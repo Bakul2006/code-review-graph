@@ -72,15 +72,39 @@ def find_project_root(start: Path | None = None) -> Path:
     return start or Path.cwd()
 
 
+def get_data_dir(repo_root: Path) -> Path:
+    """Get the data directory, respecting CRG_DATA_DIR environment variable.
+
+    By default, returns `.code-review-graph/` at the repository root.
+    Can be overridden via the `CRG_DATA_DIR` environment variable.
+    If CRG_DATA_DIR is relative, it's resolved relative to repo_root.
+
+    Args:
+        repo_root: Repository root path.
+
+    Returns:
+        Absolute path to the data directory.
+    """
+    env_path = os.environ.get("CRG_DATA_DIR")
+    if env_path:
+        path = Path(env_path)
+        if not path.is_absolute():
+            path = repo_root / path  # Make relative to repo root
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    return repo_root / ".code-review-graph"
+
+
 def get_db_path(repo_root: Path) -> Path:
     """Determine the database path for a repository.
 
-    Creates the ``.code-review-graph/`` directory and an inner ``.gitignore``
-    (with ``*``) so generated files are never committed.  If a legacy
-    ``.code-review-graph.db`` exists at the repo root the database is migrated
-    into the new directory (WAL/SHM side-files are discarded).
+    Creates the data directory (default: ``.code-review-graph/``) and an inner
+    ``.gitignore`` (with ``*``) so generated files are never committed.
+    Can be overridden via the CRG_DATA_DIR environment variable.
+    If a legacy ``.code-review-graph.db`` exists at the repo root the database
+    is migrated into the new directory (WAL/SHM side-files are discarded).
     """
-    crg_dir = repo_root / ".code-review-graph"
+    crg_dir = get_data_dir(repo_root)
     new_db = crg_dir / "graph.db"
 
     # Ensure directory exists

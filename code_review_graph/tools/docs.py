@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..embeddings import EmbeddingStore, embed_all_nodes
-from ..incremental import get_db_path
+from ..incremental import get_data_dir, get_db_path
 from ._common import _get_store
 
 # ---------------------------------------------------------------------------
@@ -158,8 +158,8 @@ def generate_wiki_func(
 
     [DOCS] Creates a wiki page for each detected community and an index
     page. Pages are written to ``.code-review-graph/wiki/`` inside the
-    repository. Only regenerates pages whose content has changed unless
-    force=True.
+    repository (or custom location via CRG_DATA_DIR environment variable).
+    Only regenerates pages whose content has changed unless force=True.
 
     Args:
         repo_root: Repository root path. Auto-detected if omitted.
@@ -172,7 +172,7 @@ def generate_wiki_func(
 
     store, root = _get_store(repo_root)
     try:
-        wiki_dir = root / ".code-review-graph" / "wiki"
+        wiki_dir = get_data_dir(root) / "wiki"
         result = generate_wiki(store, wiki_dir, force=force)
         total = (
             result["pages_generated"]
@@ -220,7 +220,7 @@ def get_wiki_page_func(
     from ..wiki import get_wiki_page
 
     _, root = _get_store(repo_root)
-    wiki_dir = root / ".code-review-graph" / "wiki"
+    wiki_dir = get_data_dir(root) / "wiki"
     content = get_wiki_page(wiki_dir, community_name)
     if content is None:
         return {

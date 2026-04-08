@@ -16,6 +16,7 @@ from code_review_graph.incremental import (
     full_build,
     get_all_tracked_files,
     get_changed_files,
+    get_data_dir,
     get_db_path,
     get_staged_and_unstaged,
     incremental_update,
@@ -78,6 +79,42 @@ class TestGetDbPath:
         get_db_path(tmp_path)
         for suffix in ("-wal", "-shm", "-journal"):
             assert not (tmp_path / f".code-review-graph.db{suffix}").exists()
+
+
+class TestGetDataDir:
+    def test_default_returns_code_review_graph_dir(self, tmp_path):
+        """Test default behavior without CRG_DATA_DIR env var."""
+        result = get_data_dir(tmp_path)
+        assert result == tmp_path / ".code-review-graph"
+
+    def test_absolute_path_from_env(self, tmp_path):
+        """Test CRG_DATA_DIR with absolute path."""
+        custom_dir = tmp_path / "custom" / "data"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        with patch.dict("os.environ", {"CRG_DATA_DIR": str(custom_dir)}):
+            result = get_data_dir(tmp_path)
+            assert result == custom_dir
+
+    def test_relative_path_from_env(self, tmp_path):
+        """Test CRG_DATA_DIR with relative path (relative to repo_root)."""
+        with patch.dict("os.environ", {"CRG_DATA_DIR": ".cache/graph"}):
+            result = get_data_dir(tmp_path)
+            assert result == tmp_path / ".cache" / "graph"
+            # Should create the directory
+            assert result.is_dir()
+
+    def test_creates_directory_for_relative_path(self, tmp_path):
+        """Test that directory is created for relative paths."""
+        with patch.dict("os.environ", {"CRG_DATA_DIR": ".build/analysis"}):
+            result = get_data_dir(tmp_path)
+            assert result.is_dir()
+            assert (tmp_path / ".build" / "analysis").is_dir()
+
+    def test_clears_env_var(self, tmp_path):
+        """Test that clearing env var reverts to default."""
+        with patch.dict("os.environ", {}, clear=True):
+            result = get_data_dir(tmp_path)
+            assert result == tmp_path / ".code-review-graph"
 
 
 class TestIgnorePatterns:
