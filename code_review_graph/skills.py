@@ -325,7 +325,7 @@ def generate_skills(repo_root: Path, skills_dir: Path | None = None) -> Path:
             "---\n\n"
             f"{skill['body']}\n"
         )
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         logger.info("Wrote skill: %s", path)
 
     return skills_dir
