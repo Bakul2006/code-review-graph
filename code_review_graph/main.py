@@ -6,6 +6,8 @@ Communicates via stdio (standard MCP transport).
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -255,10 +257,18 @@ def semantic_search_nodes_tool(
 def embed_graph_tool(
     repo_root: Optional[str] = None,
     model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> dict:
     """Compute vector embeddings for all graph nodes to enable semantic search.
 
     Requires: pip install code-review-graph[embeddings]
+    Default provider: local (sentence-transformers). Cloud providers available:
+    - "google": Google Gemini embeddings (requires GOOGLE_API_KEY)
+    - "minimax": MiniMax embeddings (requires MINIMAX_API_KEY)
+    
+    WARNING: Cloud providers send codebase content to third-party APIs.
+    Use --local-only or CRG_LOCAL_ONLY=1 to prevent network egress.
+
     Default model: all-MiniLM-L6-v2. Override via `model` param or
     CRG_EMBEDDING_MODEL env var (any sentence-transformers compatible model).
     Changing the model re-embeds all nodes automatically.
@@ -270,8 +280,19 @@ def embed_graph_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         model: Embedding model name (HuggingFace ID or local path).
                Falls back to CRG_EMBEDDING_MODEL env var, then all-MiniLM-L6-v2.
+        provider: Embedding provider ("local", "google", "minimax"). 
+                 Defaults to "local".
     """
-    return embed_graph(repo_root=repo_root, model=model)
+    # Check local-only mode
+    if getattr(mcp, '_local_only', False):
+        if provider and provider != "local":
+            return {
+                "status": "error",
+                "error": "Cloud embedding providers disabled by --local-only flag."
+            }
+        provider = "local"  # Force local even if not specified
+    
+    return embed_graph(repo_root=repo_root, model=model, provider=provider)
 
 
 @mcp.tool()
@@ -687,10 +708,36 @@ def pre_merge_check(base: str = "HEAD~1") -> list[dict]:
     return pre_merge_check_prompt(base=base)
 
 
-def main(repo_root: str | None = None) -> None:
+def _check_cloud_embedding_config() -> None:
+    """Check for cloud embedding API keys and warn if present."""
+    warnings = []
+    if os.environ.get("GOOGLE_API_KEY"):
+        warnings.append("Google Gemini API key detected - embeddings may send code to Google APIs")
+    if os.environ.get("MINIMAX_API_KEY"):
+        warnings.append("MiniMax API key detected - embeddings may send code to MiniMax APIs")
+    
+    if warnings:
+        print("WARNING: Cloud embedding providers configured:", file=sys.stderr)
+        for w in warnings:
+            print(f"  - {w}", file=sys.stderr)
+        print("Use --local-only or CRG_LOCAL_ONLY=1 to disable cloud providers.", file=sys.stderr)
+
+
+def main(repo_root: str | None = None, local_only: bool = False) -> None:
     """Run the MCP server via stdio."""
     global _default_repo_root
     _default_repo_root = repo_root
+    
+    # Check for local-only mode from environment or CLI
+    if os.environ.get("CRG_LOCAL_ONLY", "").lower() in ("1", "true", "yes"):
+        local_only = True
+    
+    # Store local_only setting for use in tools
+    mcp._local_only = local_only
+    
+    # Check for cloud embedding providers and warn
+    _check_cloud_embedding_config()
+    
     mcp.run(transport="stdio")
 
 

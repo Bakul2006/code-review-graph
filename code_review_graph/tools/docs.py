@@ -17,10 +17,17 @@ from ._common import _get_store
 def embed_graph(
     repo_root: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """Compute vector embeddings for all graph nodes to enable semantic search.
 
     Requires: ``pip install code-review-graph[embeddings]``
+    Default provider: local (sentence-transformers). Cloud providers available:
+    - "google": Google Gemini embeddings (requires GOOGLE_API_KEY)
+    - "minimax": MiniMax embeddings (requires MINIMAX_API_KEY)
+    
+    WARNING: Cloud providers send codebase content to third-party APIs.
+
     Default model: all-MiniLM-L6-v2. Override via ``model`` param or
     CRG_EMBEDDING_MODEL env var.
     Changing the model re-embeds all nodes automatically.
@@ -32,13 +39,26 @@ def embed_graph(
         model: Embedding model name (HuggingFace ID or local path).
                Falls back to CRG_EMBEDDING_MODEL env var, then
                all-MiniLM-L6-v2.
+        provider: Embedding provider ("local", "google", "minimax"). 
+                 Defaults to "local".
 
     Returns:
         Number of nodes embedded and total embedding count.
     """
     store, root = _get_store(repo_root)
     db_path = get_db_path(root)
-    emb_store = EmbeddingStore(db_path, model=model)
+    emb_store = EmbeddingStore(db_path, provider=provider, model=model)
+    
+    # Check for cloud provider and require confirmation
+    if emb_store.provider and not emb_store.provider.name.startswith("local:"):
+        provider_name = emb_store.provider.name.split(":")[0]
+        if not _confirm_cloud_usage(provider_name):
+            store.close()
+            return {
+                "status": "cancelled",
+                "error": f"Cloud embedding provider ({provider_name}) usage cancelled by user.",
+            }
+    
     try:
         if not emb_store.available:
             return {
@@ -65,6 +85,18 @@ def embed_graph(
     finally:
         emb_store.close()
         store.close()
+
+
+def _confirm_cloud_usage(provider_name: str) -> bool:
+    """Get user confirmation for cloud provider usage."""
+    try:
+        response = input(
+            f"WARNING: This will send codebase content to {provider_name} APIs. "
+            "Continue? (yes/no): "
+        ).strip().lower()
+        return response in ("yes", "y")
+    except (EOFError, KeyboardInterrupt):
+        return False
 
 
 # ---------------------------------------------------------------------------

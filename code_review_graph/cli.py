@@ -330,6 +330,11 @@ def main() -> None:
     # serve
     serve_cmd = sub.add_parser("serve", help="Start MCP server (stdio transport)")
     serve_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    serve_cmd.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Disable all network egress, including cloud embedding providers"
+    )
 
     args = ap.parse_args()
 
@@ -343,7 +348,7 @@ def main() -> None:
 
     if args.command == "serve":
         from .main import main as serve_main
-        serve_main(repo_root=args.repo)
+        serve_main(repo_root=args.repo, local_only=getattr(args, 'local_only', False))
         return
 
     if args.command == "eval":

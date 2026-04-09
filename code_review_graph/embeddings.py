@@ -256,11 +256,16 @@ def get_provider(
         provider: Provider name. One of "local", "google", "minimax", or None for local.
                   Google requires GOOGLE_API_KEY env var and explicit opt-in.
                   MiniMax requires MINIMAX_API_KEY env var and explicit opt-in.
+                  Falls back to CRG_EMBEDDING_PROVIDER env var.
         model: Model name/path to use. For local provider this is any
                sentence-transformers compatible model. Falls back to
                CRG_EMBEDDING_MODEL env var, then to all-MiniLM-L6-v2.
                For Google provider this is a Gemini model ID.
     """
+    # Check environment variable if provider not specified
+    if provider is None:
+        provider = os.environ.get("CRG_EMBEDDING_PROVIDER")
+    
     if provider == "minimax":
         api_key = os.environ.get("MINIMAX_API_KEY")
         if not api_key:
