@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,7 @@ def embed_graph(
     emb_store = EmbeddingStore(db_path, provider=provider, model=model)
     
     # Check for cloud provider and require confirmation
-    if emb_store.provider and not emb_store.provider.name.startswith("local:"):
+    if emb_store.provider and not emb_store.provider.is_local:
         provider_name = emb_store.provider.name.split(":")[0]
         if not _confirm_cloud_usage(provider_name):
             store.close()
@@ -88,15 +89,22 @@ def embed_graph(
 
 
 def _confirm_cloud_usage(provider_name: str) -> bool:
-    """Get user confirmation for cloud provider usage."""
+    """Confirm cloud provider usage in a safe way for MCP and CLI."""
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        return False
+
+    sys.stderr.write(
+        f"WARNING: embed_graph will send codebase content to {provider_name} APIs.\n"
+        "Continue? (yes/no): "
+    )
+    sys.stderr.flush()
+
     try:
-        response = input(
-            f"WARNING: This will send codebase content to {provider_name} APIs. "
-            "Continue? (yes/no): "
-        ).strip().lower()
-        return response in ("yes", "y")
+        response = sys.stdin.readline()
     except (EOFError, KeyboardInterrupt):
         return False
+
+    return response.strip().lower() in ("yes", "y")
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 """Tests for MCP tool functions."""
 
+import io
+import sys
 import tempfile
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from code_review_graph.tools import (
     list_communities_func,
     list_flows,
 )
+from code_review_graph.tools.docs import _confirm_cloud_usage
 
 
 class TestTools:
@@ -172,6 +175,47 @@ class TestGetDocsSection:
         assert result["status"] in ("ok", "not_found")
         if result["status"] == "ok":
             assert len(result["content"]) > 0
+
+
+class TestConfirmCloudUsage:
+    def test_declines_in_non_tty_environment(self):
+        class FakeStdin(io.StringIO):
+            def isatty(self) -> bool:
+                return False
+
+        stdin = FakeStdin("")
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        old_stdin, old_stdout, old_stderr = sys.stdin, sys.stdout, sys.stderr
+        sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr
+        try:
+            assert not _confirm_cloud_usage("google")
+            assert stdout.getvalue() == ""
+            assert stderr.getvalue() == ""
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
+
+    def test_prompt_writes_to_stderr_on_tty(self):
+        class FakeStdin(io.StringIO):
+            def __init__(self, value: str):
+                super().__init__(value)
+
+            def isatty(self) -> bool:
+                return True
+
+        stdin = FakeStdin("yes\n")
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        old_stdin, old_stdout, old_stderr = sys.stdin, sys.stdout, sys.stderr
+        sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr
+        try:
+            assert _confirm_cloud_usage("google")
+            assert stdout.getvalue() == ""
+            assert "WARNING: embed_graph will send codebase content to google APIs." in stderr.getvalue()
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
 
 
 class TestFindLargeFunctions:

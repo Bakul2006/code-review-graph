@@ -166,6 +166,16 @@ class TestLocalEmbeddingProviderModelName:
             assert provider.name == "local:BAAI/bge-small-en-v1.5"
 
 
+class TestEmbeddingProviderType:
+    def test_local_provider_is_local(self):
+        provider = LocalEmbeddingProvider(model_name="custom/model")
+        assert provider.is_local
+
+    def test_non_local_provider_is_not_local(self):
+        provider = MiniMaxEmbeddingProvider(api_key="test-key")
+        assert not provider.is_local
+
+
 class TestGetProviderModel:
     """Tests for model parameter in get_provider()."""
 

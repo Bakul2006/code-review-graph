@@ -47,6 +47,10 @@ class EmbeddingProvider(ABC):
     def name(self) -> str:
         pass
 
+    @property
+    def is_local(self) -> bool:
+        return False
+
 
 LOCAL_DEFAULT_MODEL = "all-MiniLM-L6-v2"
 
@@ -86,6 +90,10 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     def dimension(self) -> int:
         model = self._get_model()
         return model.get_sentence_embedding_dimension()
+
+    @property
+    def is_local(self) -> bool:
+        return True
 
     @property
     def name(self) -> str:
