@@ -268,6 +268,33 @@ class TestPHPParsing:
         names = {f.name for f in funcs}
         assert len(names) > 0
 
+    def test_finds_calls(self):
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        targets = {e.target for e in calls}
+        target_names = {t.split("::")[-1].split(".")[-1] for t in targets}
+
+        run_queries_targets = {
+            e.target for e in calls if e.source.endswith("::ExtendedRepo.runQueries")
+        }
+
+        # Plain function calls
+        assert "sqlQuery" in target_names
+        assert "xl" in target_names
+        assert "text" in target_names
+
+        # Member and nullsafe method calls
+        assert "execute" in target_names
+        assert "search" in target_names
+
+        # Scoped/static calls
+        assert "QueryUtils::fetchRecords" in targets
+        assert "EncounterService::create" in targets
+        assert any(t.endswith("__construct") for t in run_queries_targets)
+        assert any(t.endswith("factory") for t in run_queries_targets)
+
+        # Global namespaced calls should normalize to a stable name
+        assert "dirname" in target_names
+
 
 class TestKotlinParsing:
     def setup_method(self):
