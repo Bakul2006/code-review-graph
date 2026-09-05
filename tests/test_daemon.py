@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -584,6 +585,29 @@ class TestWatchDaemon:
 
     @patch("code_review_graph.daemon.subprocess.Popen")
     @patch("code_review_graph.registry.Registry")
+    def test_start_assigns_children_to_windows_job(self, mock_registry_cls, mock_popen, daemon_env):
+        """Windows watcher children are attached before they are tracked."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = None
+        mock_popen.return_value = mock_proc
+
+        daemon = daemon_env["daemon"]
+        job = MagicMock()
+        daemon._windows_job = job
+
+        daemon.start()
+        try:
+            assert job.assign.call_count == 2
+            assert [call.args[0] for call in job.assign.call_args_list] == [
+                mock_proc,
+                mock_proc,
+            ]
+        finally:
+            daemon.stop()
+
+    @patch("code_review_graph.daemon.subprocess.Popen")
+    @patch("code_review_graph.registry.Registry")
     def test_start_registers_repos(self, mock_registry_cls, mock_popen, daemon_env):
         """start() calls Registry.register for each repo."""
         mock_proc = MagicMock()
@@ -1041,7 +1065,10 @@ class TestDaemonCLI:
         with (
             patch("code_review_graph.daemon.is_daemon_running", return_value=True),
             patch("code_review_graph.daemon.read_pid", return_value=pid),
-            patch("code_review_graph.daemon.pid_alive", return_value=True) as mock_alive,
+            patch(
+                "code_review_graph.daemon.pid_alive",
+                return_value=True,
+            ) as mock_alive,
             patch("code_review_graph.daemon.clear_pid") as mock_clear_pid,
             patch("code_review_graph.daemon_cli.signal", windows_signal),
             patch("code_review_graph.daemon_cli.os.kill") as mock_kill,
@@ -1083,8 +1110,8 @@ class TestDaemonCLI:
         mock_clear_pid.assert_called_once_with()
         mock_start.assert_called_once_with(args)
 
-    def test_handle_stop_clears_pid_if_forced_stop_fails(self):
-        """A failed forced stop must not leave a stale daemon PID file."""
+    def test_handle_stop_keeps_pid_if_forced_stop_does_not_kill(self):
+        """A still-live daemon must retain its PID file after failed escalation."""
         from code_review_graph.daemon_cli import _handle_stop
 
         args = MagicMock()
@@ -1104,7 +1131,7 @@ class TestDaemonCLI:
         ):
             _handle_stop(args)
 
-        mock_clear_pid.assert_called_once_with()
+        mock_clear_pid.assert_not_called()
 
     def test_handle_status_not_running(self):
         """_handle_status displays 'not running' when daemon is down."""
@@ -1435,3 +1462,24 @@ class TestPerUserStateLocation:
         from code_review_graph.daemon import CONFIG_PATH
 
         assert CONFIG_PATH == tmp_path / "state" / "watch.toml"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object integration")
+def test_windows_job_close_terminates_watcher():
+    """Closing the daemon job terminates a watcher it owns."""
+    from code_review_graph.daemon import _WindowsJob
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"]
+    )
+    job = _WindowsJob()
+    try:
+        job.assign(process)
+        job.close()
+        process.wait(timeout=10)
+        assert process.returncode is not None
+    finally:
+        job.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
