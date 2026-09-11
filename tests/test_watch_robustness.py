@@ -214,6 +214,29 @@ class TestIgnoreAwareScheduling:
 
         assert plan == [(tmp_path, True)]
 
+    def test_startup_budget_fallback_is_degraded(self, tmp_path):
+        for index in range(10):
+            (tmp_path / f"pkg{index}").mkdir()
+        for index in range(6):
+            (tmp_path / "node_modules" / f"dep{index}").mkdir(parents=True)
+
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer,
+            tmp_path,
+            _load_ignore_patterns(tmp_path),
+            health_path=None,
+            max_schedules=3,
+        )
+        supervisor.schedule_initial(MagicMock())
+
+        assert supervisor.degraded is True
+        supervisor._health_path = tmp_path / "health.json"
+        supervisor.report_health(observer_alive=True, force=True)
+        health = json.loads((tmp_path / "health.json").read_text(encoding="utf-8"))
+        assert health["degraded"] is True
+        assert watcher_status(True, {**health, "stalled": False}) == "partial"
+
     def test_nested_module_output_is_ignored_and_never_watched(self, tmp_path):
         """`moduleA/target/` is build output when `moduleA/pom.xml` says so."""
         _maven_repo(tmp_path)
@@ -338,6 +361,42 @@ class TestNewDirectoryAdoption:
 
         assert adopted == []
         assert not any(path == str(created) for path, _ in observer.scheduled)
+
+    def test_new_large_ignored_tree_replaces_recursive_root_watch(self, tmp_path):
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert observer.scheduled == [(str(tmp_path), True)]
+
+        created = tmp_path / "node_modules"
+        for index in range(_WATCH_SPLIT_MIN_DIRS + 1):
+            (created / f"pkg{index}").mkdir(parents=True)
+        supervisor.request_replan()
+        supervisor.sync_watches()
+
+        assert str(tmp_path) in observer.unscheduled
+        assert (str(tmp_path), False) in observer.scheduled
+        assert not any("node_modules" in path for path, _ in observer.scheduled)
+
+    def test_ignored_tree_growth_replans_recursive_root(self, tmp_path):
+        created = tmp_path / "node_modules"
+        created.mkdir()
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert observer.scheduled == [(str(tmp_path), True)]
+
+        for index in range(_WATCH_SPLIT_MIN_DIRS + 1):
+            (created / f"pkg{index}").mkdir()
+        supervisor.request_replan()
+        supervisor.sync_watches()
+
+        assert (str(tmp_path), False) in observer.scheduled
+        assert not any("node_modules" in path for path, _ in observer.scheduled)
 
     def test_directory_inside_a_recursive_watch_is_not_rescheduled(self, tmp_path):
         """watchdog already covers those; a second watch would be waste."""
