@@ -10236,6 +10236,19 @@ class CodeParser:
 
         Returns True if the child was handled (class with a name found).
         """
+        if language == "go" and child.type == "type_declaration" and any(
+            part.type == "(" for part in child.children
+        ):
+            # A grouped declaration owns several independent types. Extract
+            # each spec so later embeddings cannot attach to the first type.
+            for spec in child.named_children:
+                if spec.type == "type_spec":
+                    self._extract_classes(
+                        spec, source, language, file_path, nodes, edges,
+                        enclosing_class, import_map, defined_names, _depth,
+                    )
+            return True
+
         name = self._get_name(child, language, "class")
         if not name:
             return False
@@ -15519,16 +15532,39 @@ class CodeParser:
                                 if ident.type == "identifier":
                                     bases.append(ident.text.decode("utf-8", errors="replace"))
         elif language == "go":
-            # Embedded structs / interface composition
-            for child in node.children:
-                if child.type == "type_spec":
-                    for sub in child.children:
-                        if sub.type in ("struct_type", "interface_type"):
-                            for field_node in sub.children:
-                                if field_node.type == "field_declaration_list":
-                                    for f in field_node.children:
-                                        if f.type == "type_identifier":
-                                            bases.append(f.text.decode("utf-8", errors="replace"))
+            spec = node if node.type == "type_spec" else next(
+                (child for child in node.named_children if child.type == "type_spec"),
+                None,
+            )
+            body = spec.child_by_field_name("type") if spec is not None else None
+            embedded_types: list = []
+            if body is not None and body.type == "struct_type":
+                for fields in body.named_children:
+                    if fields.type != "field_declaration_list":
+                        continue
+                    for field in fields.named_children:
+                        if (
+                            field.type == "field_declaration"
+                            and field.child_by_field_name("name") is None
+                        ):
+                            # The optional '*' and tag are siblings of the
+                            # type; named fields are composition, not embedding.
+                            embedded_types.append(field.child_by_field_name("type"))
+            elif body is not None and body.type == "interface_type":
+                for element in body.named_children:
+                    if element.type != "type_elem":
+                        continue
+                    types = [part for part in element.named_children if part.type != "comment"]
+                    # A union is a constraint, not a list of embedded bases.
+                    if len(types) == 1:
+                        embedded_types.append(types[0])
+            for embedded in embedded_types:
+                if embedded is not None and embedded.type == "generic_type":
+                    # Link to the declared type, just as generic Go receivers
+                    # do. Keep package qualification; arguments are not bases.
+                    embedded = embedded.child_by_field_name("type")
+                if embedded is not None and embedded.type in ("type_identifier", "qualified_type"):
+                    bases.append(embedded.text.decode("utf-8", errors="replace"))
         elif language == "dart":
             # class Foo extends Bar with Mixin implements Iface { ... }
             # AST: superclass contains type_identifier (base) and mixins (with clause);
