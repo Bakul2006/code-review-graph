@@ -625,7 +625,9 @@ def _scan_nested_output_dirs(
         flagged: set[str] = set()
         if depth > 0:
             for output_dir, markers in NESTED_OUTPUT_DIR_MARKERS.items():
-                if output_dir in subdirectories and file_names & markers:
+                # A watch can start before the first build creates its output.
+                # Reserve that path now, without rescanning on each file event.
+                if file_names & markers and output_dir not in file_names:
                     relative = (directory / output_dir).relative_to(repo_root).as_posix()
                     patterns.append(f"/{relative}/**")
                     flagged.add(output_dir)
@@ -690,10 +692,15 @@ def _nested_output_ignore_patterns(
     return list(patterns)
 
 
-def clear_nested_ignore_cache() -> None:
-    """Drop the cached nested build-output patterns (used by tests)."""
+def clear_nested_ignore_cache(repo_root: Path | None = None) -> None:
+    """Drop cached output patterns for one repository, or all repositories."""
     with _nested_ignore_lock:
-        _nested_ignore_cache.clear()
+        if repo_root is None:
+            _nested_ignore_cache.clear()
+        else:
+            for key in list(_nested_ignore_cache):
+                if key[0] == str(repo_root):
+                    del _nested_ignore_cache[key]
 
 
 def _is_binary(path: Path) -> bool:
@@ -2373,6 +2380,7 @@ def _create_watch_handler(
     parser = CodeParser(repo_root)
     lexical_root = Path(os.path.abspath(repo_root))
     resolved_root = lexical_root.resolve()
+    manifest_names = set().union(*NESTED_OUTPUT_DIR_MARKERS.values())
 
     class WatchBatchProcessor:
         def __init__(self) -> None:
@@ -2380,7 +2388,7 @@ def _create_watch_handler(
             self.last_event_at: float | None = None
             self.events_seen: int = 0
 
-        def _relative_path(self, path: str) -> str | None:
+        def _relative_path(self, path: str, *, apply_ignores: bool = True) -> str | None:
             candidate = Path(os.path.abspath(path))
             try:
                 relative = candidate.relative_to(lexical_root)
@@ -2408,9 +2416,68 @@ def _create_watch_handler(
                 # reach process() and end the watch loop (#897).
                 logger.debug("Skipping unstattable watch path %s: %s", path[:120], exc)
                 return None
-            if _should_ignore(str(relative), ignore_patterns):
+            if apply_ignores and _should_ignore(str(relative), ignore_patterns):
                 return None
             return str(relative)
+
+        def _refresh_ignore_patterns(
+            self, events: list[FileSystemEvent],
+        ) -> tuple[int, set[str]]:
+            nonlocal ignore_patterns
+            # Only metadata/topology changes invalidate the bounded module scan.
+            # The normal source-edit path reads the explicit rules and uses cache.
+            invalidate = False
+            for event in events:
+                for path in (event.src_path, getattr(event, "dest_path", "")):
+                    if not path:
+                        continue
+                    relative = self._relative_path(os.fsdecode(path), apply_ignores=False)
+                    if relative is None:
+                        continue
+                    if relative == ".code-review-graphignore" or (
+                        not _should_ignore(relative, ignore_patterns)
+                        and (
+                            (
+                                event.is_directory
+                                and event.event_type in {"created", "deleted", "moved"}
+                            )
+                            or Path(relative).name in manifest_names
+                        )
+                    ):
+                        invalidate = True
+            if invalidate:
+                clear_nested_ignore_cache(repo_root)
+            refreshed = _load_ignore_patterns(repo_root)
+            if set(refreshed) == set(ignore_patterns):
+                return 0, set()
+            previous = ignore_patterns
+            ignore_patterns = refreshed
+            _assert_graph_matches_root(repo_root, store)
+            newly_included = set()
+            if set(previous) - set(refreshed):
+                # Relaxed exclusions need an inventory, even without source events.
+                # Only previously excluded files join this batch's update inputs.
+                newly_included = {
+                    path for path in collect_all_files(repo_root)
+                    if _should_ignore(path, previous)
+                    and self._relative_path(str(repo_root / path)) is not None
+                }
+            # Purge by stored path only: no repository inventory, stats or reads.
+            ignored_files = []
+            for stored_path in store.get_all_files():
+                try:
+                    stored_relative = PurePosixPath(normalize_file_path(stored_path)).relative_to(
+                        PurePosixPath(normalize_file_path(repo_root))
+                    )
+                except ValueError:
+                    continue
+                if _should_ignore(stored_relative.as_posix(), ignore_patterns):
+                    ignored_files.append(stored_path)
+            removed = (
+                store.remove_files_permanently(ignored_files, stored_paths=True)
+                if ignored_files else 0
+            )
+            return removed, newly_included
 
         def _stored_descendants(self, relative_directory: str) -> set[str]:
             # Stored file paths use POSIX separators (#774).
@@ -2477,19 +2544,20 @@ def _create_watch_handler(
             self.last_event_at = time.time()
             self.events_seen += len(events)
             try:
+                files_updated, newly_included = self._refresh_ignore_patterns(events)
                 changed_files = sorted(
-                    {path for event in events for path in self._event_paths(event)}
+                    newly_included | {path for event in events for path in self._event_paths(event)}
                 )
-                if not changed_files:
-                    return
-                result = incremental_update(
-                    repo_root,
-                    store,
-                    changed_files=changed_files,
-                    reconcile_stale=False,
-                )
-                _raise_watch_update_errors(result, "incremental update")
-                if result["files_updated"] > 0 and on_files_updated is not None:
+                if changed_files:
+                    result = incremental_update(
+                        repo_root,
+                        store,
+                        changed_files=changed_files,
+                        reconcile_stale=False,
+                    )
+                    _raise_watch_update_errors(result, "incremental update")
+                    files_updated += result["files_updated"]
+                if files_updated > 0 and on_files_updated is not None:
                     postprocess_result = on_files_updated(store)
                     _raise_watch_postprocess_warnings(postprocess_result)
             except BaseException as exc:
