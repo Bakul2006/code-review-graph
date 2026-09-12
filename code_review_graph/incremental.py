@@ -2062,7 +2062,9 @@ class _WatchSupervisor:
         else:
             self._shallow.add(key)
 
-    def sync_watches(self) -> tuple[list[str], list[str]]:
+    def sync_watches(
+        self, *, ignore_patterns: list[str] | None = None,
+    ) -> tuple[list[str], list[str]]:
         """Reconcile the watches under every non-recursive watch.
 
         Returns ``(adopted, vanished)`` as absolute paths, so the caller can
@@ -2076,6 +2078,11 @@ class _WatchSupervisor:
         per tick (typically one or two) is nothing next to the thousands of
         kernel watches this planning saves, and it cannot go blind.
         """
+        # Batch processing publishes a fresh list; scheduling remains on this
+        # thread so adoption cannot race against liveness or watch promotion.
+        previous_patterns = self._ignore_patterns
+        if ignore_patterns is not None:
+            self._ignore_patterns = ignore_patterns
         adopted: list[str] = []
         vanished: list[str] = []
         self._promotion_failed = False
@@ -2102,7 +2109,14 @@ class _WatchSupervisor:
                 candidate = os.path.join(parent, name)
                 if candidate in self._watches:
                     continue
-                if self._adopt_directory(candidate):
+                newly_included = (
+                    previous_patterns is not self._ignore_patterns
+                    and _should_ignore(
+                        Path(candidate).relative_to(self._repo_root).as_posix(),
+                        previous_patterns,
+                    )
+                )
+                if self._adopt_directory(candidate, required=newly_included):
                     adopted.append(candidate)
         return adopted, vanished
 
@@ -2115,7 +2129,7 @@ class _WatchSupervisor:
         prefix = parent.rstrip(os.sep) + os.sep
         return [path for path in self._watches if path.startswith(prefix)]
 
-    def _adopt_directory(self, candidate: str) -> bool:
+    def _adopt_directory(self, candidate: str, *, required: bool = False) -> bool:
         """Watch a directory that appeared under a non-recursive watch.
 
         Planned the same way startup plans the repository: a module arriving
@@ -2134,9 +2148,14 @@ class _WatchSupervisor:
             # Promoting the parent — often the repository root — hands every
             # ignored tree under it back to the OS, which is the condition
             # #811 is about.  It is the last resort, never the first.
-            return self._promote_to_recursive(os.path.dirname(candidate))
+            promoted = self._promote_to_recursive(os.path.dirname(candidate))
+            if required and not promoted:
+                raise RuntimeError(f"Cannot watch newly included directory: {candidate}")
+            return promoted
         for path, recursive in plan:
             self._schedule(path, recursive=recursive)
+            if required and str(path) not in self._watches:
+                raise RuntimeError(f"Cannot watch newly included directory: {path}")
         logger.info("Watching new directory %s (%d watch(es))", relative, len(plan))
         return True
 
@@ -2602,6 +2621,12 @@ def _create_watch_handler(
             processor.raise_if_failed()
 
         @property
+        def ignore_patterns(self) -> list[str]:
+            # Lists are replaced, never mutated, by the batch processor. The
+            # supervisor can therefore adopt one consistent snapshot per tick.
+            return ignore_patterns
+
+        @property
         def last_event_at(self) -> float | None:
             return processor.last_event_at
 
@@ -2623,7 +2648,7 @@ def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
     """
     from watchdog.events import DirCreatedEvent, DirDeletedEvent
 
-    adopted, vanished = supervisor.sync_watches()
+    adopted, vanished = supervisor.sync_watches(ignore_patterns=handler.ignore_patterns)
     for path in adopted:
         handler.dispatch(DirCreatedEvent(path))
     for path in vanished:
