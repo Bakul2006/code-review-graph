@@ -900,7 +900,7 @@ def semantic_search_nodes(
         if confidence:
             result["confidence"] = confidence
         result["_hints"] = generate_hints(
-            "semantic_search_nodes", result, get_session()
+            "semantic_search_nodes_tool", result, get_session()
         )
         return result
     finally:

@@ -200,9 +200,9 @@ def get_review_context(
                 "key_entities": key_entities,
                 "test_gaps": test_gap_count,
                 "next_tool_suggestions": [
-                    "detect_changes",
-                    "get_affected_flows",
-                    "get_impact_radius",
+                    "detect_changes_tool",
+                    "get_affected_flows_tool",
+                    "get_impact_radius_tool",
                 ],
             }
             attach_context_savings(result, original_tokens=original_tokens)
@@ -510,7 +510,7 @@ def get_affected_flows_func(
             "truncated": truncated,
         }
         out["_hints"] = generate_hints(
-            "get_affected_flows", out, get_session()
+            "get_affected_flows_tool", out, get_session()
         )
         return out
     except Exception as exc:
@@ -689,7 +689,7 @@ def detect_changes_func(
                 "truncated": any_cut,
             }
         result["_hints"] = generate_hints(
-            "detect_changes", result, get_session()
+            "detect_changes_tool", result, get_session()
         )
         attach_context_savings(result, original_tokens=original_tokens)
         return result
