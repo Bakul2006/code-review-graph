@@ -18,6 +18,14 @@ code-review-graph install                 # rewrites .claude/settings.json
 
 The re-install merge-replaces the entire broken `hooks` block with the new nested format and drops a real git pre-commit hook into the hooks directory resolved via `git rev-parse --git-path hooks` — typically `.git/hooks/pre-commit`, but linked worktrees and `core.hooksPath` (husky) setups are handled too. That's where "check before commit" lives in v2.2.3+, not in Claude Code settings.
 
+The generated pre-commit hook skips automatic graph checks in linked worktrees and
+prints a short explanation. This prevents a commit from implicitly creating another
+graph for the worktree. Each branch needs its own explicitly managed graph; the hook
+does not reuse the main checkout's graph. Main-checkout commits still update and check
+their own repository. Reinstall to upgrade an older generated hook block; custom
+edits to that block are preserved and need a manual update. If Git cannot identify
+the current worktree, the hook also skips these checks and lets the commit continue.
+
 Valid Claude Code hook events are: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `SessionStart`, `SessionEnd`, `PreCompact`, `Notification`. There is no `PreCommit`.
 
 ### 2. `code-review-graph: command not found` after `pip install`

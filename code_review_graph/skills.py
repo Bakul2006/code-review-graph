@@ -1147,14 +1147,35 @@ def install_git_hook(repo_root: Path) -> Path | None:
     one — the hook is appended, not overwritten, preserving any hooks
     already there. Falls back to the legacy ``.git/hooks`` resolution when
     git itself is unavailable. Returns None when no hooks directory can be
-    determined.
+    determined. Exact generated legacy blocks are upgraded in place. The
+    installed hook skips automatic checks in linked worktrees, where an
+    implicit update could build a duplicate graph for a different branch.
     """
-    script = """\
+    legacy_script = """\
 #!/bin/sh
 # Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
 if command -v code-review-graph >/dev/null 2>&1; then
     code-review-graph update || true
     code-review-graph detect-changes --brief || true
+fi
+"""
+    script = """\
+#!/bin/sh
+# Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
+if command -v code-review-graph >/dev/null 2>&1; then
+    crg_hook_git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || crg_hook_git_dir=""
+    crg_hook_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \\
+        || crg_hook_common_dir=""
+    crg_hook_root=$(git rev-parse --show-toplevel 2>/dev/null) || crg_hook_root=""
+    if [ -z "$crg_hook_git_dir" ] || [ -z "$crg_hook_common_dir" ] || [ -z "$crg_hook_root" ]; then
+        echo "code-review-graph: skipping automatic checks; cannot determine the Git worktree." >&2
+    elif [ "$crg_hook_git_dir" != "$crg_hook_common_dir" ]; then
+        echo "code-review-graph: skipping automatic checks in a linked worktree;" \\
+            "use an explicitly managed graph for this worktree." >&2
+    else
+        code-review-graph update --repo "$crg_hook_root" || true
+        code-review-graph detect-changes --brief --repo "$crg_hook_root" || true
+    fi
 fi
 """
     marker = "code-review-graph detect-changes"
@@ -1192,8 +1213,13 @@ fi
     if hook_path.exists():
         existing = hook_path.read_text(encoding="utf-8")
         if marker in existing:
-            return hook_path
-        hook_path.write_text(existing.rstrip("\n") + "\n" + script, encoding="utf-8")
+            # Upgrade only the exact block emitted by older CRG releases;
+            # custom hook logic and surrounding user commands remain intact.
+            if legacy_script not in existing:
+                return hook_path
+            hook_path.write_text(existing.replace(legacy_script, script), encoding="utf-8")
+        else:
+            hook_path.write_text(existing.rstrip("\n") + "\n" + script, encoding="utf-8")
     else:
         hook_path.write_text(script, encoding="utf-8")
 
