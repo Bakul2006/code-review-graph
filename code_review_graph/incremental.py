@@ -1988,7 +1988,7 @@ class _WatchSupervisor:
                     continue
                 if self._adopt_directory(candidate):
                     adopted.append(candidate)
-            self._replan_if_requested()
+        self._replan_if_requested()
         return adopted, vanished
 
     def _children_of(self, parent: str) -> list[str]:
