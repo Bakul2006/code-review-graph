@@ -2434,7 +2434,17 @@ def _create_watch_handler(
                     relative = self._relative_path(os.fsdecode(path), apply_ignores=False)
                     if relative is None:
                         continue
-                    if relative == ".code-review-graphignore" or (
+                    # An inferred future output directory can instead become a
+                    # regular source file. Recheck only that exact reserved path;
+                    # explicit exclusions still apply when the rules reload.
+                    output_became_file = (
+                        not event.is_directory
+                        and event.event_type in {"created", "moved"}
+                        and Path(relative).name in NESTED_OUTPUT_DIR_MARKERS
+                        and f"/{Path(relative).as_posix()}/**" in ignore_patterns
+                        and (repo_root / relative).is_file()
+                    )
+                    if output_became_file or relative == ".code-review-graphignore" or (
                         not _should_ignore(relative, ignore_patterns)
                         and (
                             (

@@ -3,7 +3,13 @@
 from unittest.mock import Mock, patch
 
 import pytest
-from watchdog.events import DirModifiedEvent, FileCreatedEvent, FileDeletedEvent, FileModifiedEvent
+from watchdog.events import (
+    DirModifiedEvent,
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+)
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
@@ -250,3 +256,31 @@ def test_parent_directory_modification_does_not_rescan_ordinary_batch(tmp_path, 
         handler.process([FileModifiedEvent(str(user)), DirModifiedEvent(str(user.parent))])
     handler.raise_if_failed()
     assert store.get_nodes_by_file(str(user))
+
+
+@pytest.mark.parametrize("event_type", ["created", "moved"])
+@pytest.mark.parametrize("explicit_ignore", [False, True])
+def test_new_source_file_at_inferred_output_root_is_indexed(
+    tmp_path,
+    store,
+    event_type,
+    explicit_ignore,
+):
+    module = tmp_path / "module"
+    module.mkdir()
+    (module / "pom.xml").write_text("<project/>")
+    if explicit_ignore:
+        (tmp_path / ".code-review-graphignore").write_text("module/target/\n")
+    handler = _create_watch_handler(tmp_path, store, None)
+    target = module / "target"
+    source = module / "script" if event_type == "moved" else target
+    source.write_text("#!/usr/bin/env python3\ndef source(): return 1\n")
+    if event_type == "moved":
+        source.rename(target)
+        event = FileMovedEvent(str(source), str(target))
+    else:
+        event = FileCreatedEvent(str(target))
+
+    handler.process([event])
+    handler.raise_if_failed()
+    assert bool(store.get_nodes_by_file(str(target))) is not explicit_ignore
