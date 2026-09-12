@@ -10,6 +10,7 @@ import ast
 import hashlib
 import html
 import importlib
+import importlib.util
 import json
 import logging
 import math
