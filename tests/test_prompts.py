@@ -35,7 +35,10 @@ class TestReviewChangesPrompt:
 
     def test_custom_base(self):
         content = _text(review_changes_prompt(base="origin/main")[0])
-        assert 'get_minimal_context_tool(task="review changes against origin/main", base="origin/main")' in content
+        assert (
+            'get_minimal_context_tool(task="review changes against origin/main", base="origin/main")'
+            in content
+        )
         assert 'detect_changes_tool(base="origin/main", detail_level="minimal")' in content
         assert 'detect_changes_tool(base="origin/main", detail_level="standard")' in content
         assert 'get_affected_flows_tool(base="origin/main", detail_level="minimal")' in content
