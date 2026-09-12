@@ -1905,13 +1905,35 @@ class _WatchSupervisor:
         desired = {str(path): recursive for path, recursive in plan}
         current = {path: path not in self._shallow for path in self._watches}
         for path, recursive in current.items():
-            if desired.get(path) != recursive:
+            if path not in desired:
                 self._release_directory(path)
+            elif desired[path] != recursive:
+                self._replace_watch(Path(path), recursive=desired[path])
         for path, recursive in plan:
             self._schedule(path, recursive=recursive)
         if fallback:
             self._degraded = True
         self._remember_ignored_boundaries()
+
+    def _replace_watch(self, path: Path, *, recursive: bool) -> bool:
+        """Register a replacement before releasing the current watch."""
+        key = str(path)
+        entry = self._watches.get(key)
+        if entry is None:
+            self._schedule(path, recursive=recursive)
+            return key in self._watches
+        try:
+            handle = self._observer.schedule(self._handler, key, recursive=recursive)
+        except OSError as exc:
+            logger.warning("Could not replace watch on %s: %s", key, exc)
+            return False
+        self._release_directory(key)
+        self._watches[key] = _WatchEntry(handle, _watch_identity(key))
+        if recursive:
+            self._shallow.discard(key)
+        else:
+            self._shallow.add(key)
+        return True
 
     def sync_watches(self) -> tuple[list[str], list[str]]:
         """Reconcile the watches under every non-recursive watch.

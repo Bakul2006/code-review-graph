@@ -398,6 +398,31 @@ class TestNewDirectoryAdoption:
         assert (str(tmp_path), False) in observer.scheduled
         assert not any("node_modules" in path for path, _ in observer.scheduled)
 
+    def test_failed_replan_keeps_the_existing_recursive_watch(self, tmp_path):
+        class FailingReplacementObserver(FakeObserver):
+            def schedule(self, handler, path, *, recursive=False, event_filter=None):
+                if path == str(tmp_path) and not recursive:
+                    raise OSError("watch limit")
+                return super().schedule(
+                    handler, path, recursive=recursive, event_filter=event_filter
+                )
+
+        observer = FailingReplacementObserver()
+        supervisor = _WatchSupervisor(
+            observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None
+        )
+        supervisor.schedule_initial(MagicMock())
+
+        created = tmp_path / "node_modules"
+        for index in range(_WATCH_SPLIT_MIN_DIRS + 1):
+            (created / f"pkg{index}").mkdir(parents=True)
+        supervisor.request_replan()
+        supervisor.sync_watches()
+
+        assert observer.unscheduled == []
+        assert supervisor.watched_paths == [str(tmp_path)]
+        assert observer.scheduled == [(str(tmp_path), True)]
+
     def test_directory_inside_a_recursive_watch_is_not_rescheduled(self, tmp_path):
         """watchdog already covers those; a second watch would be waste."""
         supervisor, observer = self._supervisor(tmp_path)
