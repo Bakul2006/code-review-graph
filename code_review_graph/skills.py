@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -2052,10 +2053,11 @@ def install_qoder_skills(repo_root: Path) -> Path | None:
     """Install skills to Qoder's project-level skills directory.
 
     Qoder expects skills in .qoder/skills/{skillName}/SKILL.md format within the project.
-    This function copies the project's skills/ directory contents to that location.
+    Loads the shipped skills from package resources. Source checkouts use their
+    own top-level skills/ directory when wheel resources are not present.
 
     Args:
-        repo_root: Repository root directory (where the skills/ folder is located).
+        repo_root: Target repository root directory.
 
     Returns:
         Path to the Qoder skills directory, or None if installation failed.
@@ -2064,17 +2066,20 @@ def install_qoder_skills(repo_root: Path) -> Path | None:
     qoder_skills_dir = repo_root / ".qoder" / "skills"
     qoder_skills_dir.mkdir(parents=True, exist_ok=True)
 
-    # Source skills directory in the project
-    source_skills_dir = repo_root / "skills"
-    if not source_skills_dir.exists():
-        logger.warning("No skills/ directory found in %s", repo_root)
+    source_skills_dir = resources.files("code_review_graph").joinpath("_bundled_skills")
+    if not source_skills_dir.is_dir():
+        # Editable installs keep the same files beside the source package. Never
+        # treat the target project's unrelated skills as CRG's bundled workflows.
+        source_skills_dir = Path(__file__).resolve().parent.parent / "skills"
+    if not source_skills_dir.is_dir():
+        logger.warning("Bundled code-review-graph skills are unavailable.")
         return None
 
     installed_count = 0
     for skill_dir in source_skills_dir.iterdir():
         if skill_dir.is_dir():
             skill_file = skill_dir / "SKILL.md"
-            if skill_file.exists():
+            if skill_file.is_file():
                 target_dir = qoder_skills_dir / skill_dir.name
                 target_dir.mkdir(parents=True, exist_ok=True)
                 target_file = target_dir / "SKILL.md"
