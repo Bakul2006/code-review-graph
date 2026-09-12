@@ -1931,3 +1931,40 @@ class TestRevertedContentParity:
             assert other_functions == {"other"}
         finally:
             store.close()
+
+
+class TestGraphExtraCorruption:
+    def test_get_all_files_survives_malformed_extra_and_false_virtual(self, tmp_path):
+        """#864: a killed writer can leave extra='' and crash every
+        get_all_files caller with SQLite 'malformed JSON'; extra with
+        virtual=false must stay visible so reconciliation can purge it."""
+        good = tmp_path / "good.py"
+        good.write_text("def ok():\n    pass\n")
+        store = GraphStore(tmp_path / "test.db")
+        try:
+            store._conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, "
+                "extra, updated_at) "
+                "VALUES ('Function', 'dead', 'dead', ?, '', 1.0)",
+                (str(tmp_path / "killed.py"),),
+            )
+            store._conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, "
+                "extra, updated_at) "
+                "VALUES ('Class', 'Concrete', 'Concrete', ?, ?, 1.0)",
+                (str(tmp_path / "flagged.py"), '{"virtual": false}'),
+            )
+            store._conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, "
+                "extra, updated_at) "
+                "VALUES ('Event', 'SpringEvent', 'SpringEvent', ?, ?, 1.0)",
+                (str(tmp_path / "virtual.py"), '{"virtual": true}'),
+            )
+            store.commit()
+
+            files = set(store.get_all_files())
+            assert str(tmp_path / "killed.py") in files, "malformed extra must not crash"
+            assert str(tmp_path / "flagged.py") in files, "virtual=false must remain purgeable"
+            assert str(tmp_path / "virtual.py") not in files, "virtual=true stays resolver-managed"
+        finally:
+            store.close()
