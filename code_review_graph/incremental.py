@@ -77,6 +77,42 @@ logger = logging.getLogger(__name__)
 
 CPP_IDENTITY_VERSION = "1"
 _CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
+_CPP_IDENTITY_PENDING_KEY = "cpp_identity_pending"
+
+
+def _load_cpp_identity_pending(store: GraphStore) -> set[str] | None:
+    """Load failed paths from a complete attempt of this identity version.
+
+    A missing/older checkpoint must still take the normal full migration path.
+    Keep the global version stale until every recorded replacement succeeds.
+    """
+    try:
+        state = json.loads(store.get_metadata(_CPP_IDENTITY_PENDING_KEY) or "null")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("version") != CPP_IDENTITY_VERSION:
+        return None
+    files = state.get("files")
+    if not isinstance(files, list) or any(
+        not isinstance(path, str)
+        or not path
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+        for path in files
+    ):
+        return None
+    return set(files)
+
+
+def _store_cpp_identity_pending(store: GraphStore, files: set[str]) -> None:
+    # Publish completion before clearing retry state: interruption can cause
+    # an extra retry, but cannot leave a stale version with no pending paths.
+    if not files:
+        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+    store.set_metadata(
+        _CPP_IDENTITY_PENDING_KEY,
+        json.dumps({"version": CPP_IDENTITY_VERSION, "files": sorted(files)}),
+    )
 
 
 def _run_python_resolver(store: GraphStore) -> Optional[dict]:
@@ -1448,8 +1484,7 @@ def full_build(
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
-    if not cpp_errors:
-        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+    _store_cpp_identity_pending(store, cpp_errors)
     if not errors:
         _store_vcs_metadata(repo_root, store)
     store.commit()
@@ -1499,8 +1534,10 @@ def incremental_update(
         and base == stored_git_sha
     )
 
+    identity_pending = _load_cpp_identity_pending(store)
     if (
-        store.get_metadata(_CPP_IDENTITY_METADATA_KEY) != CPP_IDENTITY_VERSION
+        identity_pending is None
+        and store.get_metadata(_CPP_IDENTITY_METADATA_KEY) != CPP_IDENTITY_VERSION
         and store.has_nodes_for_language("cpp")
     ):
         logger.info(
@@ -1556,7 +1593,8 @@ def incremental_update(
                 dependent_files.add(d)
 
     # Combine changed + dependent
-    all_files = set(changed_files) | dependent_files
+    all_files = set(changed_files) | dependent_files | (identity_pending or set())
+    remaining_identity = set(identity_pending or [])
 
     total_nodes = 0
     total_edges = 0
@@ -1567,9 +1605,18 @@ def incremental_update(
     to_parse: list[str] = []
     for rel_path in all_files:
         if _should_ignore(rel_path, ignore_patterns):
+            if rel_path in remaining_identity:
+                if normalize_file_path(repo_root / rel_path) in stale_files:
+                    remaining_identity.discard(rel_path)
+                else:
+                    errors.append({
+                        "file": rel_path,
+                        "error": "Identity migration pending for ignored file",
+                    })
             continue
         abs_path = repo_root / rel_path
         if not abs_path.is_file():
+            remaining_identity.discard(rel_path)
             if normalize_file_path(abs_path) not in stale_files:
                 missing_paths.add(normalize_file_path(abs_path))
             continue
@@ -1587,7 +1634,8 @@ def incremental_update(
         try:
             existing_nodes = store.get_nodes_by_file(str(abs_path))
             if (
-                fhash is not None
+                rel_path not in remaining_identity
+                and fhash is not None
                 and existing_nodes
                 and existing_nodes[0].file_hash == fhash
             ):
@@ -1609,6 +1657,7 @@ def incremental_update(
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(abs_path, source)
                 store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
+                remaining_identity.discard(rel_path)
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
@@ -1636,12 +1685,15 @@ def incremental_update(
                     edges,
                     fhash,
                 )
+                remaining_identity.discard(rel_path)
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
 
     removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
     files_updated = parsed_files + len(stale_files) + removed_files
+    if identity_pending is not None and remaining_identity != identity_pending:
+        _store_cpp_identity_pending(store, remaining_identity)
 
     # Only re-run language-specific resolvers when the relevant files changed.
     python_changed = any(
@@ -1678,7 +1730,8 @@ def incremental_update(
     if not errors and (files_updated or authoritative_git_sync):
         store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
         store.set_metadata("last_build_type", "incremental")
-        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+        if not remaining_identity:
+            store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
         if authoritative_git_sync or (vcs == "svn" and files_updated):
             freshness_advanced = _store_vcs_metadata(repo_root, store)
         store.commit()
