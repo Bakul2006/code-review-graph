@@ -15883,7 +15883,12 @@ class CodeParser:
             }
             if node.type in include_types:
                 for child in node.children:
-                    if child.type == "string":
+                    # A double-quoted literal uses encapsed_string even with
+                    # no interpolation. Variables and escapes need evaluation.
+                    if child.type == "string" or (
+                        child.type == "encapsed_string"
+                        and all(part.type == "string_content" for part in child.named_children)
+                    ):
                         value = child.text.decode(
                             "utf-8", errors="replace",
                         ).strip("'\"")
