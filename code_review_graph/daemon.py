@@ -120,8 +120,9 @@ class _WindowsJob:
         import ctypes
         from ctypes import wintypes
 
-        self._ctypes = ctypes
-        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ctypes_api: Any = ctypes
+        self._ctypes: Any = ctypes_api
+        self._kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
         kernel32 = self._kernel32
         kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
         kernel32.CreateJobObjectW.restype = wintypes.HANDLE
@@ -167,7 +168,7 @@ class _WindowsJob:
 
         self._handle = kernel32.CreateJobObjectW(None, None)
         if not self._handle:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes_api.WinError(ctypes_api.get_last_error())
 
         limits = ExtendedLimitInformation()
         limits.basic_limit_information.limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -177,9 +178,9 @@ class _WindowsJob:
             ctypes.byref(limits),
             ctypes.sizeof(limits),
         ):
-            error = ctypes.get_last_error()
+            error = ctypes_api.get_last_error()
             kernel32.CloseHandle(self._handle)
-            raise ctypes.WinError(error)
+            raise ctypes_api.WinError(error)
 
     def assign(self, proc: subprocess.Popen[bytes]) -> None:
         """Assign *proc* to this job before it can outlive the daemon."""

@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1053,8 +1054,8 @@ class TestDaemonCLI:
 
         assert exc_info.value.code == 1
 
-    def test_handle_stop_windows_uses_sigterm_for_forced_stop(self):
-        """Windows falls back to SIGTERM when SIGKILL is unavailable."""
+    def test_handle_stop_retains_pid_when_forced_signal_does_not_kill(self):
+        """Successful signal delivery is not proof that the daemon exited."""
         from code_review_graph.daemon_cli import _handle_stop
 
         args = MagicMock()
@@ -1073,6 +1074,7 @@ class TestDaemonCLI:
             patch("code_review_graph.daemon_cli.signal", windows_signal),
             patch("code_review_graph.daemon_cli.os.kill") as mock_kill,
             patch("code_review_graph.daemon_cli.time.sleep"),
+            pytest.raises(SystemExit) as exc_info,
         ):
             _handle_stop(args)
 
@@ -1080,8 +1082,9 @@ class TestDaemonCLI:
             (pid, signal.SIGTERM),
             (pid, signal.SIGTERM),
         ]
-        assert mock_alive.call_count == 50
-        mock_clear_pid.assert_called_once_with()
+        assert mock_alive.call_count == 100
+        mock_clear_pid.assert_not_called()
+        assert exc_info.value.code == 1
 
     def test_handle_restart_windows_starts_after_process_exits(self):
         """A Windows restart continues to start after the old process exits."""
@@ -1478,6 +1481,49 @@ def test_windows_job_close_terminates_watcher():
         job.close()
         process.wait(timeout=10)
         assert process.returncode is not None
+    finally:
+        job.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object integration")
+def test_windows_job_close_terminates_watcher_children(tmp_path):
+    """Closing a job terminates an assigned parent and children it creates."""
+    from code_review_graph.daemon import _WindowsJob, pid_alive
+
+    start_file = tmp_path / "start"
+    child_file = tmp_path / "children"
+    child_code = "import time; time.sleep(60)"
+    parent_code = (
+        "import pathlib, subprocess, sys, time; "
+        f"start = pathlib.Path({str(start_file)!r}); "
+        f"children = pathlib.Path({str(child_file)!r}); "
+        "while not start.exists():\n    time.sleep(0.01)\n"
+        f"procs = [subprocess.Popen([sys.executable, '-c', {child_code!r}]) for _ in range(2)]; "
+        "children.write_text('\\n'.join(str(proc.pid) for proc in procs)); "
+        "time.sleep(60)"
+    )
+    process = subprocess.Popen([sys.executable, "-c", parent_code])
+    job = _WindowsJob()
+    child_pids: list[int] = []
+    try:
+        job.assign(process)
+        start_file.touch()
+        deadline = time.monotonic() + 10
+        while not child_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        child_pids = [int(pid) for pid in child_file.read_text().splitlines()]
+
+        job.close()
+        process.wait(timeout=10)
+        assert process.returncode is not None
+
+        deadline = time.monotonic() + 10
+        while any(pid_alive(pid) for pid in child_pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert all(not pid_alive(pid) for pid in child_pids)
     finally:
         job.close()
         if process.poll() is None:

@@ -95,7 +95,12 @@ def _handle_stop(_args: argparse.Namespace) -> None:
             except ProcessLookupError:
                 stopped = True
             else:
-                stopped = True
+                # Signal delivery does not prove that the process has exited.
+                for _ in range(50):
+                    if not pid_alive(pid):
+                        stopped = True
+                        break
+                    time.sleep(0.1)
     finally:
         if stopped:
             clear_pid()
