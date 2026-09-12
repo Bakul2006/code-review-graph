@@ -1,4 +1,5 @@
 """A shared Git hook must not implicitly build a graph for each worktree."""
+
 import os
 import subprocess
 
@@ -15,7 +16,12 @@ fi
 
 def git(repo, *args):
     return subprocess.run(
-        ["git", *args], cwd=repo, check=True, capture_output=True, text=True, timeout=10,
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
 
 
@@ -24,11 +30,13 @@ def hook_repo(tmp_path, monkeypatch):
     repo.mkdir()
     # Isolate identity and hooks from the developer's or test runner's Git config.
     monkeypatch.setenv("GIT_CONFIG_COUNT", "3")
-    for index, (key, value) in enumerate((
-        ("core.hooksPath", str(repo / ".git" / "hooks")),
-        ("user.name", "CRG Hook Test"),
-        ("user.email", "hook-tests@example.invalid"),
-    )):
+    for index, (key, value) in enumerate(
+        (
+            ("core.hooksPath", str(repo / ".git" / "hooks")),
+            ("user.name", "CRG Hook Test"),
+            ("user.email", "hook-tests@example.invalid"),
+        )
+    ):
         monkeypatch.setenv(f"GIT_CONFIG_KEY_{index}", key)
         monkeypatch.setenv(f"GIT_CONFIG_VALUE_{index}", value)
     git(repo, "init", "-b", "main")
@@ -42,7 +50,7 @@ def hook_repo(tmp_path, monkeypatch):
     binary = bin_dir / "code-review-graph"
     binary.write_text(
         '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CRG_HOOK_LOG"\n'
-        'mkdir -p .code-review-graph\ntouch .code-review-graph/graph.db\n'
+        "mkdir -p .code-review-graph\ntouch .code-review-graph/graph.db\n"
     )
     binary.chmod(0o755)
     monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
@@ -71,7 +79,8 @@ def test_main_tree_hook_still_runs_with_explicit_root(tmp_path, monkeypatch):
     install_git_hook(repo)
     commit_change(repo)
     assert commands.read_text().splitlines() == [
-        f"update --repo {repo}", f"detect-changes --brief --repo {repo}",
+        f"update --repo {repo}",
+        f"detect-changes --brief --repo {repo}",
     ]
 
 
@@ -82,7 +91,8 @@ def test_upgrade_preserves_user_hook_commands_and_is_idempotent(tmp_path, monkey
     monkeypatch.setenv("USER_HOOK_LOG", str(marker))
     hook.write_text(
         '#!/bin/sh\necho before >> "$USER_HOOK_LOG"\n'
-        + LEGACY_SCRIPT + 'echo after >> "$USER_HOOK_LOG"\n'
+        + LEGACY_SCRIPT
+        + 'echo after >> "$USER_HOOK_LOG"\n'
     )
     hook.chmod(0o755)
     install_git_hook(repo)

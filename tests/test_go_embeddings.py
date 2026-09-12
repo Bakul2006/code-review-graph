@@ -32,7 +32,8 @@ from code_review_graph.tools import query_graph
 )
 def test_extracts_only_direct_embedded_type_names(declaration, targets):
     _, edges = CodeParser().parse_bytes(
-        Path("sample.go"), f"package sample\ntype Child {declaration}\n".encode(),
+        Path("sample.go"),
+        f"package sample\ntype Child {declaration}\n".encode(),
     )
     inherits = [(edge.source, edge.target) for edge in edges if edge.kind == "INHERITS"]
     assert set(inherits) == {("sample.go::Child", target) for target in targets}
@@ -91,7 +92,9 @@ def test_inheritors_query_finds_struct_and_interface_embeddings(tmp_path):
 @pytest.mark.parametrize("framework", ["spring", "temporal"])
 @pytest.mark.parametrize("has_java_implementation", [False, True])
 def test_go_embedding_does_not_change_java_implementation_resolution(
-    tmp_path, framework, has_java_implementation,
+    tmp_path,
+    framework,
+    has_java_implementation,
 ):
     from code_review_graph.spring_resolver import resolve_spring_di_calls
     from code_review_graph.temporal_resolver import resolve_temporal_calls
@@ -100,9 +103,7 @@ def test_go_embedding_does_not_change_java_implementation_resolution(
     if has_java_implementation:
         java_source += "class JavaWorkActivity implements WorkActivity { public void work() {} }\n"
     if framework == "spring":
-        java_source += (
-            "class Client { @Autowired WorkActivity dep; void run() { dep.work(); } }\n"
-        )
+        java_source += "class Client { @Autowired WorkActivity dep; void run() { dep.work(); } }\n"
         resolve = resolve_spring_di_calls
     else:
         java_source += (

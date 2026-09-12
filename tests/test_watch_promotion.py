@@ -1,4 +1,5 @@
 """Failed budget promotion must preserve coverage until its replacement is live."""
+
 import json
 import threading
 
@@ -39,8 +40,11 @@ def supervisor_with_full_budget(root):
         (root / "node_modules" / f"dep{index}").mkdir(parents=True)
     observer = PromotionObserver(root)
     supervisor = _WatchSupervisor(
-        observer, root, _load_ignore_patterns(root),
-        health_path=root / "health.json", max_schedules=2,
+        observer,
+        root,
+        _load_ignore_patterns(root),
+        health_path=root / "health.json",
+        max_schedules=2,
     )
     supervisor.schedule_initial(object())
     return supervisor, observer
@@ -103,7 +107,11 @@ def test_polling_observer_keeps_events_across_promotion_failure(tmp_path, monkey
 
     observer = PollingObserver(timeout=0.02)
     supervisor = _WatchSupervisor(
-        observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None, max_schedules=2,
+        observer,
+        tmp_path,
+        _load_ignore_patterns(tmp_path),
+        health_path=None,
+        max_schedules=2,
     )
     supervisor.schedule_initial(Handler())
     observer.start()

@@ -1,4 +1,5 @@
 """Branch review must exclude changes made only on the base branch."""
+
 import subprocess
 
 from code_review_graph.graph import GraphStore
@@ -11,7 +12,11 @@ def test_review_context_excludes_base_only_changes(tmp_path, monkeypatch):
 
     def git(*args):
         return subprocess.run(
-            ["git", *args], cwd=repo, check=True, capture_output=True, timeout=10,
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            timeout=10,
         )
 
     git("init", "-b", "main")
@@ -29,7 +34,8 @@ def test_review_context_excludes_base_only_changes(tmp_path, monkeypatch):
     git("checkout", "feature")
     store = GraphStore(tmp_path / "graph.db")
     monkeypatch.setattr(
-        "code_review_graph.tools.review._get_store", lambda _root: (store, repo),
+        "code_review_graph.tools.review._get_store",
+        lambda _root: (store, repo),
     )
     result = get_review_context(base="main", repo_root=str(repo), include_source=False)
     assert result["status"] == "ok"

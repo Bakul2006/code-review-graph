@@ -1,4 +1,5 @@
 """Review snippets must preserve source text on legacy locale defaults."""
+
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -16,10 +17,14 @@ def test_review_snippet_preserves_utf8_under_legacy_default(tmp_path, monkeypatc
     monkeypatch.setattr(Path, "read_text", legacy_read)
     store = MagicMock()
     store.get_impact_radius.return_value = {
-        "changed_nodes": [], "impacted_nodes": [], "impacted_files": [], "edges": [],
+        "changed_nodes": [],
+        "impacted_nodes": [],
+        "impacted_files": [],
+        "edges": [],
     }
     monkeypatch.setattr(
-        "code_review_graph.tools.review._get_store", lambda _root: (store, tmp_path),
+        "code_review_graph.tools.review._get_store",
+        lambda _root: (store, tmp_path),
     )
     result = get_review_context(changed_files=["module.py"], repo_root=str(tmp_path))
     assert result["status"] == "ok"

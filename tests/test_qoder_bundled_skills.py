@@ -1,11 +1,17 @@
 """Qoder installs the shipped workflows independently of the user's repository."""
+
 from pathlib import Path
 
 from code_review_graph.skills import install_qoder_skills
 
 SHIPPED_SKILLS = {
-    "build-graph", "debug-issue", "explore-codebase", "refactor-safely",
-    "review-changes", "review-delta", "review-pr",
+    "build-graph",
+    "debug-issue",
+    "explore-codebase",
+    "refactor-safely",
+    "review-changes",
+    "review-delta",
+    "review-pr",
 }
 
 
