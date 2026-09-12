@@ -19,7 +19,12 @@ from ..graph import (
     node_to_dict,
 )
 from ..hints import generate_hints, get_session
-from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
+from ..incremental import (
+    get_changed_files,
+    get_db_path,
+    get_staged_and_unstaged,
+    resolve_review_base,
+)
 from ..parser import normalize_file_path
 from ..search import hybrid_search
 from ..uncertainty import (
@@ -147,6 +152,7 @@ def get_impact_radius(
     store, root = _get_store(repo_root)
     try:
         if changed_files is None:
+            base = resolve_review_base(root, base)
             changed_files = get_changed_files(root, base)
             if not changed_files:
                 changed_files = get_staged_and_unstaged(root)
