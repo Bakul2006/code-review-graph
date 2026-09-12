@@ -1950,6 +1950,7 @@ class _WatchSupervisor:
         self._live_threads: dict[int, threading.Thread] = {}
         self._repaired_roots: set[str] = set()
         self._degraded = False
+        self._promotion_failed = False
         self._last_health_write = 0.0
         self._last_health_state: tuple[bool, bool, tuple[str, ...]] | None = None
         self._started_at = time.time()
@@ -1963,8 +1964,8 @@ class _WatchSupervisor:
 
     @property
     def degraded(self) -> bool:
-        """True once the watch budget forced a coarser, recursive watch."""
-        return self._degraded
+        """True for coarser coverage or a failed promotion in the current sync."""
+        return self._degraded or self._promotion_failed
 
     def attach(self, observer: Any) -> None:
         """Bind the observer, once the initial build has earned one."""
@@ -2017,6 +2018,7 @@ class _WatchSupervisor:
         """
         adopted: list[str] = []
         vanished: list[str] = []
+        self._promotion_failed = False
         for parent in sorted(self._shallow):
             present = {
                 name for name, is_dir in _child_directories(Path(parent)) if is_dir
@@ -2072,8 +2074,7 @@ class _WatchSupervisor:
             # Promoting the parent — often the repository root — hands every
             # ignored tree under it back to the OS, which is the condition
             # #811 is about.  It is the last resort, never the first.
-            self._promote_to_recursive(os.path.dirname(candidate))
-            return True
+            return self._promote_to_recursive(os.path.dirname(candidate))
         for path, recursive in plan:
             self._schedule(path, recursive=recursive)
         logger.info("Watching new directory %s (%d watch(es))", relative, len(plan))
@@ -2100,11 +2101,21 @@ class _WatchSupervisor:
         # One recursive watch still filters every other directory in the repo.
         return [(directory, True)]
 
-    def _promote_to_recursive(self, parent: str) -> None:
-        """Trade filtering for coverage when the watch budget runs out."""
+    def _promote_to_recursive(self, parent: str) -> bool:
+        """Replace the filtered plan only after its recursive watch is live."""
+        # Watchdog distinguishes handles by both path and recursive flag. Bypass
+        # _schedule's path-only dedup so both parent watches can coexist briefly.
+        try:
+            handle = self._observer.schedule(self._handler, parent, recursive=True)
+        except OSError as exc:
+            self._promotion_failed = True
+            logger.warning(
+                "Could not promote watch on %s; keeping existing watches: %s", parent, exc
+            )
+            return False
         for path in [parent, *self._descendants_of(parent)]:
             self._release_directory(path)
-        self._schedule(Path(parent), recursive=True)
+        self._watches[parent] = _WatchEntry(handle, _watch_identity(parent))
         self._degraded = True
         logger.warning(
             "Watch budget of %d reached; watching %s recursively instead — ignored "
@@ -2113,6 +2124,7 @@ class _WatchSupervisor:
             self._max_schedules,
             parent,
         )
+        return True
 
     def _release_directory(self, path: str) -> None:
         entry = self._watches.pop(path, None)
@@ -2249,7 +2261,7 @@ class _WatchSupervisor:
         if self._health_path is None:
             return
         now = time.time()
-        state = (observer_alive, self._degraded, tuple(dead_threads))
+        state = (observer_alive, self.degraded, tuple(dead_threads))
         if (
             not force
             and state == self._last_health_state
@@ -2266,7 +2278,7 @@ class _WatchSupervisor:
             "events_seen": events_seen,
             "watched_paths": len(self._watches),
             "dead_threads": list(dead_threads),
-            "degraded": self._degraded,
+            "degraded": self.degraded,
             "phase": phase,
         }
         try:
