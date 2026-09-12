@@ -2233,7 +2233,7 @@ class _WatchSupervisor:
         still the live watch for a directory that is still the same directory.
         Three things are deliberately not deaths:
 
-        * a thread never seen alive — an emitter caught between construction
+        * a thread not yet started — an emitter caught between construction
           and start is not a corpse;
         * a thread whose watch we have already released, or whose root is gone.
           Both backends stop an emitter when its own root disappears, so a
@@ -2258,7 +2258,9 @@ class _WatchSupervisor:
             if thread.is_alive():
                 still_present[key] = thread
                 continue
-            if key not in self._live_threads:
+            # Thread.ident survives termination, so a thread that started
+            # and died before our first tick still counts as a death (#891).
+            if key not in self._live_threads and thread.ident is None:
                 continue
             if root is None:
                 dead.append(thread.name)
