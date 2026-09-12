@@ -10,7 +10,14 @@ from typing import Any
 from ..config_keys import normalize_spring_config_key
 from ..context_savings import attach_context_savings, estimate_file_tokens
 from ..embeddings import EmbeddingStore
-from ..graph import GraphNode, GraphStore, _sanitize_name, edge_to_dict, node_to_dict
+from ..graph import (
+    GraphNode,
+    GraphStore,
+    _compatible_edge_languages,
+    _sanitize_name,
+    edge_to_dict,
+    node_to_dict,
+)
 from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
 from ..parser import normalize_file_path
@@ -628,13 +635,27 @@ def query_graph(
             # (e.g. "Animal") while qn is fully qualified
             # (e.g. "sample.dart::Animal"). Search by plain name too. See: #87
             if total_results == 0 and node:
+                # Ambiguity is measured on the indexed name alone: several
+                # declarations answer to this bare base name. Which one it
+                # binds to is #943's work — file namespaces and imports cannot
+                # prove it — so caveat the matches instead of guessing.
+                languages = (
+                    _compatible_edge_languages(node.language) if node.language else (None,)
+                )
+                ambiguous_base = sum(
+                    store.count_nodes_by_name(node.name, language=language, kinds=("Class", "Type"))
+                    for language in languages
+                ) > 1
                 for kind in ("INHERITS", "IMPLEMENTS"):
                     for e in store.iter_edges_by_target_name(
                         node.name, kind=kind, language=node.language or None,
                     ):
                         child = store.get_node(e.source_qualified)
                         if child:
-                            add_result(node_to_dict(child), e)
+                            child_result = node_to_dict(child)
+                            if ambiguous_base:
+                                child_result["inferred_by"] = "bare_name"
+                            add_result(child_result, e)
 
         elif pattern == "triggers_of":
             for edge in store.get_edges_by_source(qn):
@@ -725,10 +746,13 @@ def query_graph(
         )
 
         if detail_level == "minimal":
+            result_fields: tuple[str, ...] = ("name", "kind", "file_path", "indirect")
+            if pattern == "inheritors_of":
+                result_fields += ("inferred_by",)
             minimal_results = [
                 {
                     k: r[k]
-                    for k in ("name", "kind", "file_path", "indirect")
+                    for k in result_fields
                     if k in r
                 }
                 for r in results
