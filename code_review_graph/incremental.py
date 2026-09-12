@@ -1224,9 +1224,9 @@ def _reconcile_stale_files(
 def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
     """Refuse an incremental reconciliation anchored to a different root.
 
-    Authoritative File nodes identify the root a graph was built with. If none
-    of them are under the requested root, treating every row as stale is more
-    likely to destroy a usable graph than to clean up orphan rows. Orphan-only
+    Authoritative File nodes identify the root a graph was built with. Every
+    marker must be under the requested root: partial overlap can otherwise
+    delete valid files in a parent or sibling repository (#909). Orphan-only
     databases have no File markers and retain the purge behavior from #861.
     """
     file_paths = store.get_file_marker_paths()
@@ -1234,12 +1234,16 @@ def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
         return
     prefix = normalize_file_path(repo_root)
     prefix = prefix if prefix.endswith("/") else prefix + "/"
-    if any(normalize_file_path(path).startswith(prefix) for path in file_paths):
+    foreign_paths = [
+        normalize_file_path(path) for path in file_paths
+        if not normalize_file_path(path).startswith(prefix)
+    ]
+    if not foreign_paths:
         return
-    sample = normalize_file_path(sorted(file_paths)[0])
+    sample = sorted(foreign_paths)[0]
     raise RuntimeError(
-        f"the graph holds {len(file_paths)} file(s) such as {sample!r}, none of "
-        f"them under {str(repo_root)!r}; it was built with a different "
+        f"the graph holds {len(foreign_paths)} file(s) such as {sample!r} outside "
+        f"{str(repo_root)!r}; it was built with a different "
         "repository root. Rebuild it, or retry with the root it was built "
         "with, instead of reconciling every file away."
     )
