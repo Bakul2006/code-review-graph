@@ -1150,7 +1150,13 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "perl": ["use_statement", "require_expression"],
     "kotlin": ["import_header"],
     "swift": ["import_declaration"],
-    "php": ["namespace_use_declaration"],
+    "php": [
+        "namespace_use_declaration",
+        "include_expression",
+        "include_once_expression",
+        "require_expression",
+        "require_once_expression",
+    ],
     "scala": ["import_declaration"],
     "solidity": ["import_directive"],
     # Dart: import_or_export wraps library_import > import_specification > configurable_uri
@@ -13861,6 +13867,18 @@ class CodeParser:
                 current = current.parent
 
         elif language == "php":
+            # Literal include paths are filesystem paths, not PHP namespaces.
+            # Preserve absolute paths and explicit relative traversal instead
+            # of stripping the root or searching ancestor namespace roots.
+            if "/" in module or module.endswith(".php"):
+                try:
+                    boundary = self._php_repository_boundary(caller_dir)
+                    target = (caller_dir / module).resolve()
+                except (OSError, RuntimeError, ValueError):
+                    return None
+                if boundary is not None and _path_is_within(target, boundary) and target.is_file():
+                    return str(target)
+                return None
             composer_resolved = self._resolve_php_composer_module(
                 module, caller_dir,
             )
@@ -13874,7 +13892,12 @@ class CodeParser:
             # ``.../App/Foo``) resolve; vendor/global classes (``\Exception``)
             # and ``use function`` / ``use const`` targets with no matching
             # file stay unresolved and keep the bare FQN, like JDK imports.
-            rel_path = module.replace("\\", "/").lstrip("/") + ".php"
+            normalized_module = module.replace("\\", "/").lstrip("/")
+            rel_path = (
+                normalized_module
+                if normalized_module.endswith(".php")
+                else normalized_module + ".php"
+            )
             try:
                 boundary = self._php_repository_boundary(caller_dir)
                 current = caller_dir.resolve()
@@ -15800,6 +15823,22 @@ class CodeParser:
                     if txt and txt != "extends":
                         imports.append(txt)
         elif language == "php":
+            include_types = {
+                "include_expression",
+                "include_once_expression",
+                "require_expression",
+                "require_once_expression",
+            }
+            if node.type in include_types:
+                for child in node.children:
+                    if child.type == "string":
+                        value = child.text.decode(
+                            "utf-8", errors="replace",
+                        ).strip("'\"")
+                        if value:
+                            imports.append(value)
+                return imports
+
             # ``namespace_use_declaration`` covers several shapes:
             #   use A\B\C;            use A\B\C as D;
             #   use function A\b;     use const A\B;
