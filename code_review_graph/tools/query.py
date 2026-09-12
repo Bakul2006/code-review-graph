@@ -482,6 +482,30 @@ def query_graph(
                 if source:
                     seen_reference_sources.add(e.source_qualified)
                     add_result(node_to_dict(source), e)
+            # Fallback: a module that imports the symbol through a specifier
+            # the parser cannot resolve (npm workspace alias, tsconfig path
+            # mapping) stores the REFERENCES target as a bare name rather than
+            # "<file>::<Symbol>". Without this pass those dependents are
+            # dropped silently, which reads as proof of absence. Only merge
+            # when the bare name identifies exactly one node, so a name shared
+            # by two symbols is never attributed to both.
+            if node and store.count_nodes_by_name(node.name) == 1:
+                for e in store.iter_edges_by_target_name(
+                    node.name,
+                    kind="REFERENCES",
+                    language=node.language or None,
+                ):
+                    if (
+                        "ambiguous_targets" in e.extra
+                        or e.source_qualified in seen_reference_sources
+                    ):
+                        continue
+                    source = store.get_node(e.source_qualified)
+                    if source:
+                        seen_reference_sources.add(e.source_qualified)
+                        source_result = node_to_dict(source)
+                        source_result["target_resolution"] = "unresolved"
+                        add_result(source_result, e)
 
         elif pattern == "callees_of":
             seen_targets: set[str] = set()
@@ -749,6 +773,8 @@ def query_graph(
             result_fields: tuple[str, ...] = ("name", "kind", "file_path", "indirect")
             if pattern == "inheritors_of":
                 result_fields += ("inferred_by",)
+            if pattern == "references_to":
+                result_fields += ("target_resolution",)
             minimal_results = [
                 {
                     k: r[k]
