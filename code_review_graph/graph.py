@@ -331,9 +331,17 @@ class GraphStore:
         """Remove one deleted file and every graph reference to its nodes."""
         return self.remove_files_permanently([file_path])
 
-    def remove_files_permanently(self, file_paths: list[str]) -> int:
-        """Atomically remove deleted files and graph references to their nodes."""
-        file_paths = [normalize_file_path(p) for p in file_paths]
+    def remove_files_permanently(
+        self, file_paths: list[str], *, stored_paths: bool = False,
+    ) -> int:
+        """Atomically remove deleted files and graph references to their nodes.
+
+        Reconciliation passes exact inventory spellings with ``stored_paths``.
+        Normalising legacy rows would miss them and could delete a different,
+        current row that already uses the canonical spelling (#911).
+        """
+        if not stored_paths:
+            file_paths = [normalize_file_path(p) for p in file_paths]
         changed = 0
         has_embeddings = self._conn.execute(
             "SELECT 1 FROM sqlite_master "

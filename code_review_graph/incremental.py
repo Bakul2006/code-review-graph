@@ -1217,7 +1217,7 @@ def _reconcile_stale_files(
                 current_paths.add(stored_file)
     stale_files = sorted(stored_files - current_paths)
     if stale_files:
-        store.remove_files_permanently(stale_files)
+        store.remove_files_permanently(stale_files, stored_paths=True)
     return stale_files
 
 
