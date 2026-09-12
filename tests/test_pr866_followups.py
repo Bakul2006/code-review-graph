@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from code_review_graph.parser import CodeParser
 from code_review_graph.tools.review import get_affected_flows_func
 
@@ -47,3 +49,17 @@ def test_cjs_specifier_resolves_cts_source(tmp_path: Path) -> None:
     resolved = CodeParser()._resolve_module_to_file("./foo.cjs", str(caller), "typescript")
 
     assert resolved == (tmp_path / "foo.cts").as_posix()
+
+
+@pytest.mark.parametrize(("specifier", "native"), [("mjs", "mts"), ("cjs", "cts")])
+def test_native_module_source_precedes_legacy_ts_fallback(tmp_path, specifier, native):
+    caller = tmp_path / "app.ts"
+    native_source = tmp_path / f"foo.{native}"
+    native_source.write_text("export {}\n")
+    (tmp_path / "foo.ts").write_text("export {}\n")
+    resolved = CodeParser()._resolve_module_to_file(
+        f"./foo.{specifier}",
+        str(caller),
+        "typescript",
+    )
+    assert resolved == str(native_source.resolve())

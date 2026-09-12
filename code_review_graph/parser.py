@@ -13783,8 +13783,8 @@ class CodeParser:
                 suffix_substitutions = {
                     ".js": (".ts", ".tsx", ".jsx"),
                     ".jsx": (".ts", ".tsx"),
-                    ".mjs": (".mts",),
-                    ".cjs": (".cts",),
+                    ".mjs": (".mts", ".ts", ".tsx"),
+                    ".cjs": (".cts", ".ts", ".tsx"),
                 }
                 if base.suffix in suffix_substitutions:
                     for ext in suffix_substitutions[base.suffix]:
