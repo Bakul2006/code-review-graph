@@ -536,7 +536,21 @@ def build_or_update_graph(
                 "summary": summary,
             }
         else:
-            result = incremental_update(root, store, base=base_resolved)
+            try:
+                result = incremental_update(root, store, base=base_resolved)
+            except RuntimeError as exc:
+                # Change discovery or root validation failed before anything was
+                # stored; report it the way every other failure is reported.
+                return {
+                    "status": "error",
+                    "build_type": "incremental",
+                    "base_resolved": base_resolved,
+                    "files_updated": 0,
+                    "errors": [],
+                    "error": str(exc),
+                    "summary": f"Incremental update failed: {exc}",
+                    "postprocess_level": postprocess,
+                }
             failed = [str(item.get("file", "?")) for item in result["errors"]]
             if result["files_updated"] == 0 and not failed:
                 summary = (

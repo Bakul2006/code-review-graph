@@ -1824,6 +1824,9 @@ def main() -> None:
                 sys.exit(1)
             finally:
                 logging.disable(previous_disable)
+            if result.get("status") == "error":
+                print(f"Error: {result.get('summary', 'update failed')}", file=sys.stderr)
+                sys.exit(1)
             nodes = result.get("total_nodes", 0)
             edges = result.get("total_edges", 0)
             if not args.quiet:
