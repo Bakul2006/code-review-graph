@@ -6,7 +6,7 @@
 
 ## Graph Tool Usage (Token-Efficient)
 When using code-review-graph MCP tools, follow these rules:
-1. First call: `get_minimal_context(task="<description>")` — costs ~100 tokens, gives you the full picture.
+1. First call: `get_minimal_context_tool(task="<description>")` — costs ~100 tokens, gives you the full picture.
 2. All subsequent calls: use `detail_level="minimal"` unless you need more.
 3. Prefer `query_graph_tool` with a specific target over broad `list_*` calls.
 4. The `next_tool_suggestions` field in every response tells you the optimal next step.
