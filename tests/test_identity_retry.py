@@ -181,8 +181,8 @@ def test_pending_identity_preserves_git_freshness_and_content_reconciliation(
         assert set(calls) == {"healthy_0.py", "broken.cpp"}
         assert updated["files_updated"] == 1
         assert updated["errors"]
-        assert updated["freshness_advanced"] is False
-        assert store.get_metadata("git_head_sha") == initial_sha
+        assert updated["freshness_advanced"] is True
+        assert store.get_metadata("git_head_sha") == git("rev-parse", "HEAD")
         assert store.get_metadata("cpp_identity_version") is None
     with monkeypatch.context() as recovered:
         calls = failing_parser(recovered, failing=False)

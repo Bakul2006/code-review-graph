@@ -605,23 +605,25 @@ def test_automatic_update_after_unsupported_file_commit_refreshes_freshness(
     ) == (commit_b, True)
 
 
-def test_explicit_changed_files_update_does_not_refresh_freshness(
+def test_explicit_changed_files_update_records_head_when_files_stored(
     tmp_path: Path,
 ) -> None:
     repo = _init_repo(tmp_path)
-    commit_a = _git_ok(repo, "rev-parse", "HEAD").stdout.strip()
     build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
 
     (repo / "a.py").write_text("def alpha():\n    return 2\n")
     _git_ok(repo, "add", "a.py")
     _git_ok(repo, "commit", "-m", "change alpha")
+    commit_b = _git_ok(repo, "rev-parse", "HEAD").stdout.strip()
 
     with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
         result = incremental_update(repo, store, changed_files=["a.py"])
         stored_sha = store.get_metadata("git_head_sha")
 
+    # Watch batches pass explicit files; once they store the change the graph
+    # matches HEAD and must say so, or every query carries a stale caveat.
     assert result["files_updated"] == 1
-    assert stored_sha == commit_a
+    assert stored_sha == commit_b
 
 
 def test_failed_automatic_update_does_not_claim_graph_is_current(
@@ -654,11 +656,15 @@ def test_failed_automatic_update_does_not_claim_graph_is_current(
     with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
         stored_sha = store.get_metadata("git_head_sha")
 
-    assert result["status"] == "error"
+    # The failure is visible in status, errors and summary, but the anchor
+    # still advances: freezing it would re-diff the same range on every later
+    # update and never recover on its own.
+    assert result["status"] == "partial"
     assert result["files_updated"] == 0
     assert result["errors"] == [{"file": "a.py", "error": "forced parse failure"}]
-    assert stored_sha == commit_a
-    assert stored_sha != commit_b
+    assert stored_sha == commit_b
+    assert stored_sha != commit_a
+    assert "a.py" in result["summary"]
     assert "up to date" not in result["summary"].lower()
 
 

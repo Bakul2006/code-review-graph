@@ -1492,8 +1492,9 @@ def full_build(
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     _store_cpp_identity_pending(store, cpp_errors)
-    if not errors:
-        _store_vcs_metadata(repo_root, store)
+    # Failed files are reported in ``errors`` and simply hold no rows; the
+    # anchor still describes the commit the stored files were parsed at.
+    _store_vcs_metadata(repo_root, store)
     store.commit()
 
     python_stats = _run_python_resolver(store)
@@ -1733,14 +1734,21 @@ def incremental_update(
     scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
 
+    # Freshness follows what was stored. A file that failed to parse is
+    # reported in ``errors`` and keeps its previous rows; it must not stop the
+    # successfully stored files from being recorded as current, otherwise one
+    # persistently failing file pins the anchor forever (every later update
+    # re-diffs the same range, and a failed full build forces full rebuilds).
+    # Explicit batches (watch mode, ``--base``) record HEAD when they stored
+    # something; an explicit batch that stored nothing is not evidence that
+    # the graph matches HEAD, so it keeps the old anchor.
     freshness_advanced = False
-    if not errors and (files_updated or authoritative_git_sync):
+    if files_updated or authoritative_git_sync:
         store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
         store.set_metadata("last_build_type", "incremental")
         if not remaining_identity:
             store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
-        if authoritative_git_sync or (vcs == "svn" and files_updated):
-            freshness_advanced = _store_vcs_metadata(repo_root, store)
+        freshness_advanced = _store_vcs_metadata(repo_root, store)
         store.commit()
 
     return {

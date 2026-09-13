@@ -520,32 +520,25 @@ def build_or_update_graph(
 
         if full_rebuild:
             result = full_build(root, store, recurse_submodules)
+            failed = [str(item.get("file", "?")) for item in result["errors"]]
+            summary = (
+                f"Full build complete: parsed {result['files_parsed']} files, "
+                f"created {result['total_nodes']} nodes and "
+                f"{result['total_edges']} edges."
+            )
+            if failed:
+                summary += f" {len(failed)} file(s) failed to parse: {failed}."
             build_result = {
                 **result,
-                "status": "ok",
+                "status": "partial" if failed else "ok",
                 "build_type": "full",
                 "base_resolved": None,
-                "summary": (
-                    f"Full build complete: parsed {result['files_parsed']} files, "
-                    f"created {result['total_nodes']} nodes and "
-                    f"{result['total_edges']} edges."
-                ),
+                "summary": summary,
             }
         else:
             result = incremental_update(root, store, base=base_resolved)
-            if result["errors"]:
-                return {
-                    **result,
-                    "status": "error",
-                    "build_type": "incremental",
-                    "base_resolved": base_resolved,
-                    "summary": (
-                        f"Incremental update incomplete: {len(result['errors'])} "
-                        "file(s) failed; graph freshness was not advanced."
-                    ),
-                    "postprocess_level": postprocess,
-                }
-            if result["files_updated"] == 0:
+            failed = [str(item.get("file", "?")) for item in result["errors"]]
+            if result["files_updated"] == 0 and not failed:
                 summary = (
                     "No changes detected. Graph is up to date."
                     if result.get("freshness_advanced")
@@ -559,18 +552,24 @@ def build_or_update_graph(
                     "summary": summary,
                     "postprocess_level": postprocess,
                 }
+            summary = (
+                f"Incremental update: {result['files_updated']} files re-parsed, "
+                f"{result['total_nodes']} nodes and "
+                f"{result['total_edges']} edges updated. "
+                f"Changed: {result['changed_files']}. "
+                f"Dependents also updated: {result['dependent_files']}."
+            )
+            if failed:
+                summary += (
+                    f" {len(failed)} file(s) failed to parse and keep their "
+                    f"previous graph rows: {failed}."
+                )
             build_result = {
                 **result,
-                "status": "ok",
+                "status": "partial" if failed else "ok",
                 "build_type": "incremental",
                 "base_resolved": base_resolved,
-                "summary": (
-                    f"Incremental update: {result['files_updated']} files re-parsed, "
-                    f"{result['total_nodes']} nodes and "
-                    f"{result['total_edges']} edges updated. "
-                    f"Changed: {result['changed_files']}. "
-                    f"Dependents also updated: {result['dependent_files']}."
-                ),
+                "summary": summary,
             }
 
         # Pass changed_files for incremental flow/community detection

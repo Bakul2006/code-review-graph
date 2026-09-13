@@ -677,6 +677,20 @@ def _run_graph_tool_command(args, repo_root: Path) -> None:
     print(json.dumps(result, indent=2, default=str))
 
 
+def _warn_failed_files(result: dict) -> None:
+    """Report files that failed to parse; their previous graph rows are kept."""
+    failed = result.get("errors") or []
+    if not failed:
+        return
+    names = ", ".join(str(item.get("file", "?")) for item in failed[:5])
+    extra = f" (+{len(failed) - 5} more)" if len(failed) > 5 else ""
+    print(
+        f"Warning: {len(failed)} file(s) failed to parse and were not updated: "
+        f"{names}{extra}",
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
     """Main CLI entry point."""
     _configure_utf8_stdio()
@@ -1833,6 +1847,7 @@ def main() -> None:
                         f"{nodes} nodes, {edges} edges"
                         f" (postprocess={pp})"
                     )
+            _warn_failed_files(result)
 
             # --brief: append a one-line change-impact summary with the same
             # estimated context-savings approximation that detect-changes uses.
