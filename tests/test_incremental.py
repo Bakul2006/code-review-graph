@@ -1834,7 +1834,7 @@ class TestRevertedContentParity:
 
         def fake_content_scan(repo_root, store):
             scan_calls.append(repo_root)
-            return [], {}
+            return [], {}, set()
 
         monkeypatch.setattr(
             incremental_module,

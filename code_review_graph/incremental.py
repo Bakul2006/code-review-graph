@@ -706,7 +706,8 @@ def clear_nested_ignore_cache(repo_root: Path | None = None) -> None:
 def _is_binary(path: Path) -> bool:
     """Quick heuristic: check if file appears to be binary."""
     try:
-        chunk = path.read_bytes()[:8192]
+        with path.open("rb") as handle:
+            chunk = handle.read(8192)
         return b"\x00" in chunk
     except (OSError, PermissionError):
         return True
@@ -997,8 +998,12 @@ def get_changed_files(
 def _find_content_mismatches(
     repo_root: Path,
     store: "GraphStore",
-) -> tuple[list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str], set[str]]:
     """Find indexed files whose bytes differ from the graph's last parsed hash.
+
+    Also returns the stored spellings of every file read that is not binary,
+    so stale-file reconciliation can reuse this pass instead of reading the
+    repository a second time.
 
     Git diffs compare the working tree with a base commit.  If a file is
     changed, incrementally indexed, and then reverted before the next update,
@@ -1009,6 +1014,7 @@ def _find_content_mismatches(
     """
     mismatched_files: list[str] = []
     current_hashes: dict[str, str] = {}
+    text_files: set[str] = set()
 
     for stored_path, stored_hash in store.get_file_hashes().items():
         path = Path(stored_path)
@@ -1024,10 +1030,12 @@ def _find_content_mismatches(
             # outside the repository cannot be represented as relative update
             # inputs and are left to that reconciliation path as well.
             continue
+        if b"\x00" not in raw[:8192]:
+            text_files.add(stored_path)
         if current_hash != stored_hash:
             mismatched_files.append(relative_path)
 
-    return mismatched_files, current_hashes
+    return mismatched_files, current_hashes, text_files
 
 
 def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> list[str]:
@@ -1232,8 +1240,14 @@ def _reconcile_stale_files(
     repo_root: Path,
     store: GraphStore,
     current_files: list[str] | None = None,
+    *,
+    known_text: set[str] | None = None,
 ) -> list[str]:
-    """Remove graph files absent from the current parseable repository inventory."""
+    """Remove graph files absent from the current parseable repository inventory.
+
+    ``known_text`` holds stored spellings already read and found not binary in
+    this update, so they are not read again just to repeat that check.
+    """
     stored_files = set(store.get_all_files())
     current_paths: set[str]
     if current_files is not None:
@@ -1255,7 +1269,10 @@ def _reconcile_stale_files(
                 and not path.is_symlink()
                 and not _should_ignore(relative, ignore_patterns)
                 and parser.detect_language(path) is not None
-                and not _is_binary(path)
+                and (
+                    (known_text is not None and stored_file in known_text)
+                    or not _is_binary(path)
+                )
             ):
                 current_paths.add(stored_file)
     stale_files = sorted(stored_files - current_paths)
@@ -1577,16 +1594,23 @@ def incremental_update(
         )
     content_mismatches: list[str] = []
     current_hashes: dict[str, str] = {}
+    known_text: set[str] | None = None
     if reconcile_stale:
-        # The content scan reads every indexed file.  Watch batches disable stale
-        # reconciliation to remain proportional to filesystem events; reverted
-        # content arrives in those events and is covered by the normal hash check.
-        content_mismatches, current_hashes = _find_content_mismatches(
+        # The content scan reads every indexed file once; the hashes and the
+        # binary check it produces are reused below so nothing is read twice.
+        # Watch batches disable stale reconciliation to remain proportional to
+        # filesystem events; reverted content arrives in those events and is
+        # covered by the normal hash check.
+        content_mismatches, current_hashes, known_text = _find_content_mismatches(
             repo_root,
             store,
         )
     changed_files = list(dict.fromkeys([*changed_files, *content_mismatches]))
-    stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
+    stale_files = (
+        _reconcile_stale_files(repo_root, store, known_text=known_text)
+        if reconcile_stale
+        else []
+    )
 
     # Find dependent files (files that import from changed files)
     dependent_files: set[str] = set()
@@ -1614,7 +1638,13 @@ def incremental_update(
     for rel_path in all_files:
         if _should_ignore(rel_path, ignore_patterns):
             if rel_path in remaining_identity:
-                if normalize_file_path(repo_root / rel_path) in stale_files:
+                ignored_path = repo_root / rel_path
+                if (
+                    normalize_file_path(ignored_path) in stale_files
+                    or not store.get_nodes_by_file(str(ignored_path))
+                ):
+                    # Nothing of this file is in the graph (it was removed as
+                    # stale, or never parsed), so there is nothing to migrate.
                     remaining_identity.discard(rel_path)
                 else:
                     errors.append({
