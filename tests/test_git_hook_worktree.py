@@ -104,3 +104,30 @@ def test_upgrade_preserves_user_hook_commands_and_is_idempotent(tmp_path, monkey
     commit_change(linked)
     assert marker.read_text().splitlines() == ["before", "after"]
     assert not commands.exists()
+
+
+def test_hook_needs_no_git_options_newer_than_2_13(tmp_path, monkeypatch):
+    """Git before 2.31 has no --path-format; the hook must not depend on it.
+
+    Git prepends its own exec path when running hooks, so a PATH shim cannot
+    simulate an older git here; check the generated script directly instead.
+    """
+    repo, _commands = hook_repo(tmp_path, monkeypatch)
+    hook = install_git_hook(repo)
+    script = hook.read_text()
+    assert "--path-format" not in script
+    assert "--git-common-dir" not in script
+    assert "commondir" in script
+
+
+def test_hook_opt_in_runs_in_linked_worktree(tmp_path, monkeypatch):
+    repo, commands = hook_repo(tmp_path, monkeypatch)
+    install_git_hook(repo)
+    linked = tmp_path / "linked tree"
+    git(repo, "worktree", "add", "-b", "feature", str(linked))
+    monkeypatch.setenv("CRG_HOOK_WORKTREES", "1")
+    commit_change(linked)
+    assert commands.read_text().splitlines() == [
+        f"update --repo {linked}",
+        f"detect-changes --brief --repo {linked}",
+    ]

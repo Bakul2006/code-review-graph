@@ -1150,7 +1150,9 @@ def install_git_hook(repo_root: Path) -> Path | None:
     git itself is unavailable. Returns None when no hooks directory can be
     determined. Exact generated legacy blocks are upgraded in place. The
     installed hook skips automatic checks in linked worktrees, where an
-    implicit update could build a duplicate graph for a different branch.
+    implicit update could build a duplicate graph for a different branch;
+    ``CRG_HOOK_WORKTREES=1`` opts a worktree back in. Detection relies only
+    on ``git rev-parse --absolute-git-dir`` (Git 2.13), not on newer options.
     """
     legacy_script = """\
 #!/bin/sh
@@ -1165,14 +1167,14 @@ fi
 # Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
 if command -v code-review-graph >/dev/null 2>&1; then
     crg_hook_git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || crg_hook_git_dir=""
-    crg_hook_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \\
-        || crg_hook_common_dir=""
     crg_hook_root=$(git rev-parse --show-toplevel 2>/dev/null) || crg_hook_root=""
-    if [ -z "$crg_hook_git_dir" ] || [ -z "$crg_hook_common_dir" ] || [ -z "$crg_hook_root" ]; then
+    if [ -z "$crg_hook_git_dir" ] || [ -z "$crg_hook_root" ]; then
         echo "code-review-graph: skipping automatic checks; cannot determine the Git worktree." >&2
-    elif [ "$crg_hook_git_dir" != "$crg_hook_common_dir" ]; then
+    elif [ -f "$crg_hook_git_dir/commondir" ] && [ "$CRG_HOOK_WORKTREES" != "1" ]; then
+        # Only a linked worktree's git dir carries a commondir file (Git 2.5+),
+        # so this needs no rev-parse options newer than --absolute-git-dir.
         echo "code-review-graph: skipping automatic checks in a linked worktree;" \\
-            "use an explicitly managed graph for this worktree." >&2
+            "set CRG_HOOK_WORKTREES=1 to keep a graph for this worktree too." >&2
     else
         code-review-graph update --repo "$crg_hook_root" || true
         code-review-graph detect-changes --brief --repo "$crg_hook_root" || true
