@@ -535,6 +535,9 @@ class TestWatchDaemon:
         save_config(config, config_file)
 
         daemon = WatchDaemon(config=config, config_path=config_file)
+        if daemon._windows_job is not None:
+            daemon._windows_job.close()
+            daemon._windows_job = None
 
         return {
             "daemon": daemon,
