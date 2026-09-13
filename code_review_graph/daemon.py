@@ -107,8 +107,6 @@ _RESTART_BACKOFF_BASE = float(os.environ.get("CRG_RESTART_BACKOFF", "30"))
 _RESTART_BACKOFF_MAX = float(os.environ.get("CRG_RESTART_BACKOFF_MAX", "900"))
 _RESTART_HEALTHY_SECONDS = float(os.environ.get("CRG_RESTART_HEALTHY_AFTER", "600"))
 
-_PROCESS_TERMINATE = 0x0001
-_PROCESS_SET_QUOTA = 0x0100
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 
@@ -133,8 +131,6 @@ class _WindowsJob:
             wintypes.DWORD,
         )
         kernel32.SetInformationJobObject.restype = wintypes.BOOL
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
@@ -184,18 +180,11 @@ class _WindowsJob:
 
     def assign(self, proc: subprocess.Popen[bytes]) -> None:
         """Assign *proc* to this job before it can outlive the daemon."""
-        process_handle = self._kernel32.OpenProcess(
-            _PROCESS_SET_QUOTA | _PROCESS_TERMINATE,
-            False,
-            proc.pid,
-        )
-        if not process_handle:
+        process_handle = getattr(proc, "_handle", None)
+        if process_handle is None:
+            raise RuntimeError("Windows subprocess has no process handle")
+        if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
             raise self._ctypes.WinError(self._ctypes.get_last_error())
-        try:
-            if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
-                raise self._ctypes.WinError(self._ctypes.get_last_error())
-        finally:
-            self._kernel32.CloseHandle(process_handle)
 
     def close(self) -> None:
         """Release the job; kill-on-close handles abnormal daemon exits."""
