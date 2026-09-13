@@ -1863,11 +1863,16 @@ def main() -> None:
                 from .incremental import (
                     get_changed_files,
                     get_staged_and_unstaged,
+                    resolve_review_base,
                 )
 
                 # Reuse the base the update actually resolved to (args.base is
-                # None by default now, which get_changed_files cannot accept).
-                brief_base = result.get("base_resolved") or "HEAD~1"
+                # None by default now, which get_changed_files cannot accept),
+                # then apply the same merge-base rule as detect-changes so a
+                # branch ref scopes the summary to this branch's own commits.
+                brief_base = resolve_review_base(
+                    repo_root, result.get("base_resolved") or "HEAD~1"
+                )
                 changed = get_changed_files(repo_root, brief_base)
                 if not changed:
                     changed = get_staged_and_unstaged(repo_root)
