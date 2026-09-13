@@ -76,9 +76,7 @@ def test_update_after_failed_file_stays_incremental(repo, monkeypatch):
     _fail_parsing(monkeypatch, "bad.py")
     build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
     _commit(repo, "c.py", "def c():\n    return 3\n")
-    result = build_or_update_graph(
-        full_rebuild=False, repo_root=str(repo), postprocess="none"
-    )
+    result = build_or_update_graph(full_rebuild=False, repo_root=str(repo), postprocess="none")
     assert result["build_type"] == "incremental"
     assert result["changed_files"] == ["c.py"]
 
@@ -87,9 +85,7 @@ def test_watch_batch_after_commit_records_head(repo):
     with GraphStore(get_db_path(repo)) as store:
         full_build(repo, store)
         head = _commit(repo, "a.py", "def a():\n    return 11\n")
-        result = incremental_update(
-            repo, store, changed_files=["a.py"], reconcile_stale=False
-        )
+        result = incremental_update(repo, store, changed_files=["a.py"], reconcile_stale=False)
         assert result["files_updated"] == 1
         assert store.get_metadata("git_head_sha") == head
 
@@ -99,9 +95,7 @@ def test_watch_batch_that_stores_nothing_keeps_old_anchor(repo):
         full_build(repo, store)
         anchor = store.get_metadata("git_head_sha")
         _commit(repo, "notes.txt", "not source\n")
-        result = incremental_update(
-            repo, store, changed_files=["a.py"], reconcile_stale=False
-        )
+        result = incremental_update(repo, store, changed_files=["a.py"], reconcile_stale=False)
         assert result["files_updated"] == 0
         assert store.get_metadata("git_head_sha") == anchor
 
@@ -133,9 +127,7 @@ def test_build_tool_reports_failed_files_and_still_postprocesses(repo, monkeypat
     (repo / "bad.py").write_text("def bad():\n    pass\n")
     head = _commit(repo, "c.py", "def c():\n    return 3\n")
     _fail_parsing(monkeypatch, "bad.py")
-    result = build_or_update_graph(
-        full_rebuild=False, repo_root=str(repo), postprocess="minimal"
-    )
+    result = build_or_update_graph(full_rebuild=False, repo_root=str(repo), postprocess="minimal")
     assert result["build_type"] == "incremental"
     assert [e["file"] for e in result["errors"]] == ["bad.py"]
     assert "bad.py" in result["summary"]
@@ -149,9 +141,7 @@ def test_build_tool_with_only_a_failed_file_does_not_claim_up_to_date(repo, monk
     build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
     _commit(repo, "a.py", "def a():\n    return 11\n")
     _fail_parsing(monkeypatch, "a.py")
-    result = build_or_update_graph(
-        full_rebuild=False, repo_root=str(repo), postprocess="none"
-    )
+    result = build_or_update_graph(full_rebuild=False, repo_root=str(repo), postprocess="none")
     assert result["files_updated"] == 0
     assert [e["file"] for e in result["errors"]] == ["a.py"]
     assert "up to date" not in result["summary"].lower()
