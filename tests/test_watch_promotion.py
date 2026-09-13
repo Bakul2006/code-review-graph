@@ -50,7 +50,11 @@ def supervisor_with_full_budget(root):
     return supervisor, observer
 
 
-def test_failed_promotion_keeps_coverage_and_retries(tmp_path):
+def test_failed_promotion_keeps_coverage_and_retries(tmp_path, monkeypatch):
+    import code_review_graph.incremental as incremental_module
+
+    clock = [1000.0]
+    monkeypatch.setattr(incremental_module.time, "monotonic", lambda: clock[0])
     supervisor, observer = supervisor_with_full_budget(tmp_path)
     previous = {(str(tmp_path), False), (str(tmp_path / "src"), True)}
     assert observer.active == previous
@@ -61,6 +65,8 @@ def test_failed_promotion_keeps_coverage_and_retries(tmp_path):
     assert set(supervisor.watched_paths) == {str(tmp_path), str(tmp_path / "src")}
     assert adopted == []
 
+    # The retry is rate-limited; once the cool-down has passed it goes ahead.
+    clock[0] += incremental_module._PROMOTION_RETRY_SECONDS
     observer.fail_promotion = False
     adopted, _ = supervisor.sync_watches()
     assert adopted == [str(tmp_path / "new")]
@@ -92,6 +98,11 @@ def test_vanished_unadopted_directory_clears_transient_degradation(tmp_path):
 
 
 def test_polling_observer_keeps_events_across_promotion_failure(tmp_path, monkeypatch):
+    import code_review_graph.incremental as incremental_module
+
+    # This test is about event delivery across a failed promotion, not about
+    # the retry rate, so let the retry happen on the next tick.
+    monkeypatch.setattr(incremental_module, "_PROMOTION_RETRY_SECONDS", 0.0)
     (tmp_path / "src").mkdir()
     source = tmp_path / "src" / "existing.py"
     source.write_text("before\n")
@@ -138,3 +149,32 @@ def test_polling_observer_keeps_events_across_promotion_failure(tmp_path, monkey
     finally:
         observer.stop()
         observer.join(timeout=3)
+
+
+def test_failed_promotion_waits_before_retrying(tmp_path, monkeypatch):
+    """One failed promotion per cool-down, not one per one-second tick.
+
+    On Linux every attempt walks the parent subtree and can leak an inotify
+    instance, so retrying each tick consumes the quota it is waiting for.
+    """
+    import code_review_graph.incremental as incremental_module
+
+    clock = [1000.0]
+    monkeypatch.setattr(incremental_module.time, "monotonic", lambda: clock[0])
+    supervisor, observer = supervisor_with_full_budget(tmp_path)
+    (tmp_path / "new").mkdir()
+
+    supervisor.sync_watches()
+    assert len(observer.coverage_at_promotion) == 1
+    for _ in range(5):
+        clock[0] += 1.0
+        supervisor.sync_watches()
+    assert len(observer.coverage_at_promotion) == 1
+    assert supervisor.degraded is True
+
+    clock[0] += incremental_module._PROMOTION_RETRY_SECONDS
+    observer.fail_promotion = False
+    adopted, _ = supervisor.sync_watches()
+    assert adopted == [str(tmp_path / "new")]
+    assert len(observer.coverage_at_promotion) == 2
+    assert supervisor.degraded is True  # recursive coverage is still coarser

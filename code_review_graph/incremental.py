@@ -1848,6 +1848,10 @@ _WATCH_SPLIT_MIN_DIRS = int(os.environ.get("CRG_WATCH_SPLIT_MIN_DIRS", "4"))
 _WATCH_HEALTH_INTERVAL = float(os.environ.get("CRG_WATCH_HEALTH_INTERVAL", "10"))
 _WATCH_STOP_TIMEOUT = 10.0
 _WATCH_TICK_SECONDS = 1.0
+# A failed recursive promotion is retried no more often than this. Each attempt
+# walks the parent subtree and, on Linux, can leave a partly built inotify
+# instance behind, so retrying every tick would consume the quota it waits for.
+_PROMOTION_RETRY_SECONDS = 30.0
 
 
 def _watch_child_dirs(
@@ -2050,6 +2054,7 @@ class _WatchSupervisor:
         self._repaired_roots: set[str] = set()
         self._degraded = False
         self._promotion_failed = False
+        self._promotion_retry_at: dict[str, float] = {}
         self._last_health_write = 0.0
         self._last_health_state: tuple[bool, bool, tuple[str, ...]] | None = None
         self._started_at = time.time()
@@ -2221,16 +2226,28 @@ class _WatchSupervisor:
 
     def _promote_to_recursive(self, parent: str) -> bool:
         """Replace the filtered plan only after its recursive watch is live."""
+        retry_at = self._promotion_retry_at.get(parent)
+        if retry_at is not None and time.monotonic() < retry_at:
+            # Still inside the cool-down from the last failure: coverage stays
+            # as it is and health keeps reporting the gap.
+            self._promotion_failed = True
+            return False
         # Watchdog distinguishes handles by both path and recursive flag. Bypass
         # _schedule's path-only dedup so both parent watches can coexist briefly.
         try:
             handle = self._observer.schedule(self._handler, parent, recursive=True)
         except OSError as exc:
             self._promotion_failed = True
+            self._promotion_retry_at[parent] = time.monotonic() + _PROMOTION_RETRY_SECONDS
             logger.warning(
-                "Could not promote watch on %s; keeping existing watches: %s", parent, exc
+                "Could not promote watch on %s; keeping existing watches and retrying "
+                "in %.0fs: %s",
+                parent,
+                _PROMOTION_RETRY_SECONDS,
+                exc,
             )
             return False
+        self._promotion_retry_at.pop(parent, None)
         for path in [parent, *self._descendants_of(parent)]:
             self._release_directory(path)
         self._watches[parent] = _WatchEntry(handle, _watch_identity(parent))
