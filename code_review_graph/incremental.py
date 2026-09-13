@@ -1732,6 +1732,7 @@ def incremental_update(
     files_updated = parsed_files + len(stale_files) + removed_files
     if identity_pending is not None and remaining_identity != identity_pending:
         _store_cpp_identity_pending(store, remaining_identity)
+        store.commit()
 
     # Only re-run language-specific resolvers when the relevant files changed.
     python_changed = any(
