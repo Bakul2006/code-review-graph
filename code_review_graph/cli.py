@@ -1717,7 +1717,7 @@ def main() -> None:
     if args.command in _data_dir_cmds and not read_only_explicit_data_dir:
         _handle_data_dir_option(args, repo_root)
 
-    if args.command in _read_only_db_cmds:
+    if args.command in (*_read_only_db_cmds, "dead-code", "forget"):
         if read_only_explicit_data_dir:
             db_path = Path(args.data_dir).expanduser().resolve() / "graph.db"
         else:
@@ -1734,10 +1734,7 @@ def main() -> None:
             # materialize graph state when neither database exists.
             db_path = get_db_path(repo_root)
     else:
-        db_path = get_db_path(
-            repo_root,
-            read_only=args.command in ("dead-code", "forget"),
-        )
+        db_path = get_db_path(repo_root)
     if (
         args.command in ("dead-code", "forget", *_read_only_db_cmds)
         and not db_path.exists()
