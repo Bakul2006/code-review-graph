@@ -108,7 +108,7 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
     for row in conn.execute(
         "SELECT e.source_qualified, e.target_qualified FROM edges e "
         "JOIN nodes n ON n.qualified_name = e.source_qualified "
-        "WHERE e.kind = 'INHERITS' AND n.language = 'java'"
+        "WHERE e.kind = 'INHERITS' AND n.language IN ('java', 'kotlin', 'scala')"
     ).fetchall():
         iface = row["target_qualified"]
         impl = row["source_qualified"]
