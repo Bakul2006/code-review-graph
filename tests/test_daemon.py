@@ -1497,14 +1497,15 @@ def test_windows_job_close_terminates_watcher_children(tmp_path):
     child_file = tmp_path / "children"
     child_code = "import time; time.sleep(60)"
     parent_code = (
-        "import pathlib, subprocess, sys, time; "
-        f"start = pathlib.Path({str(start_file)!r}); "
-        f"children = pathlib.Path({str(child_file)!r}); "
+        "import pathlib, subprocess, sys, time\n"
+        f"start = pathlib.Path({str(start_file)!r})\n"
+        f"children = pathlib.Path({str(child_file)!r})\n"
         "while not start.exists():\n    time.sleep(0.01)\n"
-        f"procs = [subprocess.Popen([sys.executable, '-c', {child_code!r}]) for _ in range(2)]; "
-        "children.write_text('\\n'.join(str(proc.pid) for proc in procs)); "
+        f"procs = [subprocess.Popen([sys.executable, '-c', {child_code!r}]) for _ in range(2)]\n"
+        "children.write_text('\\n'.join(str(proc.pid) for proc in procs))\n"
         "time.sleep(60)"
     )
+    compile(parent_code, "<parent>", "exec")
     process = subprocess.Popen([sys.executable, "-c", parent_code])
     job = _WindowsJob()
     child_pids: list[int] = []
