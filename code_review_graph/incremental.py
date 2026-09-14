@@ -1904,13 +1904,44 @@ class _WatchSupervisor:
         )
         desired = {str(path): recursive for path, recursive in plan}
         current = {path: path not in self._shallow for path in self._watches}
-        for path, recursive in current.items():
-            if path not in desired:
-                self._release_directory(path)
-            elif desired[path] != recursive:
-                self._replace_watch(Path(path), recursive=desired[path])
-        for path, recursive in plan:
-            self._schedule(path, recursive=recursive)
+        provisional: list[tuple[str, Any, bool]] = []
+        try:
+            # Keep the current plan installed until every new or replacement
+            # registration succeeds.  A failed registration must not turn a
+            # working parent watch into a coverage gap for its descendants.
+            for planned_path, recursive in plan:
+                key = str(planned_path)
+                if key in current and desired[key] == current[key]:
+                    continue
+                if key in current and desired[key] != current[key]:
+                    continue
+                handle = self._observer.schedule(self._handler, key, recursive=recursive)
+                provisional.append((key, handle, recursive))
+            for planned_path, recursive in plan:
+                key = str(planned_path)
+                if key not in current or desired[key] == current[key]:
+                    continue
+                handle = self._observer.schedule(self._handler, key, recursive=recursive)
+                provisional.append((key, handle, recursive))
+        except OSError as exc:
+            logger.warning("Could not apply watch replan: %s", exc)
+            for key, handle, _ in provisional:
+                _run_time_boxed(
+                    lambda: self._observer.unschedule(handle),
+                    f"rollback watch registration {key}",
+                    timeout=_WATCH_STOP_TIMEOUT,
+                )
+            return
+
+        for current_path in current:
+            if current_path not in desired or desired[current_path] != current[current_path]:
+                self._release_directory(current_path)
+        for key, handle, recursive in provisional:
+            self._watches[key] = _WatchEntry(handle, _watch_identity(key))
+            if recursive:
+                self._shallow.discard(key)
+            else:
+                self._shallow.add(key)
         if fallback:
             self._degraded = True
         self._remember_ignored_boundaries()
@@ -1956,14 +1987,14 @@ class _WatchSupervisor:
                 name for name, is_dir in _child_directories(Path(parent)) if is_dir
             }
             for name in sorted(present):
-                candidate = Path(parent) / name
-                relative = candidate.relative_to(self._repo_root).as_posix()
+                candidate_path = Path(parent) / name
+                relative = candidate_path.relative_to(self._repo_root).as_posix()
                 if _should_ignore(relative, self._ignore_patterns):
                     above_threshold = (
-                        _ignored_tree_weight(candidate, _WATCH_SPLIT_MIN_DIRS)
+                        _ignored_tree_weight(candidate_path, _WATCH_SPLIT_MIN_DIRS)
                         >= _WATCH_SPLIT_MIN_DIRS
                     )
-                    key = str(candidate)
+                    key = str(candidate_path)
                     if self._ignored_boundaries.get(key, False) != above_threshold:
                         self.request_replan()
                     self._ignored_boundaries[key] = above_threshold
@@ -1983,11 +2014,11 @@ class _WatchSupervisor:
                     # A promotion replaced this parent with one recursive
                     # watch, which already covers everything below it.
                     break
-                candidate = os.path.join(parent, name)
-                if candidate in self._watches:
+                candidate_key = os.path.join(parent, name)
+                if candidate_key in self._watches:
                     continue
-                if self._adopt_directory(candidate):
-                    adopted.append(candidate)
+                if self._adopt_directory(candidate_key):
+                    adopted.append(candidate_key)
         self._replan_if_requested()
         return adopted, vanished
 

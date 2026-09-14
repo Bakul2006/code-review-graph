@@ -1168,6 +1168,120 @@ class TestRealObserver:
             time.sleep(interval)
         return False
 
+    def _polling_watch_survives_failed_replan(
+        self,
+        tmp_path,
+        *,
+        start_ignored: bool,
+        failed_path: Path,
+        failed_recursive: bool,
+        retry: bool = False,
+    ) -> None:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers.polling import PollingObserver
+
+        source = tmp_path / "src" / "deep" / "a.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("value = 1\n", encoding="utf-8")
+        ignored = tmp_path / "node_modules"
+        if start_ignored:
+            for index in range(_WATCH_SPLIT_MIN_DIRS + 1):
+                (ignored / f"pkg{index}").mkdir(parents=True)
+
+        delivered = threading.Event()
+
+        class Handler(FileSystemEventHandler):
+            def on_modified(self, event):
+                if not event.is_directory and event.src_path == str(source):
+                    delivered.set()
+
+        observer = PollingObserver(timeout=0.05)
+        supervisor = _WatchSupervisor(
+            observer,
+            tmp_path,
+            _load_ignore_patterns(tmp_path),
+            health_path=None,
+        )
+        supervisor.schedule_initial(Handler())
+        original_schedule = observer.schedule
+        failed = {"once": True}
+
+        def schedule(handler, path, recursive=False, event_filter=None):
+            if (
+                failed["once"]
+                and path == str(failed_path)
+                and recursive == failed_recursive
+            ):
+                failed["once"] = False
+                raise OSError("watch limit")
+            return original_schedule(
+                handler, path, recursive=recursive, event_filter=event_filter
+            )
+
+        observer.schedule = schedule
+        observer.start()
+        try:
+            if start_ignored:
+                shutil.rmtree(ignored)
+            else:
+                for index in range(_WATCH_SPLIT_MIN_DIRS + 1):
+                    (ignored / f"pkg{index}").mkdir(parents=True)
+            supervisor.request_replan()
+            supervisor.sync_watches()
+            if start_ignored:
+                assert str(source.parents[1]) in supervisor.watched_paths
+            else:
+                assert supervisor.watched_paths == [str(tmp_path)]
+            if retry:
+                supervisor.request_replan()
+                supervisor.sync_watches()
+
+            source.write_text("value = 2\n", encoding="utf-8")
+            assert self._wait_for(delivered.is_set), (
+                f"edit under {source.parent} was not delivered after failed replan"
+            )
+        finally:
+            observer.stop()
+            observer.join()
+
+    def test_polling_observer_keeps_recursive_root_after_failed_split(self, tmp_path):
+        self._polling_watch_survives_failed_replan(
+            tmp_path,
+            start_ignored=False,
+            failed_path=tmp_path / "src",
+            failed_recursive=True,
+        )
+
+    def test_polling_observer_keeps_coverage_while_split_replan_retries(
+        self, tmp_path
+    ):
+        self._polling_watch_survives_failed_replan(
+            tmp_path,
+            start_ignored=False,
+            failed_path=tmp_path / "src",
+            failed_recursive=True,
+            retry=True,
+        )
+
+    def test_polling_observer_keeps_source_watch_after_failed_restore(self, tmp_path):
+        self._polling_watch_survives_failed_replan(
+            tmp_path,
+            start_ignored=True,
+            failed_path=tmp_path,
+            failed_recursive=True,
+        )
+
+    def test_polling_observer_keeps_coverage_while_restore_replan_retries(
+        self, tmp_path
+    ):
+        self._polling_watch_survives_failed_replan(
+            tmp_path,
+            start_ignored=True,
+            failed_path=tmp_path,
+            failed_recursive=True,
+            retry=True,
+        )
+
     def test_new_top_level_directory_is_indexed(self, tmp_path):
         repo = tmp_path / "repo"
         (repo / "src").mkdir(parents=True)
