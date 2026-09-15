@@ -2500,6 +2500,9 @@ class CodeParser:
         self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
+        # Directory listings for case-exact Python module lookup; see
+        # :meth:`_python_file_exists`.
+        self._python_dir_entries: dict[str, frozenset[str]] = {}
         # Absolute file paths to treat as absent during import resolution.
         # ``forget`` sets this (via :meth:`exclude_files`) so a re-parsed
         # referrer resolves exactly as it would in a build where the forgotten
@@ -2803,7 +2806,7 @@ class CodeParser:
 
         # Pre-scan for import mappings and defined names
         import_map, defined_names = self._collect_file_scope(
-            tree.root_node, language, source,
+            tree.root_node, language, source, file_path_str,
         )
         if language == "python":
             self._expand_python_star_imports(
@@ -3113,6 +3116,7 @@ class CodeParser:
             # Collect imports and defined names from the script block
             import_map, defined_names = self._collect_file_scope(
                 script_tree.root_node, script_lang, script_source,
+                file_path_str,
             )
 
             nodes: list[NodeInfo] = []
@@ -3238,6 +3242,7 @@ class CodeParser:
             script_tree = script_parser.parse(script_source)
             import_map, defined_names = self._collect_file_scope(
                 script_tree.root_node, script_lang, script_source,
+                file_path_str,
             )
 
             nodes: list[NodeInfo] = []
@@ -3442,7 +3447,7 @@ class CodeParser:
             tree = ts_parser.parse(concat_bytes)
 
             import_map, defined_names = self._collect_file_scope(
-                tree.root_node, lang, concat_bytes,
+                tree.root_node, lang, concat_bytes, file_path_str,
             )
             if lang == "python":
                 self._expand_python_star_imports(
@@ -10709,7 +10714,7 @@ class CodeParser:
         invocation). Returning False lets the dispatcher fall through to call
         extraction instead of silently dropping the call. See: Ruby call graph.
         """
-        imports = self._extract_import(child, language, source)
+        imports = self._extract_import(child, language, source, file_path)
         for imp_target in imports:
             resolved = self._resolve_module_to_file(
                 imp_target, file_path, language,
@@ -13037,9 +13042,17 @@ class CodeParser:
         return False
 
     def _collect_file_scope(
-        self, root, language: str, source: bytes,
+        self,
+        root,
+        language: str,
+        source: bytes,
+        file_path: Optional[str] = None,
     ) -> tuple[dict[str, str], set[str]]:
         """Pre-scan top-level AST to collect import mappings and defined names.
+
+        ``file_path`` is what makes a Python relative import resolvable —
+        ``.graph`` names a different module from every directory — so callers
+        that have it must pass it.
 
         Returns:
             (import_map, defined_names) where import_map maps imported names
@@ -13073,6 +13086,7 @@ class CodeParser:
                     if import_node.type == "import_header":
                         self._collect_import_names(
                             import_node, language, source, import_map,
+                            file_path,
                         )
                 continue
 
@@ -13122,7 +13136,9 @@ class CodeParser:
 
             # Collect import mappings: imported_name → module_path
             if node_type in import_types:
-                self._collect_import_names(child, language, source, import_map)
+                self._collect_import_names(
+                    child, language, source, import_map, file_path,
+                )
 
             if (
                 language in ("javascript", "typescript", "tsx")
@@ -13251,7 +13267,7 @@ class CodeParser:
                 return {}
             tree = parser.parse(source)  # type: ignore[union-attr]
             import_map, defined_names = self._collect_file_scope(
-                tree.root_node, "python", source,
+                tree.root_node, "python", source, resolved_module,
             )
 
             origins: dict[str, str] = {}
@@ -13260,7 +13276,9 @@ class CodeParser:
                 tree.root_node, resolved_module, origins, next_resolving,
             )
             for name, module in import_map.items():
-                origin = self._resolve_python_module_in_repo(module, resolved_module)
+                # A relative import stores its already-resolved file here,
+                # an absolute one a dotted module name; both must work.
+                origin = self._python_import_origin(module, resolved_module)
                 if origin is not None:
                     origins[name] = origin
             for name in defined_names:
@@ -13325,6 +13343,110 @@ class CodeParser:
             return False
         return True
 
+    def _python_file_exists(self, path: Path) -> bool:
+        """Case-exact ``is_file`` for Python module lookup.
+
+        ``Path.is_file()`` answers "yes" to ``Registry.py`` on APFS/NTFS when
+        only ``registry.py`` exists, which is how a wrong import target
+        reached the graph as a confident, real-looking file path and stayed
+        invisible to everyone not on Linux. Module resolution therefore
+        compares against the directory's real listing, cached per directory
+        because a package is probed once per import that names it.
+        """
+        parent = path.parent
+        key = str(parent)
+        entries = self._python_dir_entries.get(key)
+        if entries is None:
+            try:
+                entries = frozenset(os.listdir(parent))
+            except OSError:
+                entries = frozenset()
+            if len(self._python_dir_entries) >= self._MODULE_CACHE_MAX:
+                self._python_dir_entries.clear()
+            self._python_dir_entries[key] = entries
+        if path.name not in entries:
+            return False
+        try:
+            return path.is_file()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _python_imported_names(node) -> list[str]:
+        """Original (pre-alias) names bound after ``import`` in a from-import."""
+        names: list[str] = []
+        seen_import_keyword = False
+        for child in node.children:
+            if child.type == "import":
+                seen_import_keyword = True
+                continue
+            if not seen_import_keyword:
+                continue
+            if child.type in ("dotted_name", "identifier"):
+                names.append(child.text.decode("utf-8", errors="replace"))
+            elif child.type == "aliased_import":
+                # `a as b` — the module-side name is `a`; `b` is only local.
+                for sub in child.children:
+                    if sub.type in ("dotted_name", "identifier"):
+                        names.append(sub.text.decode("utf-8", errors="replace"))
+                        break
+        return names
+
+    def _python_submodule_imports(
+        self, node, module: str, file_path: Optional[str],
+    ) -> list[str]:
+        """Extra module targets for imported names that are themselves modules.
+
+        ``from . import incremental`` and ``from .tools import query`` import a
+        MODULE through a package: the statement's real dependency is that
+        submodule's file, not only the package ``__init__.py``. Only names
+        that answer to a file next to the package's ``__init__.py`` qualify,
+        so ``from .graph import GraphStore`` (a class) stays a single edge and
+        edge counts do not inflate.
+        """
+        if not file_path:
+            return []
+        package_file = self._resolve_module_to_file(module, file_path, "python")
+        if not package_file or Path(package_file).name != "__init__.py":
+            return []
+        package_dir = Path(package_file).parent
+        prefix = module if module.endswith(".") else f"{module}."
+        submodules: list[str] = []
+        for name in self._python_imported_names(node):
+            if "." in name:
+                continue
+            if self._python_file_exists(
+                package_dir / f"{name}.py",
+            ) or self._python_file_exists(
+                package_dir / name / "__init__.py",
+            ):
+                candidate = f"{prefix}{name}"
+                if candidate not in submodules:
+                    submodules.append(candidate)
+        return submodules
+
+    def _python_import_origin(
+        self, module: str, file_path: str,
+    ) -> Optional[str]:
+        """Resolve an ``import_map`` value for Python to a repository file.
+
+        Values are either a dotted module name (absolute import) or an
+        already-resolved absolute file path — relative imports and star
+        imports both store the path, because a relative module string cannot
+        be resolved without the importing file's package.
+        """
+        candidate = Path(module)
+        if candidate.is_absolute():
+            boundary = self._python_repo_boundary(file_path)
+            try:
+                resolved = candidate.resolve()
+            except (OSError, ValueError):
+                return None
+            if not self._path_is_within(resolved, boundary):
+                return None
+            return normalize_file_path(resolved) if resolved.is_file() else None
+        return self._resolve_python_module_in_repo(module, file_path)
+
     def _resolve_python_module_in_repo(
         self, module: str, file_path: str,
     ) -> Optional[str]:
@@ -13364,7 +13486,7 @@ class CodeParser:
                     continue
                 if not self._path_is_within(resolved, boundary):
                     continue
-                if resolved.is_file():
+                if self._python_file_exists(resolved):
                     return normalize_file_path(resolved)
         return None
 
@@ -13478,20 +13600,43 @@ class CodeParser:
                     import_map[local_name] = module
 
     def _collect_import_names(
-        self, node, language: str, source: bytes, import_map: dict[str, str],
+        self,
+        node,
+        language: str,
+        source: bytes,
+        import_map: dict[str, str],
+        file_path: Optional[str] = None,
     ) -> None:
         """Extract imported names and their source modules into import_map."""
         if language == "python":
             if node.type == "import_from_statement":
                 # from X.Y import A, B → {A: X.Y, B: X.Y}
-                module = None
+                #
+                # Same trap as `_extract_import`: a relative import's module
+                # is a `relative_import` node, so the old first-`dotted_name`
+                # scan never matched one and `module` stayed None — every
+                # relatively imported name was simply absent from the map,
+                # and each call through one stayed an unresolved bare name.
+                module_node = node.child_by_field_name("module_name")
+                if module_node is None:
+                    return
+                module = module_node.text.decode("utf-8", errors="replace")
+                if module.startswith("."):
+                    # A relative module string means nothing away from the
+                    # file that wrote it, so store the resolved file instead;
+                    # `_resolve_imported_symbol` already accepts a path here,
+                    # which is what star-import expansion stores too.
+                    resolved = (
+                        self._resolve_python_module_in_repo(module, file_path)
+                        if file_path
+                        else None
+                    )
+                    module = resolved or module
                 seen_import_keyword = False
                 for child in node.children:
-                    if child.type == "dotted_name" and not seen_import_keyword:
-                        module = child.text.decode("utf-8", errors="replace")
-                    elif child.type == "import":
+                    if child.type == "import":
                         seen_import_keyword = True
-                    elif seen_import_keyword and module:
+                    elif seen_import_keyword:
                         if child.type in ("identifier", "dotted_name"):
                             name = child.text.decode("utf-8", errors="replace")
                             import_map[name] = module
@@ -13745,16 +13890,35 @@ class CodeParser:
             return None
 
         if language == "python":
+            if module.startswith("."):
+                # Relative import. The leading dots ARE the resolution: one
+                # dot is the caller's own package, each further dot one
+                # package up. There is no walk to perform and nothing above
+                # the repository to search, so delegate to the level-aware,
+                # repository-bounded resolver rather than flattening the
+                # dots into a path (`.graph` -> `/graph.py`, which collapses
+                # to an absolute path at the filesystem root and never
+                # resolves).
+                return self._resolve_python_module_in_repo(module, file_path)
             rel_path = module.replace(".", "/")
             candidates = [rel_path + ".py", rel_path + "/__init__.py"]
-            # Walk up from caller's directory to find the module file
+            # Walk up from caller's directory to find the module file, never
+            # past the repository root: a match outside it is another
+            # checkout or a site-packages copy, not this repository's module.
             current = caller_dir
             while True:
                 for candidate in candidates:
                     target = current / candidate
                     if target.is_file():
-                        return str(target.resolve())
+                        found = target.resolve()
+                        if self._repo_root is not None and not _path_is_within(
+                            found, self._repo_root,
+                        ):
+                            return None
+                        return str(found)
                 if current == current.parent:
+                    break
+                if self._repo_root is not None and current == self._repo_root:
                     break
                 current = current.parent
 
@@ -14439,7 +14603,7 @@ class CodeParser:
 
         # Direct local definition/export in the module file.
         import_map, defined_names = self._collect_file_scope(
-            tree.root_node, language, source,
+            tree.root_node, language, source, module_file,
         )
         if symbol_name in defined_names:
             result = self._qualify(symbol_name, module_file, None)
@@ -15647,7 +15811,13 @@ class CodeParser:
                         )
         return bases
 
-    def _extract_import(self, node, language: str, source: bytes) -> list[str]:
+    def _extract_import(
+        self,
+        node,
+        language: str,
+        source: bytes,
+        file_path: Optional[str] = None,
+    ) -> list[str]:
         """Extract import targets as module/path strings."""
         imports = []
         text = node.text.decode("utf-8", errors="replace").strip()
@@ -15655,10 +15825,24 @@ class CodeParser:
         if language == "python":
             # import x.y.z  or  from x.y import z
             if node.type == "import_from_statement":
-                for child in node.children:
-                    if child.type == "dotted_name":
-                        imports.append(child.text.decode("utf-8", errors="replace"))
-                        break
+                # tree-sitter-python wraps the module half of a RELATIVE
+                # import in a `relative_import` node, never a `dotted_name`:
+                # `from .m import a` is [from, relative_import('.m'), import,
+                # dotted_name('a')]. Scanning for the first `dotted_name`
+                # therefore skipped the module and returned the imported
+                # SYMBOL — `from .registry import Registry` resolved to a
+                # `Registry.py` that exists on no filesystem that tells `R`
+                # from `r`, and `from .cli import main` landed on the sibling
+                # `main.py`. The `module_name` field is the module for both
+                # the relative and the absolute form, and is the only node
+                # carrying the leading dots that set the package level.
+                module_node = node.child_by_field_name("module_name")
+                if module_node is not None:
+                    module = module_node.text.decode("utf-8", errors="replace")
+                    imports.append(module)
+                    imports.extend(
+                        self._python_submodule_imports(node, module, file_path),
+                    )
             else:
                 for child in node.children:
                     if child.type == "dotted_name":
