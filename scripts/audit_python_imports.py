@@ -196,6 +196,355 @@ def _relative_call_sites(tree: ast.AST) -> list[tuple[int, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Call-attribution ground truth
+#
+# ``audit_dangling`` only sees a target that matches NO node. It cannot see a
+# target that matches the WRONG node, which is the failure that actually
+# reaches a reviewer: ``some_dict.get(...)`` recorded as a call into
+# ``ConnectionPool.get`` looks perfectly resolved and is simply false. This
+# section re-reads each attributed call with ``ast`` and asks whether the
+# source at that line gives any reason for the node it was attributed to.
+#
+# The test is deliberately more permissive than any resolver: a variable's
+# class counts if the annotation or construction appears ANYWHERE in the file,
+# in any scope. A call that fails it fails on the source, not on a scope rule.
+# ---------------------------------------------------------------------------
+
+
+class _CallSite:
+    """One call expression, classified by what it is called on."""
+
+    __slots__ = ("name", "kind", "detail")
+
+    def __init__(self, name: str, kind: str, detail: str = "") -> None:
+        self.name = name
+        self.kind = kind          # plain | self | name | expr
+        self.detail = detail      # receiver name, or enclosing class
+
+
+class _FileFacts:
+    """Everything one source file says about its own names."""
+
+    __slots__ = (
+        "calls", "classes", "class_members", "module_bindings",
+        "symbol_sources", "toplevel", "var_classes",
+    )
+
+    def __init__(self) -> None:
+        self.calls: dict[int, list[_CallSite]] = defaultdict(list)
+        self.classes: set[str] = set()
+        self.class_members: dict[str, set[str]] = defaultdict(set)
+        self.module_bindings: dict[str, set[str]] = defaultdict(set)
+        self.symbol_sources: dict[str, set[str]] = defaultdict(set)
+        self.toplevel: set[str] = set()
+        self.var_classes: dict[str, set[str]] = defaultdict(set)
+
+
+def _annotation_class(annotation: Optional[ast.expr]) -> Optional[str]:
+    """Class named by an annotation, unwrapping Optional/Annotated/etc."""
+    if annotation is None:
+        return None
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        try:
+            parsed = ast.parse(annotation.value, mode="eval").body
+        except (SyntaxError, ValueError):
+            return None
+        return _annotation_class(parsed)
+    if isinstance(annotation, ast.Subscript):
+        inner = annotation.slice
+        if isinstance(inner, ast.Tuple) and inner.elts:
+            inner = inner.elts[0]
+        return _annotation_class(inner)
+    return None
+
+
+def _assigned_name(target: ast.expr) -> Optional[str]:
+    """``x`` and ``self.x`` both bind the name a receiver would be spelled by."""
+    if isinstance(target, ast.Name):
+        return target.id
+    if (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id in ("self", "cls")
+    ):
+        return target.attr
+    return None
+
+
+def _file_facts(
+    source_file: Path, boundary: Path, cache: dict[str, _FileFacts],
+) -> Optional[_FileFacts]:
+    key = _posix(source_file)
+    if key in cache:
+        return cache[key]
+    try:
+        tree = ast.parse(source_file.read_bytes(), filename=str(source_file))
+    except (OSError, SyntaxError, ValueError):
+        return None
+    facts = _FileFacts()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".", 1)[0]
+                target = alias.name if alias.asname else alias.name.split(".", 1)[0]
+                resolved = _module_file(boundary, target)
+                if resolved is not None:
+                    facts.module_bindings[local].add(_posix(resolved))
+        elif isinstance(node, ast.ImportFrom):
+            package = _expected_module_file(source_file, node, boundary)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                submodule = (
+                    _module_file(package.parent, alias.name)
+                    if package is not None and package.name == "__init__.py"
+                    else None
+                )
+                if submodule is not None:
+                    facts.module_bindings[local].add(_posix(submodule))
+                elif package is not None:
+                    facts.symbol_sources[local].add(_posix(package))
+        elif isinstance(node, (ast.AnnAssign, ast.Assign)):
+            targets = (
+                [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+            )
+            annotated = (
+                _annotation_class(node.annotation)
+                if isinstance(node, ast.AnnAssign)
+                else None
+            )
+            constructed = (
+                node.value.func.id
+                if isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                else None
+            )
+            for target in targets:
+                name = _assigned_name(target)
+                if name is None:
+                    continue
+                for class_name in (annotated, constructed):
+                    if class_name:
+                        facts.var_classes[name].add(class_name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            arguments = node.args
+            for argument in (
+                list(arguments.posonlyargs)
+                + list(arguments.args)
+                + list(arguments.kwonlyargs)
+            ):
+                class_name = _annotation_class(argument.annotation)
+                if class_name:
+                    facts.var_classes[argument.arg].add(class_name)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            facts.toplevel.add(node.name)
+
+    def visit(node: ast.AST, class_stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                facts.classes.add(child.name)
+                for member in child.body:
+                    if isinstance(
+                        member, (ast.FunctionDef, ast.AsyncFunctionDef),
+                    ):
+                        facts.class_members[child.name].add(member.name)
+                visit(child, class_stack + [child.name])
+                continue
+            if isinstance(child, ast.Call):
+                facts.calls[child.lineno].append(
+                    _classify_call(child, class_stack),
+                )
+            visit(child, class_stack)
+
+    visit(tree, [])
+    cache[key] = facts
+    return facts
+
+
+def _classify_call(call: ast.Call, class_stack: list[str]) -> _CallSite:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return _CallSite(func.id, "plain")
+    if isinstance(func, ast.Attribute):
+        receiver = func.value
+        if isinstance(receiver, ast.Name):
+            if receiver.id in ("self", "cls"):
+                return _CallSite(
+                    func.attr, "self", class_stack[-1] if class_stack else "",
+                )
+            return _CallSite(func.attr, "name", receiver.id)
+        # ``self.field.m()`` is how a field receiver is spelled.
+        if (
+            isinstance(receiver, ast.Attribute)
+            and isinstance(receiver.value, ast.Name)
+            and receiver.value.id in ("self", "cls")
+        ):
+            return _CallSite(func.attr, "name", receiver.attr)
+        return _CallSite(func.attr, "expr")
+    return _CallSite("", "expr")
+
+
+def _expand_reexports(
+    sources: set[str],
+    symbol: str,
+    boundary: Path,
+    cache: dict[str, _FileFacts],
+) -> set[str]:
+    """Follow re-exports of *symbol* to the file that really defines it.
+
+    ``from .tools import query_graph`` names the package, but the function
+    lives in ``tools/query.py`` and the resolver is right to say so; likewise
+    ``from .graph import NodeInfo``, which ``graph.py`` imports from
+    ``parser.py``. Each hop follows the SAME name, so the set stays tight.
+    """
+    seen = set(sources)
+    frontier = list(sources)
+    for _ in range(3):
+        following: list[str] = []
+        for module in frontier:
+            facts = _file_facts(Path(module), boundary, cache)
+            if facts is None:
+                continue
+            for origin in (
+                facts.symbol_sources.get(symbol, set())
+                | facts.module_bindings.get(symbol, set())
+            ):
+                if origin not in seen:
+                    seen.add(origin)
+                    following.append(origin)
+        if not following:
+            break
+        frontier = following
+    return seen
+
+
+def _attribution_is_justified(
+    site: _CallSite,
+    caller_file: str,
+    target_file: str,
+    target_symbol: str,
+    facts: _FileFacts,
+    target_facts: Optional[_FileFacts],
+    boundary: Path,
+    cache: dict[str, _FileFacts],
+) -> bool:
+    """Does the source at this call site give a reason for this node?"""
+    leaf = target_symbol.rsplit(".", 1)[-1]
+    parent = target_symbol.rsplit(".", 1)[0] if "." in target_symbol else None
+    if site.name != leaf:
+        return False
+    if site.kind == "plain":
+        if target_file == caller_file:
+            return True
+        return target_file in _expand_reexports(
+            facts.symbol_sources.get(leaf, set()), leaf, boundary, cache,
+        )
+    if site.kind == "self":
+        return (
+            target_file == caller_file
+            and parent is not None
+            and parent in facts.classes
+        )
+    if site.kind == "name":
+        receiver = site.detail
+        if parent is None and target_file in _expand_reexports(
+            facts.module_bindings.get(receiver, set()), leaf, boundary, cache,
+        ):
+            # ``m.f()`` through a module binding: ``f`` must be a top-level
+            # name of that module.
+            return target_facts is None or leaf in target_facts.toplevel
+        if parent is not None and parent in facts.var_classes.get(receiver, set()):
+            return True
+        # ``Klass.method()``: the receiver names the class itself.
+        return parent is not None and receiver == parent
+    return False
+
+
+def audit_call_attribution(
+    conn: sqlite3.Connection, repo_root: Path,
+) -> dict[str, Any]:
+    """Precision of Python CALLS edges that DO name a node.
+
+    ``audit_dangling`` scores a target matching no node; this scores a target
+    matching the wrong one. An edge counts as judged when the call at that
+    line calls something with the target's own leaf name; otherwise the
+    parser and ``ast`` disagree about the line and the edge is set aside.
+    """
+    cache: dict[str, _FileFacts] = {}
+    judged = 0
+    justified = 0
+    unjudged = 0
+    offenders: list[dict[str, Any]] = []
+    by_target: dict[str, int] = defaultdict(int)
+
+    for row in conn.execute(
+        "SELECT e.file_path, e.line, e.target_qualified FROM edges e "
+        "WHERE e.kind = 'CALLS' AND e.file_path LIKE '%.py' "
+        "AND instr(e.target_qualified, '::') > 0 "
+        "AND EXISTS ("
+        "  SELECT 1 FROM nodes n WHERE n.qualified_name = e.target_qualified"
+        ")"
+    ):
+        caller_file = row["file_path"]
+        target_file, _, target_symbol = row["target_qualified"].partition("::")
+        if not target_symbol:
+            continue
+        facts = _file_facts(Path(caller_file), repo_root, cache)
+        if facts is None:
+            continue
+        sites = facts.calls.get(row["line"], [])
+        leaf = target_symbol.rsplit(".", 1)[-1]
+        matching = [site for site in sites if site.name == leaf]
+        if not matching:
+            unjudged += 1
+            continue
+        target_facts = (
+            _file_facts(Path(target_file), repo_root, cache)
+            if target_file.endswith(".py")
+            else None
+        )
+        judged += 1
+        if any(
+            _attribution_is_justified(
+                site, caller_file, target_file, target_symbol,
+                facts, target_facts, repo_root, cache,
+            )
+            for site in matching
+        ):
+            justified += 1
+        else:
+            by_target[row["target_qualified"]] += 1
+            if len(offenders) < 25:
+                offenders.append({
+                    "file": caller_file,
+                    "line": row["line"],
+                    "target": row["target_qualified"],
+                    "receiver": matching[0].detail or matching[0].kind,
+                })
+
+    worst = sorted(by_target.items(), key=lambda item: -item[1])[:15]
+    return {
+        "attributed_calls_judged": judged,
+        "attributed_calls_justified": justified,
+        "attributed_calls_unjustified": judged - justified,
+        "attributed_calls_precision_pct": _pct(justified, judged),
+        "attributed_calls_unjudged": unjudged,
+        "worst_targets": [
+            {"target": target, "unjustified": count} for target, count in worst
+        ],
+        "examples": offenders,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Graph access
 # ---------------------------------------------------------------------------
 
@@ -486,6 +835,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "calls": audit_calls(conn, repo_root, calls_modules),
             "edges": audit_dangling(conn),
             "python_edges": audit_python_import_edges(conn),
+            "attribution": audit_call_attribution(conn, repo_root),
         }
         offenders = missing_path_targets(conn)
         report["missing_path_targets"] = {
@@ -526,6 +876,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"cross-module CALLS resolved: {calls['calls_resolved']}"
         f"/{calls['calls_total']} ({calls['calls_resolved_pct']}%)"
     )
+    attribution = report["attribution"]
+    print(
+        "python CALLS attributed to a node, justified by the source: "
+        f"{attribution['attributed_calls_justified']}"
+        f"/{attribution['attributed_calls_judged']}"
+        f" ({attribution['attributed_calls_precision_pct']}%)"
+        f"  unjudged={attribution['attributed_calls_unjudged']}"
+    )
+    for worst in attribution["worst_targets"][:5]:
+        print(f"  UNJUSTIFIED x{worst['unjustified']} -> {worst['target']}")
     print(
         f"edges with no matching node: {edges['edges_dangling']}"
         f"/{edges['edges_total']} ({edges['edges_dangling_pct']}%)"

@@ -879,6 +879,52 @@ class GraphStore:
         ]
         return supported[0] if len(supported) == 1 else None
 
+    @staticmethod
+    def _receiver_backed_candidates(
+        candidates: list[tuple[str, str]],
+        edge_extra: dict,
+        parent_lookup: dict[str, str | None],
+    ) -> list[tuple[str, str]]:
+        """Narrow bare-name candidates to what the receiver can actually hold.
+
+        ``x.get(...)`` calls the ``get`` belonging to whatever ``x`` is. The
+        call-site file's import list says nothing about that, so a name match
+        plus an import is not evidence — it is how a plain ``some_dict.get()``
+        ended up recorded as a call into ``ConnectionPool.get``. The parser
+        records what the file itself says the receiver is; honour it:
+
+        ``module``
+            the name is bound to a module file, so the method has to be a
+            top-level name in that file — ``agent_baseline.run(...)`` means
+            ``agent_baseline.py::run`` and nothing else.
+        ``class``
+            the name is annotated, constructed, or is itself an imported
+            symbol, so the method has to belong to a class of that name.
+        anything else
+            a container literal, or a local with no evidence at all. There is
+            nothing to attribute the call to, so nothing is attributed and the
+            target stays bare for the unresolved path to explain.
+        """
+        binding = edge_extra.get("receiver_binding")
+        if binding == "module":
+            module_file = edge_extra.get("receiver_module")
+            if not isinstance(module_file, str) or not module_file:
+                return []
+            return [
+                candidate for candidate in candidates
+                if candidate[1] == module_file
+                and parent_lookup.get(candidate[0]) is None
+            ]
+        if binding == "class":
+            class_name = edge_extra.get("receiver_class")
+            if not isinstance(class_name, str) or not class_name:
+                return []
+            return [
+                candidate for candidate in candidates
+                if parent_lookup.get(candidate[0]) == class_name
+            ]
+        return []
+
     def resolve_bare_call_targets(self) -> int:
         """Resolve bare CALLS targets backed by same-file or import evidence.
 
@@ -1161,13 +1207,17 @@ class GraphStore:
 
         # bare_name -> [(qualified_name, defining_file)]
         node_lookup: dict[str, list[tuple[str, str]]] = {}
+        # qualified_name -> owning class, so a receiver known to be an
+        # instance of one class cannot be answered by another class's method.
+        parent_lookup: dict[str, str | None] = {}
         for row in conn.execute(
-            "SELECT name, qualified_name, file_path FROM nodes "
+            "SELECT name, qualified_name, file_path, parent_name FROM nodes "
             "WHERE kind IN ('Function', 'Test', 'Class')"
         ).fetchall():
             node_lookup.setdefault(row["name"], []).append(
                 (row["qualified_name"], row["file_path"]),
             )
+            parent_lookup[row["qualified_name"]] = row["parent_name"]
 
         # call-site file -> explicitly imported files
         import_targets: dict[str, set[str]] = {}
@@ -1270,6 +1320,10 @@ class GraphStore:
             if not isinstance(bare_name, str):
                 continue
             candidates = node_lookup.get(bare_name, [])
+            if "receiver_binding" in edge_extra:
+                candidates = self._receiver_backed_candidates(
+                    candidates, edge_extra, parent_lookup,
+                )
 
             context_file = edge["file_path"]
             imported_files = import_targets.get(context_file, set())

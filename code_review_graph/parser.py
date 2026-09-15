@@ -1386,6 +1386,26 @@ _JS_IMPORT_ORIGINAL_PREFIX_KEY = "__crg_js_import_original__:"
 # one (``from . import cli``). The value is that module's file; a reference to
 # the name belongs to the file node, not to ``<file>::<name>``.
 _PY_MODULE_BINDING_KEY = "__crg_py_module_binding__:"
+# Value syntax that pins a Python name to a builtin container or scalar. A
+# method called on such a name can never belong to a repository node, so the
+# resolver must not attribute it to one. Derived from the literal grammar, not
+# from a list of method names.
+_PY_LITERAL_VALUE_TYPES = frozenset({
+    "concatenated_string",
+    "dictionary",
+    "dictionary_comprehension",
+    "false",
+    "float",
+    "generator_expression",
+    "integer",
+    "list",
+    "list_comprehension",
+    "set",
+    "set_comprehension",
+    "string",
+    "true",
+    "tuple",
+})
 _SPRING_REQUEST_MAPPINGS = {
     "DeleteMapping": ("DELETE",),
     "GetMapping": ("GET",),
@@ -2827,6 +2847,11 @@ class CodeParser:
             import_map,
             defined_names,
         )
+        python_receiver_evidence = (
+            self._collect_python_receiver_evidence(tree.root_node, file_path_str)
+            if language == "python"
+            else {}
+        )
 
         # Walk the tree
         self._extract_from_tree(
@@ -2848,6 +2873,11 @@ class CodeParser:
             )
 
         edges = self._apply_typed_call_targets(edges, typed_call_targets, language)
+
+        if language == "python":
+            edges = self._apply_python_receiver_evidence(
+                edges, python_receiver_evidence,
+            )
 
         # Resolve bare call targets to qualified names using same-file definitions
         edges = self._resolve_call_targets(nodes, edges, file_path_str)
@@ -4814,7 +4844,13 @@ class CodeParser:
                 resolved.append(edge)
                 continue
             receiver = edge.extra.get("receiver")
-            has_receiver = bool(receiver)
+            # A Python member call whose receiver is an expression rather than
+            # a name (``os.environ.get(...)``) still has a receiver; the
+            # method belongs to it, never to a same-named definition in this
+            # file's own scope.
+            has_receiver = bool(receiver) or (
+                edge.extra.get("receiver_form") == "expression"
+            )
             if (
                 is_go
                 and edge.kind == "CALLS"
@@ -5635,6 +5671,385 @@ class CodeParser:
                 )
             resolved.append(edge)
         return resolved
+
+    # -----------------------------------------------------------------------
+    # Python receiver evidence
+    # -----------------------------------------------------------------------
+    #
+    # ``x.get(...)`` calls the ``get`` that belongs to whatever ``x`` holds.
+    # It does NOT call every repository function named ``get``, and it has
+    # nothing to do with which modules the call-site file happens to import.
+    # The graph-wide bare-target resolver only had the file's import list to
+    # go on, so a correct import edge made it *more* confident about calls it
+    # had no business attributing at all.
+    #
+    # These two methods answer the only question that matters — what does this
+    # file say the receiver is — using syntax visible in the file itself:
+    #
+    #   module   an import statement binds the name to a module that resolves
+    #            to an indexed file (``from . import cli``, ``import pkg.mod
+    #            as m``). The method must be a top-level name in that file.
+    #   class    an annotation, a typed parameter, or an assignment from a
+    #            constructor call whose callee is a class this file defines or
+    #            imports. The method must belong to that class.
+    #   builtin  the name is assigned a container or scalar literal, or a
+    #            comprehension. No repository node can own the method.
+    #   unknown  everything else, including a name bound two different ways
+    #            and a receiver expression the parser cannot name at all
+    #            (``os.environ.get(...)``).
+    #
+    # ``builtin`` and ``unknown`` produce no attribution: the target stays
+    # bare and the unresolved path reports it honestly. No method-name list is
+    # consulted anywhere.
+
+    def _collect_python_receiver_evidence(
+        self, root, file_path: str,
+    ) -> dict[tuple[int, str], tuple[str, str]]:
+        """Return ``{(line, receiver): (kind, detail)}`` for every member call.
+
+        Scoped the way Python is scoped, because a file-wide answer is wrong
+        often enough to matter: ``store`` is a ``GraphStore`` in fifteen test
+        methods and a ``MagicMock`` in three, and only the enclosing function
+        says which. Module bindings and imported symbols seed the module
+        scope; a class contributes its annotated attributes and every
+        ``self.x = ...`` written anywhere inside it; a function contributes
+        its typed parameters and its own assignments, in source order.
+
+        The whole tree is scanned for imports, not only its top level: the
+        import that decides a receiver is routinely written inside the
+        function that uses it, which is exactly where ``_collect_file_scope``
+        stops looking.
+        """
+        module_bindings: dict[str, set[str]] = {}
+        imported_names: set[str] = set()
+        class_names: set[str] = set()
+
+        def scan_declarations(node, depth: int = 0) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            if node.type == "class_definition":
+                name_node = node.child_by_field_name("name")
+                if name_node is not None:
+                    class_names.add(
+                        name_node.text.decode("utf-8", errors="replace"),
+                    )
+            elif node.type == "import_statement":
+                self._python_plain_import_bindings(
+                    node, file_path, module_bindings, imported_names,
+                )
+            elif node.type == "import_from_statement":
+                self._python_from_import_bindings(
+                    node, file_path, module_bindings, imported_names,
+                )
+            for child in node.children:
+                scan_declarations(child, depth + 1)
+
+        scan_declarations(root)
+
+        module_env: dict[str, tuple[str, str]] = {}
+        # A name imported as a symbol is most often a class used as
+        # ``Klass.method()``. Restricting to members of a class with that name
+        # is self-validating: a function, or a module with no file of its own
+        # (``os``, ``subprocess``), matches no node and attributes nothing.
+        for name in imported_names | class_names:
+            module_env[name] = ("class", name)
+        for name, files in module_bindings.items():
+            module_env[name] = (
+                ("module", next(iter(files))) if len(files) == 1
+                else ("unknown", "")
+            )
+
+        evidence: dict[tuple[int, str], tuple[str, str]] = {}
+
+        def walk(
+            node,
+            env: dict[str, tuple[str, str]],
+            class_fields: dict[str, tuple[str, str]],
+            depth: int = 0,
+        ) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            node_type = node.type
+            if node_type == "class_definition":
+                fields = self._collect_python_class_fields(
+                    node, class_names, imported_names,
+                )
+                class_env = dict(env)
+                class_env.update(fields)
+                for child in node.children:
+                    walk(child, class_env, fields, depth + 1)
+                return
+            if node_type == "function_definition":
+                scoped = dict(env)
+                scoped.update(class_fields)
+                for name, type_name in self._collect_function_typed_parameters(
+                    node, "python",
+                ).items():
+                    scoped[name] = ("class", type_name)
+                for child in node.children:
+                    walk(child, scoped, class_fields, depth + 1)
+                return
+            if node_type == "assignment":
+                # The right-hand side is evaluated before the name is rebound.
+                for child in node.children:
+                    walk(child, env, class_fields, depth + 1)
+                name = self._python_binding_target_name(
+                    node.child_by_field_name("left"),
+                )
+                if name:
+                    bound = self._python_assignment_evidence(
+                        node, class_names, imported_names,
+                    )
+                    if bound is not None:
+                        env[name] = bound
+                return
+            if node_type == "call":
+                receiver, method = self._get_member_call_receiver_method(
+                    node, "python",
+                )
+                if receiver and method:
+                    evidence[(node.start_point[0] + 1, receiver)] = env.get(
+                        receiver, ("unknown", ""),
+                    )
+            for child in node.children:
+                walk(child, env, class_fields, depth + 1)
+
+        walk(root, module_env, {})
+        return evidence
+
+    def _collect_python_class_fields(
+        self,
+        class_node,
+        class_names: set[str],
+        imported_names: set[str],
+    ) -> dict[str, tuple[str, str]]:
+        """Instance attributes a class declares, however it declares them.
+
+        Annotated class-body attributes, plus every ``self.x = ...`` written
+        in any of its methods — which is where the binding that matters
+        usually lives, and where the shared typed-field collector stops.
+        """
+        gathered: dict[str, list[tuple[str, str]]] = {}
+
+        def visit(node, in_function: bool, depth: int = 0) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            if node is not class_node and node.type == "class_definition":
+                return
+            nested = in_function or (
+                node is not class_node and node.type == "function_definition"
+            )
+            if node.type == "assignment":
+                left = node.child_by_field_name("left")
+                # Inside a method only ``self.x``/``cls.x`` is a field; a bare
+                # name there is a local and says nothing about the class.
+                if left is not None and (
+                    left.type == "attribute" or not nested
+                ):
+                    name = self._python_binding_target_name(left)
+                    bound = self._python_assignment_evidence(
+                        node, class_names, imported_names,
+                    )
+                    if name and bound is not None:
+                        gathered.setdefault(name, []).append(bound)
+            for child in node.children:
+                visit(child, nested, depth + 1)
+
+        visit(class_node, False)
+        return {
+            name: self._merge_python_evidence(found)
+            for name, found in gathered.items()
+        }
+
+    @staticmethod
+    def _merge_python_evidence(
+        found: list[tuple[str, str]],
+    ) -> tuple[str, str]:
+        """Reconcile several bindings of one name in the same scope.
+
+        ``unknown`` is the ABSENCE of evidence, not evidence against: a field
+        a helper returns in one branch and constructs in another is still that
+        class. Two different classes, or a class and a container literal, do
+        contradict, and contradiction means no attribution.
+        """
+        classes = {detail for kind, detail in found if kind == "class"}
+        builtin = any(kind == "builtin" for kind, _ in found)
+        if len(classes) == 1 and not builtin:
+            return "class", next(iter(classes))
+        if builtin and not classes:
+            return "builtin", ""
+        return "unknown", ""
+
+    def _python_assignment_evidence(
+        self,
+        node,
+        class_names: set[str],
+        imported_names: set[str],
+    ) -> Optional[tuple[str, str]]:
+        """What one assignment says its target holds, or None for "nothing"."""
+        type_node = node.child_by_field_name("type")
+        if type_node is not None:
+            type_name = self._base_type_name(
+                type_node.text.decode("utf-8", errors="replace"),
+            )
+            # An annotation the type reader rejects names a builtin or a
+            # container: still evidence, just not a class.
+            return ("class", type_name) if type_name else ("builtin", "")
+        right = node.child_by_field_name("right")
+        if right is None:
+            return None
+        if right.type == "none":
+            # ``x = None`` says nothing about what ``x`` later holds, so it
+            # must neither create nor destroy evidence.
+            return None
+        if right.type in _PY_LITERAL_VALUE_TYPES:
+            return "builtin", ""
+        if right.type == "call":
+            callee = right.child_by_field_name("function")
+            if callee is not None and callee.type == "identifier":
+                name = callee.text.decode("utf-8", errors="replace")
+                # A constructor call only counts when the callee is a class
+                # this file defines or a name it imports — otherwise any local
+                # factory function would manufacture class evidence.
+                if name in class_names or name in imported_names:
+                    return "class", name
+        return "unknown", ""
+
+    def _python_plain_import_bindings(
+        self,
+        node,
+        file_path: str,
+        module_bindings: dict[str, set[str]],
+        imported_names: set[str],
+    ) -> None:
+        """Record names bound by ``import x`` / ``import x.y as z``."""
+        for child in node.children:
+            local: Optional[str] = None
+            module: Optional[str] = None
+            if child.type == "dotted_name":
+                module = child.text.decode("utf-8", errors="replace")
+                # ``import a.b`` binds only ``a``; ``a.b.f()`` is an attribute
+                # chain the receiver reader never names anyway.
+                local = module.split(".", 1)[0]
+                module = local
+            elif child.type == "aliased_import":
+                names = [
+                    sub.text.decode("utf-8", errors="replace")
+                    for sub in child.children
+                    if sub.type in ("identifier", "dotted_name")
+                ]
+                if len(names) >= 2:
+                    module, local = names[0], names[-1]
+            if not local or not module:
+                continue
+            resolved = self._resolve_module_to_file(module, file_path, "python")
+            if resolved:
+                module_bindings.setdefault(local, set()).add(resolved)
+            else:
+                imported_names.add(local)
+
+    def _python_from_import_bindings(
+        self,
+        node,
+        file_path: str,
+        module_bindings: dict[str, set[str]],
+        imported_names: set[str],
+    ) -> None:
+        """Record names bound by ``from X import a, b as c``."""
+        module_node = node.child_by_field_name("module_name")
+        if module_node is None:
+            return
+        module = module_node.text.decode("utf-8", errors="replace")
+        package_dir = self._python_package_dir(module, file_path)
+        submodules = (
+            set(self._python_submodule_names(node, package_dir))
+            if package_dir is not None
+            else set()
+        )
+
+        def bind(local: str, imported: str) -> None:
+            if package_dir is not None and imported in submodules:
+                target = self._python_submodule_file(package_dir, imported)
+                if target is not None:
+                    module_bindings.setdefault(local, set()).add(target)
+                    return
+            imported_names.add(local)
+
+        seen_import_keyword = False
+        for child in node.children:
+            if child.type == "import":
+                seen_import_keyword = True
+            elif seen_import_keyword:
+                if child.type in ("identifier", "dotted_name"):
+                    name = child.text.decode("utf-8", errors="replace")
+                    bind(name, name)
+                elif child.type == "aliased_import":
+                    names = [
+                        sub.text.decode("utf-8", errors="replace")
+                        for sub in child.children
+                        if sub.type in ("identifier", "dotted_name")
+                    ]
+                    if names:
+                        bind(names[-1], names[0])
+
+    @staticmethod
+    def _python_binding_target_name(left) -> Optional[str]:
+        """Name an assignment binds, as the receiver reader would spell it.
+
+        ``self.pool = ...`` binds ``pool``, because ``self.pool.get()`` is
+        recorded with ``pool`` as its receiver.
+        """
+        if left is None:
+            return None
+        if left.type == "identifier":
+            return left.text.decode("utf-8", errors="replace")
+        if left.type == "attribute":
+            obj = left.child_by_field_name("object")
+            attribute = left.child_by_field_name("attribute")
+            if (
+                obj is not None
+                and attribute is not None
+                and obj.text in (b"self", b"cls")
+            ):
+                return attribute.text.decode("utf-8", errors="replace")
+        return None
+
+    @staticmethod
+    def _apply_python_receiver_evidence(
+        edges: list[EdgeInfo],
+        evidence: dict[tuple[int, str], tuple[str, str]],
+    ) -> list[EdgeInfo]:
+        """Stamp each bare Python member call with what its receiver is."""
+        annotated: list[EdgeInfo] = []
+        for edge in edges:
+            receiver = edge.extra.get("receiver")
+            if (
+                edge.kind != "CALLS"
+                or "::" in edge.target
+                or (not receiver and not edge.extra.get("receiver_form"))
+            ):
+                annotated.append(edge)
+                continue
+            kind, detail = (
+                evidence.get((edge.line, receiver), ("unknown", ""))
+                if receiver
+                else ("unknown", "")
+            )
+            extra = dict(edge.extra)
+            extra["receiver_binding"] = kind
+            if kind == "module":
+                extra["receiver_module"] = detail
+            elif kind == "class":
+                extra["receiver_class"] = detail
+            annotated.append(EdgeInfo(
+                kind=edge.kind,
+                source=edge.source,
+                target=edge.target,
+                file_path=edge.file_path,
+                line=edge.line,
+                extra=extra,
+            ))
+        return annotated
 
     _MAX_AST_DEPTH = 180  # Guard against pathologically nested source files
     _MAX_TEST_DESCRIPTION_LEN = 200  # Cap test description length in node names
@@ -10891,6 +11306,12 @@ class CodeParser:
                         )
                     ):
                         call_extra["go_method_receiver"] = True
+                elif method_name and language == "python":
+                    # ``os.environ.get(...)``: a member call whose receiver is
+                    # an expression, not a name. Without this marker the edge
+                    # is indistinguishable from a plain ``get(...)`` and the
+                    # resolvers below happily bind it to any same-named node.
+                    call_extra["receiver_form"] = "expression"
                 if language == "java" and child.type == "method_reference":
                     call_extra["call_syntax"] = "method_reference"
 
@@ -10955,7 +11376,7 @@ class CodeParser:
                 target = self._qualify(
                     call_name.rsplit("::", 1)[-1], file_path, enclosing_class,
                 )
-            elif receiver_name:
+            elif receiver_name or call_extra.get("receiver_form") == "expression":
                 target = call_name
             else:
                 target = self._resolve_call_target(
