@@ -13,5 +13,4 @@
 - [ROADMAP.md](ROADMAP.md): shipped and planned work
 - [LEGAL.md](LEGAL.md): licence and privacy
 - [LLM-OPTIMIZED-REFERENCE.md](../code_review_graph/docs/LLM-OPTIMIZED-REFERENCE.md): compact reference shipped inside the package for MCP clients
-
-
+- [CONTRIBUTING.md](../CONTRIBUTING.md): development setup, branching model (`staging` → `testing` → `main`), release flow

@@ -37,11 +37,64 @@ CI also runs `bandit -r code_review_graph/ -c pyproject.toml` and checks that `L
 
 ## Making Changes
 
-1. Fork the repository and create a branch.
+1. Fork the repository and create a branch from `staging`: `git checkout -b feature/your-feature origin/staging`.
 2. Make the change and add tests for new behaviour.
 3. Run the tests, ruff and mypy as above.
 4. Update docs where behaviour changed (README, `docs/`, docstrings).
-5. Open a pull request. The template asks for the linked issue, what changed and why, and the commands you ran.
+5. Open a pull request against `staging` (the default branch, so GitHub picks it for you). The template asks for the linked issue, what changed and why, and the commands you ran.
+
+## Branching and promotion
+
+The repository keeps three long-lived branches. Code moves in one direction only:
+
+```
+feature branch --PR--> staging --PR--> testing --PR--> main --tag--> PyPI
+```
+
+| Branch    | Purpose                                                        | Who merges into it                      |
+| --------- | -------------------------------------------------------------- | --------------------------------------- |
+| `staging` | Default branch. Every feature and fix PR lands here first.     | Maintainers, once CI is green.          |
+| `testing` | Candidate for the next release. Gets a longer soak and manual QA. | Maintainer, via a promotion PR from `staging`. |
+| `main`    | Released code. Nothing reaches `main` without passing QA on `testing`. | Maintainer, via a promotion PR from `testing`. |
+
+Rules that apply to all three branches (enforced by repository rulesets):
+
+- Changes arrive only through a pull request. Direct pushes, force-pushes and branch
+  deletion are blocked for everyone, admins included.
+- The same status checks must pass on every PR: `lint`, `type-check`, `security`,
+  `schema-sync`, and `test` on Python 3.10 through 3.13. Feature PRs into `staging`
+  must also be up to date with `staging` before merging; promotion PRs are exempt from
+  the up-to-date rule because a merge-commit promotion always leaves the target one
+  commit ahead of its source.
+- Repository admins may bypass the check requirements only when merging a pull
+  request, never by pushing.
+
+**Feature PRs** target `staging`. Squash-merging is fine for a single-author PR; use a
+merge commit when a PR has several authors so nobody loses attribution. Rebase-merge is
+also allowed on `staging`.
+
+**Promotion PRs** move everything on `staging` to `testing`, and later everything on
+`testing` to `main`. Open one from the Actions tab (`Promote` workflow, pick the step) or
+by hand with `gh pr create --base testing --head staging`. They are always merged with a
+**merge commit**, never squashed, so every contributor stays the author of their commits;
+the `testing` and `main` rulesets allow no other merge method. A promotion is the
+maintainer's sign-off: CI green is necessary but not sufficient. A promotion PR opened by
+the workflow shows an "Approve workflows to run" banner; the required checks are already
+satisfied by the CI run on the source branch's tip, so the banner can be approved or
+ignored.
+
+**Hotfixes** for a released version follow the same path. If a fix is urgent, open the PR
+against `staging` and promote twice in a row; do not open PRs against `main`.
+
+**Releases** are cut from `main` only: bump the version, tag `vX.Y.Z`, publish a GitHub
+release, and the `publish` workflow uploads to PyPI. Nothing is ever released from
+`staging` or `testing`.
+
+**Archived branches.** Old branches are not deleted outright. A branch that carried work
+not on `main` is kept as a tag under `archive/<branch-name>` (list them with
+`git tag -l 'archive/*'`), and local review copies live under the hidden namespace
+`refs/archive/local/*` (fetch them with `git fetch origin 'refs/archive/*:refs/archive/*'`).
+Nothing anyone contributed has been removed from history.
 
 ## Project Structure
 

@@ -163,8 +163,9 @@ database) with `actions/cache`:
   `workflow_run` workflow. See
   [`.github/workflows/pr-review.yml`](../.github/workflows/pr-review.yml) and
   [`.github/workflows/pr-review-comment.yml`](../.github/workflows/pr-review-comment.yml).
-  GitHub loads the `workflow_run` workflow from the default branch, so the
-  trusted commenting half becomes active only after that workflow is merged.
+  GitHub loads the `workflow_run` workflow from the default branch (`staging`
+  in this repository), so the trusted commenting half becomes active only
+  after that workflow is merged there.
   The privileged workflow must verify the source event and analysed commit,
   extract only under `runner.temp`, cap and validate the artifact, and add its
   own sticky marker before posting. Avoid `pull_request_target` with a checkout
