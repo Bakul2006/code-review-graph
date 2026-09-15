@@ -4063,6 +4063,21 @@ class CodeParser:
             ))
 
         finish(len(lines))
+        test_qnames = {
+            self._node_qualified(node)
+            for node in nodes
+            if node.is_test
+        }
+        for edge in list(edges):
+            if edge.kind == "CALLS" and edge.source in test_qnames:
+                edges.append(EdgeInfo(
+                    kind="TESTED_BY",
+                    source=edge.target,
+                    target=edge.source,
+                    file_path=edge.file_path,
+                    line=edge.line,
+                    extra=edge.extra.copy(),
+                ))
         return nodes, edges
 
     def _resolve_vbnet_edges(
