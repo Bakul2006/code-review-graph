@@ -697,6 +697,10 @@ pip install -e ".[dev]"
 pytest
 ```
 
+Pull requests target `staging` (the default branch). Changes are promoted
+`staging` → `testing` → `main`, and releases are tagged from `main`. See
+[CONTRIBUTING.md](CONTRIBUTING.md#branching-and-promotion) for the full flow.
+
 <details>
 <summary><strong>Adding a new language</strong></summary>
 <br>

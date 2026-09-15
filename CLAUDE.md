@@ -140,6 +140,13 @@ bd close <id>         # Complete work
 - Run `bd prime` for detailed command reference and session close protocol
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
 
+## Branching Model
+
+Three long-lived branches, one direction: feature PR → `staging` (default) → `testing` → `main` → tag → PyPI.
+Open every PR against `staging`. Never push to or open PRs against `testing` or `main`; those only
+receive promotion PRs, which the maintainer merges by hand with a merge commit. Full rules in
+CONTRIBUTING.md "Branching and promotion".
+
 ## Session Completion
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.

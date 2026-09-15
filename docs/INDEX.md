@@ -13,3 +13,4 @@
 - [REPRODUCING.md](REPRODUCING.md) -- Reproducing every benchmark number (pinned SHAs, seeded runs, tokenizer calibration)
 - [ROADMAP.md](ROADMAP.md) -- Shipped and planned features
 - [LEGAL.md](LEGAL.md) -- License and privacy
+- [CONTRIBUTING.md](../CONTRIBUTING.md) -- Development setup, branching model (`staging` → `testing` → `main`), release flow
