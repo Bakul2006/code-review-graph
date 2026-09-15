@@ -66,23 +66,33 @@ feature branch --PR--> staging --PR--> testing --PR--> main --tag--> PyPI
 | --------- | -------------------------------------------------------------- | --------------------------------------- |
 | `staging` | Default branch. Every feature and fix PR lands here first.     | Maintainers, once CI is green.          |
 | `testing` | Candidate for the next release. Gets a longer soak and manual QA. | Maintainer, via a promotion PR from `staging`. |
-| `main`    | Released code. Every commit on `main` has passed QA on `testing`. | Maintainer, via a promotion PR from `testing`. |
+| `main`    | Released code. Nothing reaches `main` without passing QA on `testing`. | Maintainer, via a promotion PR from `testing`. |
 
 Rules that apply to all three branches (enforced by repository rulesets):
 
-- Changes arrive only through a pull request. No direct pushes, no force-pushes, no deletion.
+- Changes arrive only through a pull request. Direct pushes, force-pushes and branch
+  deletion are blocked for everyone, admins included.
 - The same status checks must pass on every PR: `lint`, `type-check`, `security`,
-  `schema-sync`, and `test` on Python 3.10 through 3.13. The PR branch must be up to
-  date with its base before merging.
+  `schema-sync`, and `test` on Python 3.10 through 3.13. Feature PRs into `staging`
+  must also be up to date with `staging` before merging; promotion PRs are exempt from
+  the up-to-date rule because a merge-commit promotion always leaves the target one
+  commit ahead of its source.
+- Repository admins may bypass the check requirements only when merging a pull
+  request, never by pushing.
 
 **Feature PRs** target `staging`. Squash-merging is fine for a single-author PR; use a
-merge commit when a PR has several authors so nobody loses attribution.
+merge commit when a PR has several authors so nobody loses attribution. Rebase-merge is
+also allowed on `staging`.
 
 **Promotion PRs** move everything on `staging` to `testing`, and later everything on
 `testing` to `main`. Open one from the Actions tab (`Promote` workflow, pick the step) or
 by hand with `gh pr create --base testing --head staging`. They are always merged with a
-**merge commit**, never squashed, so every contributor stays the author of their commits.
-A promotion is the maintainer's sign-off: CI green is necessary but not sufficient.
+**merge commit**, never squashed, so every contributor stays the author of their commits;
+the `testing` and `main` rulesets allow no other merge method. A promotion is the
+maintainer's sign-off: CI green is necessary but not sufficient. A promotion PR opened by
+the workflow shows an "Approve workflows to run" banner; the required checks are already
+satisfied by the CI run on the source branch's tip, so the banner can be approved or
+ignored.
 
 **Hotfixes** for a released version follow the same path. If a fix is urgent, open the PR
 against `staging` and promote twice in a row; do not open PRs against `main`.

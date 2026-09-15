@@ -19,6 +19,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   open-pr:
@@ -50,11 +51,11 @@ jobs:
             echo
             echo "### Included"
             echo
-            git log --no-merges --format='- %h %s (%an)' "origin/$BASE..origin/$HEAD" | head -200
+            git log -n 200 --no-merges --format='- %h %s (%an)' "origin/$BASE..origin/$HEAD"
             echo
-            echo "### Merged pull requests"
+            echo "### Pull requests referenced"
             echo
-            git log --merges --format='%s' "origin/$BASE..origin/$HEAD" | grep -oE '#[0-9]+' | sort -u | sed 's/^/- /' || true
+            git log --format='%s' "origin/$BASE..origin/$HEAD" | grep -oE '#[0-9]+' | sort -u | sed 's/^/- /' || true
           } > "$RUNNER_TEMP/body.md"
           echo "count=$(git rev-list --count "origin/$BASE..origin/$HEAD")" >> "$GITHUB_OUTPUT"
       - name: Open or update the promotion PR
@@ -77,4 +78,7 @@ jobs:
           fi
       - name: Nothing to promote
         if: steps.body.outputs.count == '0'
+        env:
+          HEAD: ${{ steps.refs.outputs.head }}
+          BASE: ${{ steps.refs.outputs.base }}
         run: echo "::notice::$HEAD has no commits that $BASE lacks; no PR opened."
