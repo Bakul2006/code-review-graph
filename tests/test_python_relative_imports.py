@@ -13,6 +13,7 @@ Every test here pins the exact ``IMPORTS_FROM`` target and asserts that the
 target is a file that exists on disk.
 """
 
+import importlib.machinery
 from pathlib import Path
 
 import pytest
@@ -351,6 +352,259 @@ def test_absolute_import_calls_unchanged(pkg):
     )
 
     expected = f"{_posix(pkg / 'pkg' / 'graph.py')}::node_to_dict"
+    assert expected in _call_targets(edges)
+
+
+# --------------------------------------------------------------------------
+# Which file CPython would actually bind
+#
+# Ground truth here is taken from the interpreter, never from the audit
+# script and never from prose: ``PathFinder.find_spec`` runs the same
+# ``FileFinder`` that ``import`` runs, without executing the module. The audit
+# script's own ``_module_file`` had the module-before-package order wrong, so
+# a test written from it would have agreed with the bug.
+# --------------------------------------------------------------------------
+
+
+def _cpython_origin(directory: Path, name: str) -> str | None:
+    """``__file__`` CPython would give ``directory/name``, or None for a
+    namespace package (which has no file)."""
+    spec = importlib.machinery.PathFinder.find_spec(name, [str(directory)])
+    assert spec is not None, f"CPython finds no module {name} in {directory}"
+    return spec.origin
+
+
+def test_package_beats_a_same_named_module_file(pkg):
+    """``pkg/m/__init__.py`` and ``pkg/m.py`` both exist: the package wins."""
+    package = pkg / "pkg"
+    (package / "m.py").write_text("WHICH = 'module'\n", encoding="utf-8")
+    (package / "m").mkdir()
+    (package / "m" / "__init__.py").write_text(
+        "WHICH = 'package'\n", encoding="utf-8",
+    )
+
+    expected = _cpython_origin(package, "m")
+    assert expected == _posix(package / "m" / "__init__.py")
+
+    _, edges = _parse(pkg, "pkg/consumer.py", "from .m import WHICH\n")
+
+    assert _import_targets(edges) == [expected]
+
+
+def test_absolute_import_also_prefers_the_package(pkg):
+    """The same precedence on the absolute walk-up, not only the dot form."""
+    package = pkg / "pkg"
+    (package / "m.py").write_text("WHICH = 'module'\n", encoding="utf-8")
+    (package / "m").mkdir()
+    (package / "m" / "__init__.py").write_text(
+        "WHICH = 'package'\n", encoding="utf-8",
+    )
+
+    _, edges = _parse(pkg, "entry.py", "from pkg.m import WHICH\n")
+
+    assert _import_targets(edges) == [_cpython_origin(package, "m")]
+
+
+def test_module_file_beats_a_same_named_namespace_directory(pkg):
+    """A bare directory is only the fallback, so ``both.py`` still wins.
+
+    ``FileFinder`` records the namespace candidate but keeps looking for a
+    loader; it returns the namespace spec only when no file matched.
+    """
+    package = pkg / "pkg"
+    (package / "both.py").write_text("WHICH = 'module'\n", encoding="utf-8")
+    (package / "both").mkdir()
+    (package / "both" / "x.py").write_text("Y = 1\n", encoding="utf-8")
+
+    expected = _cpython_origin(package, "both")
+    assert expected == _posix(package / "both.py")
+
+    _, edges = _parse(pkg, "pkg/consumer.py", "from .both import WHICH\n")
+
+    assert _import_targets(edges) == [expected]
+
+
+# --------------------------------------------------------------------------
+# PEP 420 namespace packages
+# --------------------------------------------------------------------------
+
+
+def test_namespace_package_submodule_resolves_to_its_file(pkg):
+    """``pkg/ns/`` has no ``__init__.py``; ``pkg/ns/leaf.py`` is still a file."""
+    package = pkg / "pkg"
+    (package / "ns").mkdir()
+    (package / "ns" / "leaf.py").write_text(
+        "def thing():\n    return 1\n", encoding="utf-8",
+    )
+
+    # CPython: `pkg.ns` is a namespace package (no origin), `pkg.ns.leaf` is
+    # an ordinary module file.
+    assert _cpython_origin(package, "ns") is None
+    assert _cpython_origin(package / "ns", "leaf") == _posix(
+        package / "ns" / "leaf.py",
+    )
+
+    _, edges = _parse(pkg, "pkg/consumer.py", "from .ns import leaf\n")
+
+    assert _import_targets(edges) == [_posix(package / "ns" / "leaf.py")]
+
+
+def test_namespace_package_emits_no_target_for_itself(pkg):
+    """It has no file, so there is nothing honest to point an edge at.
+
+    The previous behaviour emitted the raw specifier ``.ns`` -- a target no
+    node in any graph can answer to.
+    """
+    package = pkg / "pkg"
+    (package / "ns").mkdir()
+    (package / "ns" / "leaf.py").write_text("X = 1\n", encoding="utf-8")
+
+    _, edges = _parse(pkg, "pkg/consumer.py", "from .ns import leaf\n")
+
+    assert ".ns" not in _import_targets(edges)
+
+
+def test_namespace_subpackage_is_still_walked_through(pkg):
+    """``from .ns.leaf import thing`` never needed an ``__init__.py``."""
+    package = pkg / "pkg"
+    (package / "ns").mkdir()
+    (package / "ns" / "leaf.py").write_text(
+        "def thing():\n    return 1\n", encoding="utf-8",
+    )
+
+    _, edges = _parse(pkg, "pkg/consumer.py", "from .ns.leaf import thing\n")
+
+    assert _import_targets(edges) == [_posix(package / "ns" / "leaf.py")]
+
+
+def test_namespace_package_with_no_submodule_keeps_the_raw_specifier(pkg):
+    """The one case with nothing better to say, pinned so it stays explicit."""
+    package = pkg / "pkg"
+    (package / "ns").mkdir()
+    (package / "ns" / "leaf.py").write_text("X = 1\n", encoding="utf-8")
+
+    _, edges = _parse(pkg, "pkg/consumer.py", "from .ns import NOT_A_MODULE\n")
+
+    assert _import_targets(edges) == [".ns"]
+
+
+# --------------------------------------------------------------------------
+# The two halves of the fix must agree
+#
+# `_extract_import` writes the IMPORTS_FROM edge; `_collect_import_names`
+# fills the import_map that CALLS and REFERENCES resolve through. A name
+# bound to a MODULE must mean the same file in both.
+# --------------------------------------------------------------------------
+
+
+def _import_map(root: Path, file_path: Path) -> dict[str, str]:
+    parser = CodeParser(repo_root=root)
+    source = file_path.read_bytes()
+    tree = parser._get_parser("python").parse(source)
+    import_map, _ = parser._collect_file_scope(
+        tree.root_node, "python", source, str(file_path),
+    )
+    return import_map
+
+
+def test_import_map_and_import_edge_agree_on_from_dot_import(pkg):
+    consumer = pkg / "pkg" / "consumer.py"
+    _, edges = _parse(pkg, "pkg/consumer.py", "from . import graph\n")
+
+    import_map = _import_map(pkg, consumer)
+
+    assert import_map["graph"] == _posix(pkg / "pkg" / "graph.py")
+    assert import_map["graph"] in _import_targets(edges)
+
+
+def test_import_map_and_import_edge_agree_on_a_namespace_submodule(pkg):
+    package = pkg / "pkg"
+    (package / "ns").mkdir()
+    (package / "ns" / "leaf.py").write_text("X = 1\n", encoding="utf-8")
+    consumer = package / "consumer.py"
+    _, edges = _parse(pkg, "pkg/consumer.py", "from .ns import leaf\n")
+
+    import_map = _import_map(pkg, consumer)
+
+    assert import_map["leaf"] == _posix(package / "ns" / "leaf.py")
+    assert import_map["leaf"] in _import_targets(edges)
+
+
+def test_import_map_keeps_a_plain_symbol_on_the_module_file(pkg):
+    """Only submodules move; ``GraphStore`` still belongs to ``graph.py``."""
+    consumer = pkg / "pkg" / "consumer.py"
+    _parse(pkg, "pkg/consumer.py", "from .graph import GraphStore\n")
+
+    import_map = _import_map(pkg, consumer)
+
+    assert import_map["GraphStore"] == _posix(pkg / "pkg" / "graph.py")
+
+
+def test_reference_to_an_imported_module_names_its_file_not_a_symbol(pkg):
+    """``from . import graph`` then ``f(graph)`` refers to the MODULE.
+
+    This used to emit ``<pkg>/__init__.py::graph``, a qualified name that
+    matches no node in any graph, because ``graph`` is not defined in the
+    package ``__init__``.
+    """
+    _, edges = _parse(
+        pkg,
+        "pkg/consumer.py",
+        "from . import graph\n"
+        "\n"
+        "\n"
+        "def register(fn):\n"
+        "    return fn\n"
+        "\n"
+        "\n"
+        "def run():\n"
+        "    return register(graph)\n",
+    )
+
+    references = {e.target for e in edges if e.kind == "REFERENCES"}
+    assert _posix(pkg / "pkg" / "graph.py") in references
+    assert not any("__init__.py::graph" in target for target in references)
+
+
+def test_reference_to_an_imported_subpackage_names_its_init(pkg):
+    """A subpackage's file is its ``__init__.py``, not ``<parent>::sub``."""
+    _, edges = _parse(
+        pkg,
+        "pkg/consumer.py",
+        "from . import sub\n"
+        "\n"
+        "\n"
+        "def register(fn):\n"
+        "    return fn\n"
+        "\n"
+        "\n"
+        "def run():\n"
+        "    return register(sub)\n",
+    )
+
+    references = {e.target for e in edges if e.kind == "REFERENCES"}
+    assert _posix(pkg / "pkg" / "sub" / "__init__.py") in references
+    assert f"{_posix(pkg / 'pkg' / '__init__.py')}::sub" not in references
+
+
+def test_call_through_a_package_reexport_lands_on_the_defining_file(pkg):
+    """``from .sub import thing`` where ``sub/__init__`` re-exports it.
+
+    Qualifying the symbol against the package file produced
+    ``sub/__init__.py::thing`` -- path-shaped, confident, and matching no
+    node. The package's export map knows where the name came from.
+    """
+    (pkg / "pkg" / "sub" / "__init__.py").write_text(
+        "from .deep import thing\n\n__all__ = ['thing']\n", encoding="utf-8",
+    )
+
+    _, edges = _parse(
+        pkg,
+        "pkg/consumer.py",
+        "from .sub import thing\n\n\ndef run():\n    return thing()\n",
+    )
+
+    expected = f"{_posix(pkg / 'pkg' / 'sub' / 'deep.py')}::thing"
     assert expected in _call_targets(edges)
 
 

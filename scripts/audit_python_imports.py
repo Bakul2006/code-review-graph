@@ -108,10 +108,22 @@ def _python_files(root: Path) -> list[Path]:
 
 
 def _module_file(base: Path, dotted: Optional[str]) -> Optional[Path]:
-    """Resolve ``base`` + a dotted tail to ``.py`` or ``__init__.py``."""
+    """Resolve ``base`` + a dotted tail to ``.py`` or ``__init__.py``.
+
+    Package before module. ``FileFinder`` checks whether the name is a
+    directory holding ``__init__`` *before* it tries any file loader, so with
+    both ``pkg/m/__init__.py`` and ``pkg/m.py`` on disk ``import pkg.m`` binds
+    the package. Verified against the interpreter:
+
+        $ python3 -c "import pkg.m; print(pkg.m.__file__)"
+        .../pkg/m/__init__.py
+
+    The reverse order (what this helper used to do, and what the parser used
+    to do) makes the audit agree with the bug instead of catching it.
+    """
     target = base if not dotted else base.joinpath(*dotted.split("."))
     candidates = (
-        [target.with_suffix(".py"), target / "__init__.py"]
+        [target / "__init__.py", target.with_suffix(".py")]
         if dotted
         else [target / "__init__.py"]
     )

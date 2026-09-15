@@ -1382,6 +1382,10 @@ _SPRING_EVENT_PUBLISH_METHODS = frozenset({"publishEvent"})
 _JAVA_PACKAGE_KEY = "__crg_java_package__"
 _SPRING_REQUEST_PREFIX_KEY = "__crg_spring_request_prefix__:"
 _JS_IMPORT_ORIGINAL_PREFIX_KEY = "__crg_js_import_original__:"
+# Marks a Python local name bound to a MODULE rather than to a symbol inside
+# one (``from . import cli``). The value is that module's file; a reference to
+# the name belongs to the file node, not to ``<file>::<name>``.
+_PY_MODULE_BINDING_KEY = "__crg_py_module_binding__:"
 _SPRING_REQUEST_MAPPINGS = {
     "DeleteMapping": ("DELETE",),
     "GetMapping": ("GET",),
@@ -2503,6 +2507,9 @@ class CodeParser:
         # Directory listings for case-exact Python module lookup; see
         # :meth:`_python_file_exists`.
         self._python_dir_entries: dict[str, frozenset[str]] = {}
+        # (module file, symbol) -> file that really defines the symbol; see
+        # :meth:`_python_reexport_origin`.
+        self._python_reexport_cache: dict[str, str] = {}
         # Absolute file paths to treat as absent during import resolution.
         # ``forget`` sets this (via :meth:`exclude_files`) so a re-parsed
         # referrer resolves exactly as it would in a build where the forgotten
@@ -13227,6 +13234,13 @@ class CodeParser:
         resolved_module = normalize_file_path(module_path)
         if resolved_module in resolving:
             return {}
+        if self._excluded_files:
+            # Origins are resolved with the exclusions in force, so a cache
+            # shared process-wide (and keyed only by the module's own mtime
+            # and size) would serve `forget` an answer computed for a
+            # different set of files on disk. Forget touches a handful of
+            # referrers, so recomputing is cheap and parity is exact.
+            return self._read_python_star_exports(module_path, resolving)
 
         cache_key = (resolved_module, file_stat.st_mtime_ns, file_stat.st_size)
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
@@ -13352,6 +13366,14 @@ class CodeParser:
         invisible to everyone not on Linux. Module resolution therefore
         compares against the directory's real listing, cached per directory
         because a package is probed once per import that names it.
+
+        A file marked via :meth:`exclude_files` answers False. ``forget`` asks
+        for the graph a build without that file would have produced, and in
+        that build the file is simply not on disk — so the probe must miss it
+        here rather than be filtered out one layer up in
+        :meth:`_resolve_module_to_file`, which every Python-specific caller
+        below reaches around. Missing *here* also lets resolution fall through
+        to the next candidate, exactly as the real absence would.
         """
         parent = path.parent
         key = str(parent)
@@ -13367,7 +13389,36 @@ class CodeParser:
         if path.name not in entries:
             return False
         try:
-            return path.is_file()
+            if not path.is_file():
+                return False
+        except OSError:
+            return False
+        if self._excluded_files and normalize_file_path(path) in self._excluded_files:
+            return False
+        return True
+
+    def _python_dir_exists(self, path: Path) -> bool:
+        """Case-exact ``is_dir`` for Python package lookup.
+
+        Same reason as :meth:`_python_file_exists`: a PEP 420 namespace
+        package is a directory, and ``Path.is_dir()`` would confirm a
+        spelling that is not on disk.
+        """
+        parent = path.parent
+        key = str(parent)
+        entries = self._python_dir_entries.get(key)
+        if entries is None:
+            try:
+                entries = frozenset(os.listdir(parent))
+            except OSError:
+                entries = frozenset()
+            if len(self._python_dir_entries) >= self._MODULE_CACHE_MAX:
+                self._python_dir_entries.clear()
+            self._python_dir_entries[key] = entries
+        if path.name not in entries:
+            return False
+        try:
+            return path.is_dir()
         except OSError:
             return False
 
@@ -13392,38 +13443,87 @@ class CodeParser:
                         break
         return names
 
-    def _python_submodule_imports(
-        self, node, module: str, file_path: Optional[str],
+    def _python_package_dir(
+        self, module: str, file_path: Optional[str],
+    ) -> Optional[Path]:
+        """Directory of the package *module* names, or None if it is not one.
+
+        Covers both kinds of package CPython recognises: a regular one, whose
+        directory holds ``__init__.py``, and a PEP 420 namespace package,
+        which is a bare directory. A namespace package has no file of its own
+        — nothing for an ``IMPORTS_FROM`` edge to point at — but its
+        submodules are ordinary files, so callers still need its directory.
+        """
+        if not file_path:
+            return None
+        package_file = self._resolve_module_to_file(module, file_path, "python")
+        if package_file:
+            path = Path(package_file)
+            return path.parent if path.name == "__init__.py" else None
+        return self._resolve_python_namespace_dir(module, file_path)
+
+    def _python_submodule_file(
+        self, package_dir: Path, name: str,
+    ) -> Optional[str]:
+        """File backing submodule *name* of the package at *package_dir*.
+
+        ``None`` for a name that is a symbol rather than a module, and for a
+        namespace subpackage, which has no file of its own.
+        """
+        for candidate in (
+            package_dir / name / "__init__.py",
+            package_dir / f"{name}.py",
+        ):
+            if self._python_file_exists(candidate):
+                return normalize_file_path(candidate)
+        return None
+
+    def _python_submodule_names(
+        self, node, package_dir: Path,
     ) -> list[str]:
-        """Extra module targets for imported names that are themselves modules.
+        """Imported names that are themselves modules inside *package_dir*.
 
         ``from . import incremental`` and ``from .tools import query`` import a
         MODULE through a package: the statement's real dependency is that
         submodule's file, not only the package ``__init__.py``. Only names
-        that answer to a file next to the package's ``__init__.py`` qualify,
-        so ``from .graph import GraphStore`` (a class) stays a single edge and
+        that answer to a module in the package directory qualify, so
+        ``from .graph import GraphStore`` (a class) stays a single edge and
         edge counts do not inflate.
         """
-        if not file_path:
-            return []
-        package_file = self._resolve_module_to_file(module, file_path, "python")
-        if not package_file or Path(package_file).name != "__init__.py":
-            return []
-        package_dir = Path(package_file).parent
-        prefix = module if module.endswith(".") else f"{module}."
         submodules: list[str] = []
         for name in self._python_imported_names(node):
-            if "." in name:
+            if "." in name or name in submodules:
                 continue
-            if self._python_file_exists(
-                package_dir / f"{name}.py",
-            ) or self._python_file_exists(
-                package_dir / name / "__init__.py",
-            ):
-                candidate = f"{prefix}{name}"
-                if candidate not in submodules:
-                    submodules.append(candidate)
+            if self._python_submodule_file(
+                package_dir, name,
+            ) is not None or self._python_dir_exists(package_dir / name):
+                submodules.append(name)
         return submodules
+
+    def _python_from_import_targets(
+        self, node, module: str, file_path: Optional[str],
+    ) -> list[str]:
+        """Every module one ``from X import a, b`` statement depends on.
+
+        The package itself, plus any imported name that is a submodule rather
+        than a symbol. A PEP 420 namespace package contributes no target of
+        its own — it has no file — only its submodules; emitting the raw
+        ``.ns`` specifier there would be a target no node can ever answer to.
+        """
+        package_dir = self._python_package_dir(module, file_path)
+        namespace = package_dir is not None and not self._python_file_exists(
+            package_dir / "__init__.py",
+        )
+        prefix = module if module.endswith(".") else f"{module}."
+        targets: list[str] = [] if namespace else [module]
+        if package_dir is not None:
+            targets.extend(
+                f"{prefix}{name}"
+                for name in self._python_submodule_names(node, package_dir)
+            )
+        # A namespace package that binds no submodule (only possible for a
+        # name that cannot be imported at all) still has to say something.
+        return targets or [module]
 
     def _python_import_origin(
         self, module: str, file_path: str,
@@ -13444,13 +13544,25 @@ class CodeParser:
                 return None
             if not self._path_is_within(resolved, boundary):
                 return None
-            return normalize_file_path(resolved) if resolved.is_file() else None
+            return (
+                normalize_file_path(resolved)
+                if self._python_file_exists(resolved)
+                else None
+            )
         return self._resolve_python_module_in_repo(module, file_path)
 
-    def _resolve_python_module_in_repo(
+    def _python_module_search(
         self, module: str, file_path: str,
-    ) -> Optional[str]:
-        """Resolve a Python module without traversing above the repository."""
+    ) -> tuple[list[Path], Path, Path]:
+        """``(search roots, boundary, module tail)`` for a Python module.
+
+        The leading dots of a relative import ARE the resolution: one dot is
+        the caller's own package, each further dot one package up, and there
+        is exactly one place to look. An absolute import walks up from the
+        caller's directory, never past the repository root — a match above it
+        is another checkout or a site-packages copy, not this repository's
+        module.
+        """
         caller_dir = Path(file_path).resolve().parent
         boundary = self._python_repo_boundary(file_path)
         leading_dots = len(module) - len(module.lstrip("."))
@@ -13462,7 +13574,7 @@ class CodeParser:
             base = caller_dir
             for _ in range(leading_dots - 1):
                 if base == boundary:
-                    return None
+                    return [], boundary, relative
                 base = base.parent
             search_roots.append(base)
         else:
@@ -13472,14 +13584,33 @@ class CodeParser:
                 if current == boundary:
                     break
                 current = current.parent
+        return search_roots, boundary, relative
 
+    @staticmethod
+    def _python_module_candidates(base: Path, has_tail: bool) -> tuple[Path, ...]:
+        """The files CPython would load for a module rooted at *base*, in order.
+
+        ``FileFinder`` checks the package directory before the same-named
+        module file, so with both ``pkg/m/__init__.py`` and ``pkg/m.py`` on
+        disk ``import pkg.m`` loads the package — verified against the
+        interpreter, not inferred. Probing ``m.py`` first silently bound
+        every such import to the wrong file.
+        """
+        if not has_tail:
+            return (base / "__init__.py",)
+        return (base / "__init__.py", base.with_suffix(".py"))
+
+    def _resolve_python_module_in_repo(
+        self, module: str, file_path: str,
+    ) -> Optional[str]:
+        """Resolve a Python module without traversing above the repository."""
+        search_roots, boundary, relative = self._python_module_search(
+            module, file_path,
+        )
+        has_tail = relative != Path()
         for root in search_roots:
             base = root / relative
-            candidates = (
-                base.with_suffix(".py") if module_name else base / "__init__.py",
-                base / "__init__.py",
-            )
-            for candidate in candidates:
+            for candidate in self._python_module_candidates(base, has_tail):
                 try:
                     resolved = candidate.resolve()
                 except (OSError, ValueError):
@@ -13488,6 +13619,41 @@ class CodeParser:
                     continue
                 if self._python_file_exists(resolved):
                     return normalize_file_path(resolved)
+        return None
+
+    def _resolve_python_namespace_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """Directory of the PEP 420 namespace package *module* names.
+
+        Only reached once :meth:`_resolve_python_module_in_repo` has found no
+        file, which keeps CPython's precedence intact: a real ``m.py`` wins
+        over a same-named directory with no ``__init__.py``, because the
+        namespace package is what the finder falls back to, not what it
+        prefers.
+        """
+        search_roots, boundary, relative = self._python_module_search(
+            module, file_path,
+        )
+        if relative == Path() and not module.startswith("."):
+            # A bare ``from  import x`` cannot occur; only the relative form
+            # reaches here with no tail.
+            return None
+        for root in search_roots:
+            try:
+                candidate = (root / relative).resolve()
+            except (OSError, ValueError):
+                continue
+            if not self._path_is_within(candidate, boundary):
+                continue
+            # ``from . import x`` inside a namespace package: the package IS
+            # the search root, so there is no name to compare case-exactly.
+            if candidate == root:
+                if candidate.is_dir():
+                    return candidate
+                continue
+            if self._python_dir_exists(candidate):
+                return candidate
         return None
 
     def _collect_js_exported_local_names(
@@ -13621,17 +13787,45 @@ class CodeParser:
                 if module_node is None:
                     return
                 module = module_node.text.decode("utf-8", errors="replace")
+                # Submodules the statement binds by name, so `from . import
+                # cli` agrees with the IMPORTS_FROM edge `_extract_import`
+                # writes for the same line instead of pointing `cli` at the
+                # package `__init__.py`, where no `cli` is defined.
+                package_dir = self._python_package_dir(module, file_path)
+                submodules = (
+                    set(self._python_submodule_names(node, package_dir))
+                    if package_dir is not None
+                    else set()
+                )
                 if module.startswith("."):
                     # A relative module string means nothing away from the
                     # file that wrote it, so store the resolved file instead;
                     # `_resolve_imported_symbol` already accepts a path here,
                     # which is what star-import expansion stores too.
                     resolved = (
-                        self._resolve_python_module_in_repo(module, file_path)
+                        self._resolve_module_to_file(module, file_path, "python")
                         if file_path
                         else None
                     )
                     module = resolved or module
+
+                def _bind(local_name: str, imported_name: str) -> None:
+                    if imported_name in submodules and package_dir is not None:
+                        target = self._python_submodule_file(
+                            package_dir, imported_name,
+                        )
+                        if target is not None:
+                            import_map[local_name] = target
+                            # A name bound to a MODULE is not a symbol inside
+                            # one: the reference belongs to the module's file
+                            # node, not to `<file>::<name>`, which matches
+                            # nothing. See `_resolve_call_target`.
+                            import_map[
+                                f"{_PY_MODULE_BINDING_KEY}{local_name}"
+                            ] = target
+                            return
+                    import_map[local_name] = module
+
                 seen_import_keyword = False
                 for child in node.children:
                     if child.type == "import":
@@ -13639,7 +13833,7 @@ class CodeParser:
                     elif seen_import_keyword:
                         if child.type in ("identifier", "dotted_name"):
                             name = child.text.decode("utf-8", errors="replace")
-                            import_map[name] = module
+                            _bind(name, name)
                         elif child.type == "aliased_import":
                             # from X import A as B → {B: X}
                             names = [
@@ -13649,7 +13843,7 @@ class CodeParser:
                             ]
                             # Last name is the alias (local name)
                             if names:
-                                import_map[names[-1]] = module
+                                _bind(names[-1], names[0])
 
         elif language in ("javascript", "typescript", "tsx"):
             # import { A, B } from './path' → {A: ./path, B: ./path}
@@ -13819,6 +14013,7 @@ class CodeParser:
         self._excluded_files = {normalize_file_path(Path(p).resolve()) for p in paths}
         # Drop resolutions cached before the exclusions were applied.
         self._module_file_cache.clear()
+        self._python_reexport_cache.clear()
 
     def _resolve_module_to_file(
         self, module: str, file_path: str, language: str,
@@ -13901,7 +14096,11 @@ class CodeParser:
                 # resolves).
                 return self._resolve_python_module_in_repo(module, file_path)
             rel_path = module.replace(".", "/")
-            candidates = [rel_path + ".py", rel_path + "/__init__.py"]
+            # Package before module: with both ``pkg/m/__init__.py`` and
+            # ``pkg/m.py`` on disk, ``import pkg.m`` loads the package, because
+            # ``FileFinder`` checks the directory before the file loaders. The
+            # relative resolver agrees; see ``_python_module_candidates``.
+            candidates = [rel_path + "/__init__.py", rel_path + ".py"]
             # Walk up from caller's directory to find the module file, never
             # past the repository root: a match outside it is another
             # checkout or a site-packages copy, not this repository's module.
@@ -13909,7 +14108,7 @@ class CodeParser:
             while True:
                 for candidate in candidates:
                     target = current / candidate
-                    if target.is_file():
+                    if self._python_file_exists(target):
                         found = target.resolve()
                         if self._repo_root is not None and not _path_is_within(
                             found, self._repo_root,
@@ -14529,6 +14728,14 @@ class CodeParser:
         if call_name in import_map:
             if language == "julia":
                 return import_map[call_name]
+            module_binding = import_map.get(
+                f"{_PY_MODULE_BINDING_KEY}{call_name}",
+            )
+            if module_binding:
+                # `from . import cli` binds a MODULE. The reference is to the
+                # module's file node; `<pkg>/__init__.py::cli` (what this used
+                # to produce) matches no node in any graph.
+                return module_binding
             resolved = self._resolve_imported_symbol(
                 self._js_imported_symbol_name(call_name, import_map),
                 import_map[call_name],
@@ -14562,10 +14769,39 @@ class CodeParser:
         if not resolved:
             return None
 
+        if language == "python":
+            resolved = self._python_reexport_origin(resolved, symbol_name)
         export_target = self._resolve_exported_symbol(resolved, symbol_name)
         if export_target:
             return export_target
         return self._qualify(symbol_name, resolved, None)
+
+    def _python_reexport_origin(self, module_file: str, symbol_name: str) -> str:
+        """Follow a package's re-exports to the file that defines *symbol_name*.
+
+        ``from .tools import query_graph`` resolves to ``tools/__init__.py``,
+        but the function lives in ``tools/query.py``, so qualifying the symbol
+        against the package file produced ``tools/__init__.py::query_graph`` —
+        a confident-looking target that matches no node. The package's own
+        export map already knows where each name came from; reuse it. Returns
+        *module_file* unchanged when the name is defined there, when the
+        origin is outside the repository, or when the module cannot be read.
+        """
+        if not module_file.endswith(".py"):
+            return module_file
+        # The same (module, symbol) pair is asked for once per call site, and
+        # the answer costs a resolve + stat + lock even on a cache hit inside
+        # `_get_python_star_exports`. Remember it here instead.
+        cache_key = f"{module_file}::{symbol_name}"
+        cached = self._python_reexport_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        origin = self._get_python_star_exports(module_file).get(symbol_name)
+        result = origin if origin and origin != module_file else module_file
+        if len(self._python_reexport_cache) >= self._MODULE_CACHE_MAX:
+            self._python_reexport_cache.clear()
+        self._python_reexport_cache[cache_key] = result
+        return result
 
     def _resolve_exported_symbol(
         self,
@@ -15839,9 +16075,8 @@ class CodeParser:
                 module_node = node.child_by_field_name("module_name")
                 if module_node is not None:
                     module = module_node.text.decode("utf-8", errors="replace")
-                    imports.append(module)
                     imports.extend(
-                        self._python_submodule_imports(node, module, file_path),
+                        self._python_from_import_targets(node, module, file_path),
                     )
             else:
                 for child in node.children:
