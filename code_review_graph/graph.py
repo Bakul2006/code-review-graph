@@ -673,7 +673,8 @@ class GraphStore:
         # as well as top-level functions.
         input_qns = [qualified_name]
         row = conn.execute(
-            "SELECT kind, file_path FROM nodes WHERE qualified_name = ?",
+            "SELECT kind, file_path, parent_name FROM nodes "
+            "WHERE qualified_name = ?",
             (qualified_name,),
         ).fetchone()
         if row and row["kind"] == "Class":
@@ -691,6 +692,8 @@ class GraphStore:
                 (row["file_path"], qualified_name),
             ).fetchall():
                 input_qns.append(symbol["qualified_name"])
+        target_file = row["file_path"] if row else ""
+        target_parent = row["parent_name"] if row else None
 
         def _node_dict(qn: str, indirect: bool) -> dict | None:
             row = conn.execute(
@@ -787,6 +790,22 @@ class GraphStore:
             if _has_unresolved_metadata(row["extra"]):
                 continue
             if _candidate_for_context(bare, row["file_path"]) != qualified_name:
+                continue
+            # TESTED_BY is minted from the test's own CALLS edge and inherits
+            # its metadata, so a bare source here carries the same receiver
+            # evidence a bare call target does. An import that merely brings a
+            # same-named symbol into the test file is not proof the test
+            # exercised this node — `some_dict.get(...)` in a test is still
+            # not a test of `ConnectionPool.get`. See: #997
+            try:
+                tested_by_extra = json.loads(row["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                tested_by_extra = {}
+            if isinstance(tested_by_extra, dict) and not (
+                self._receiver_evidence_admits_candidate(
+                    tested_by_extra, qualified_name, target_file, target_parent,
+                )
+            ):
                 continue
             tgt = row["target_qualified"]
             if tgt not in seen:
@@ -924,6 +943,47 @@ class GraphStore:
                 if parent_lookup.get(candidate[0]) == class_name
             ]
         return []
+
+    @classmethod
+    def _receiver_evidence_admits_candidate(
+        cls,
+        edge_extra: dict,
+        qualified_name: str,
+        file_path: str,
+        parent_name: str | None,
+    ) -> bool:
+        """Row-level form of :meth:`receiver_evidence_admits`."""
+        if "receiver_binding" not in edge_extra:
+            return True
+        return bool(cls._receiver_backed_candidates(
+            [(qualified_name, file_path)],
+            edge_extra,
+            {qualified_name: parent_name or None},
+        ))
+
+    @classmethod
+    def receiver_evidence_admits(
+        cls, edge_extra: dict, node: GraphNode,
+    ) -> bool:
+        """Can this edge's receiver evidence mean *node*?
+
+        The read path keeps a bare-name fallback: a CALLS edge whose target is
+        the plain method name still answers ``callers_of`` for a node of that
+        name. That fallback applies exactly the rule
+        ``_resolve_bare_endpoints`` refuses to apply — ``some_dict.get(...)``
+        writes the target ``get`` and says nothing whatever about
+        ``ConnectionPool.get`` — so leaving the two paths disagreeing means
+        every attribution the resolver honestly declined is handed back by the
+        tool. Reuse the resolver's own test here, over the single candidate the
+        caller is asking about.
+
+        An edge carrying no ``receiver_binding`` at all is a plain
+        ``foo(...)`` call with no receiver to consult. That is the case the
+        fallback exists for, and it is admitted unchanged.
+        """
+        return cls._receiver_evidence_admits_candidate(
+            edge_extra, node.qualified_name, node.file_path, node.parent_name,
+        )
 
     def resolve_bare_call_targets(self) -> int:
         """Resolve bare CALLS targets backed by same-file or import evidence.
