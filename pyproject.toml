@@ -90,6 +90,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["code_review_graph"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "code_review_graph/_bundled_skills"
+
 [tool.hatch.build.targets.sdist]
 include = [
     "code_review_graph/",
