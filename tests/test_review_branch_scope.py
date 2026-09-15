@@ -12,7 +12,7 @@ def test_review_context_excludes_base_only_changes(tmp_path, monkeypatch):
 
     def git(*args):
         return subprocess.run(
-            ["git", *args],
+            ["git", "-c", "user.email=t@test", "-c", "user.name=t", *args],
             cwd=repo,
             check=True,
             capture_output=True,

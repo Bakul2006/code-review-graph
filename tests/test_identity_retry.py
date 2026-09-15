@@ -156,7 +156,11 @@ def test_pending_identity_preserves_git_freshness_and_content_reconciliation(
 
     def git(*args):
         return subprocess.run(
-            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+            ["git", "-c", "user.email=t@test", "-c", "user.name=t", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
 
     git("init", "-q")

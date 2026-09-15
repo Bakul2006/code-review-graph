@@ -1538,6 +1538,24 @@ def full_build(
     }
 
 
+def _relative_update_input(repo_root: Path, path: str) -> str:
+    """Return *path* relative to *repo_root* when it is absolute and inside it.
+
+    Update inputs are repo-relative, and the ignore rules are anchored to the
+    repository root, so an absolute path handed in by a caller would be matched
+    against patterns such as ``/tmp/**`` by its filesystem spelling instead of
+    its place in the repository. Paths outside the root are returned unchanged
+    and are left to stale-file reconciliation.
+    """
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return path
+    try:
+        return candidate.relative_to(repo_root).as_posix()
+    except ValueError:
+        return path
+
+
 def incremental_update(
     repo_root: Path,
     store: GraphStore,
@@ -1605,7 +1623,11 @@ def incremental_update(
             repo_root,
             store,
         )
-    changed_files = list(dict.fromkeys([*changed_files, *content_mismatches]))
+    changed_files = list(
+        dict.fromkeys(
+            [_relative_update_input(repo_root, p) for p in [*changed_files, *content_mismatches]]
+        )
+    )
     stale_files = (
         _reconcile_stale_files(repo_root, store, known_text=known_text)
         if reconcile_stale
