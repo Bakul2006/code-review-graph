@@ -164,6 +164,7 @@ markers = [
     "surface: drives every registered MCP tool and prompt through a real client over stdio",
     "corpus: builds the graph over pinned real repositories and compares recorded baselines",
     "exports: slow conformance checks for every artefact the tool writes (visualize --format html/json/graphml/cypher/obsidian/svg, and wiki)",
+    "cli_surface: enumerates the whole CLI and its failure modes as subprocesses (slow)",
 ]
 
 [dependency-groups]

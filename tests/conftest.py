@@ -72,7 +72,7 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
 # ``-m`` expression names its marker, so ``pytest tests/`` stays fast while
 # ``pytest -m <marker>`` still finds the tests. Add a marker name to the set
 # (and to the ``markers`` list in pyproject.toml) to gate another suite.
-_OPT_IN_MARKERS = frozenset({"corpus", "determinism", "platform_lifecycle"})
+_OPT_IN_MARKERS = frozenset({"cli_surface", "corpus", "determinism", "platform_lifecycle"})
 
 
 def pytest_collection_modifyitems(config, items):
