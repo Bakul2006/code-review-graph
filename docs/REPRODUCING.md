@@ -176,10 +176,14 @@ used`, `how do tests verify core functionality`).
 | httpx | `b55d4635` | 142,356 | 2,661 | **60.6x** |
 | express | `b4ab7d65` | 136,052 | 3,936 | **36.0x** |
 
-Range across the 6 repos: 36x to 376x; median about 65x.
+`avg ratio` is the benchmark's `average_reduction_ratio`: the mean of the five per-question
+`naive_total / graph_tokens` ratios. It is not `naive_corpus_tokens / avg graph_tokens`, and
+it always reads higher than that division, so the three columns do not divide out. Range
+across the 6 repos on this measure: 36x to 376x, median about 65x. The README divides the
+two token columns instead and reports 35x to 358x, median about 63x.
 
-The JSON written by Step 4 for this capture is not checked in; the same figures appear in
-the README. They replace the 2026-05-25 capture and every ratio is lower, for two reasons
+The JSON written by Step 4 for this capture is not checked in; the same
+`naive_corpus_tokens` and `avg graph_tokens` figures appear in the README. They replace the 2026-05-25 capture and every ratio is lower, for two reasons
 confirmed by re-running from clean clones: `avg graph_tokens` rose in every repo because the
 per-node embedding text grew, so a 5-hit response carries more text; and fastapi is measured
 at its current pin `22381558` instead of the retired `0227991a`. `naive_corpus_tokens` is
