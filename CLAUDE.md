@@ -92,6 +92,7 @@ uv run code-review-graph --help             # full command list
 - Install and platforms: `test_skills.py`, `test_cli_install.py`, `test_uninstall.py`, `test_git_hook_worktree.py`, `test_hermes_install.py`, `test_qoder_bundled_skills.py`.
 - Windows: `test_windows_compat.py`, `test_windows_path_identity.py`.
 - Docs and GitHub Action: `test_documentation.py`, `test_action_render.py`.
+- Distribution gate: `test_packaging.py`, marked `packaging` and **skipped by default**. Builds a wheel and an sdist with `python -m build`, installs each into its own virtual environment, and drives the installed program with the checkout out of reach. Needs network and takes a couple of minutes. Run it before a release with `uv run --python 3.13 python -m pytest tests/test_packaging.py -m packaging`.
 - `tests/fixtures/`: sample files per supported language.
 
 ## CI Pipeline
