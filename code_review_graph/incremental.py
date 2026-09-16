@@ -191,6 +191,20 @@ def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
         return None
 
 
+def _refresh_target_resolution(store: GraphStore) -> None:
+    """Reclassify CALLS/REFERENCES targets after the cross-file resolvers.
+
+    The resolvers above rewrite bare targets into qualified ones, so this has
+    to run last. A failure here costs the query layer its stored certainty
+    column, which every read falls back from safely, so it must never fail a
+    build.
+    """
+    try:
+        store.refresh_target_resolution()
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Target-resolution refresh failed: %s", exc)
+
+
 # Default ignore patterns (in addition to .gitignore).
 #
 # ``**/<dir>/**`` patterns are safe-anywhere directory exclusions.  A leading
@@ -1528,6 +1542,7 @@ def full_build(
     temporal_stats = _run_temporal_resolver(store)
     hcl_stats = _run_hcl_resolver(store)
     scoped_stats = _run_scoped_resolver(store)
+    _refresh_target_resolution(store)
 
     return {
         "files_parsed": len(files),
@@ -1793,6 +1808,8 @@ def incremental_update(
     hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
     scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
+    if files_updated or stale_files:
+        _refresh_target_resolution(store)
 
     # Freshness follows what was stored. A file that failed to parse is
     # reported in ``errors`` and keeps its previous rows; it must not stop the
