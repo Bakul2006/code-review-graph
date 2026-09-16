@@ -38,13 +38,18 @@ from pathlib import Path
 import pytest
 
 from code_review_graph.graph import GraphStore
-from code_review_graph.migrations import LATEST_VERSION, get_schema_version
+from code_review_graph.migrations import (
+    LATEST_VERSION,
+    NODES_FTS_COLUMNS,
+    get_schema_version,
+)
 from code_review_graph.parser import NodeInfo
 from code_review_graph.search import (
     _MAX_FTS_TERMS,
     build_fts_queries,
     hybrid_search,
     rebuild_fts_index,
+    update_fts_index,
 )
 
 # ---------------------------------------------------------------------------
@@ -444,7 +449,7 @@ class TestDocstringIndexing:
 
 
 class TestDocstringMigration:
-    def test_pre_v11_database_gains_docstring_and_token_columns(self):
+    def test_pre_v13_database_gains_docstring_and_token_columns(self):
         """A graph built before this change must migrate without a rebuild."""
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp.close()
@@ -492,3 +497,114 @@ class TestDocstringMigration:
             store.close()
         finally:
             Path(path).unlink(missing_ok=True)
+
+    def test_v12_index_mirror_is_widened_to_every_indexed_column(self):
+        """The mirror has to carry what an external-content delete replays.
+
+        v12 created ``nodes_fts_state`` with the four columns the index had
+        then. v13 adds two more to the index, and a delete that omits them
+        leaves the old prose in the index -- SQLite reports the FTS table as
+        malformed on the next query. The migration therefore widens the
+        mirror and refills it from the rebuild it just ran.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        path = tmp.name
+        try:
+            store = GraphStore(path)
+            conn = store._conn
+            conn.execute("ALTER TABLE nodes DROP COLUMN docstring")
+            conn.execute("ALTER TABLE nodes DROP COLUMN name_tokens")
+            conn.execute("DROP TABLE IF EXISTS nodes_fts")
+            conn.execute("DROP TABLE IF EXISTS nodes_fts_state")
+            conn.execute(
+                "CREATE TABLE nodes_fts_state (node_id INTEGER PRIMARY KEY, "
+                "name TEXT, qualified_name TEXT, file_path TEXT, "
+                "signature TEXT)"
+            )
+            conn.execute("""
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    name, qualified_name, file_path, signature,
+                    content='nodes', content_rowid='rowid',
+                    tokenize='porter unicode61'
+                )
+            """)
+            conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, "
+                "language, extra, updated_at) VALUES "
+                "('Function', 'hashPassword', 'auth.py::hashPassword', "
+                "'auth.py', 'python', ?, 0)",
+                ('{"docstring": "Derives a zygomorphic digest."}',),
+            )
+            conn.execute(
+                "UPDATE metadata SET value = '12' WHERE key = 'schema_version'"
+            )
+            store.commit()
+            store.close()
+
+            store = GraphStore(path)
+            conn = store._conn
+            assert get_schema_version(conn) == LATEST_VERSION
+            mirror = [
+                row[1] for row in conn.execute("PRAGMA table_info(nodes_fts_state)")
+            ]
+            assert mirror == ["node_id", *NODES_FTS_COLUMNS]
+            # The mirror describes the index the migration rebuilt, so the
+            # next sync is a delta rather than another full rebuild.
+            assert conn.execute(
+                "SELECT count(*) FROM nodes_fts_state"
+            ).fetchone()[0] == conn.execute(
+                "SELECT count(*) FROM nodes"
+            ).fetchone()[0]
+
+            # A delta over the widened mirror keeps the index queryable.
+            conn.execute(
+                "UPDATE nodes SET docstring = 'Derives nothing at all.' "
+                "WHERE name = 'hashPassword'"
+            )
+            store.commit()
+            mode: list[str] = []
+            update_fts_index(store, ["auth.py"], _out_mode=mode)
+            assert mode == ["delta"]
+            assert hybrid_search(store, "zygomorphic", limit=10) == []
+            assert [r["name"] for r in hybrid_search(store, "password", limit=10)] == [
+                "hashPassword"
+            ]
+            store.close()
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+
+class TestWideningDoesNotInventMatches:
+    """What the OR widening does for a query that should match nothing."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = GraphStore(self.tmp.name)
+        _seed(self.store)
+        rebuild_fts_index(self.store)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_a_query_of_words_the_index_does_not_hold_returns_nothing(self):
+        """Neither the AND nor the OR may invent a hit out of nothing."""
+        assert hybrid_search(self.store, "zygomorphic quixotry", limit=20) == []
+        assert hybrid_search(self.store, "zygomorphic", limit=20) == []
+
+    def test_one_indexed_word_is_enough_for_the_widening_to_answer(self):
+        """Measured, and deliberate: recall over silence.
+
+        ``zygomorphic password`` cannot match anything as a conjunction, and
+        the widening answers it with what ``password`` alone matches. The
+        rows are real nodes, not phantoms, but the query as a whole is not
+        what they match -- so this is pinned rather than claimed as correct.
+        """
+        rows = hybrid_search(self.store, "zygomorphic password", limit=20)
+        assert rows
+        assert all("password" in r["name"].lower()
+                   or "password" in (r.get("docstring") or "").lower()
+                   or "password" in r["qualified_name"].lower()
+                   for r in rows)
