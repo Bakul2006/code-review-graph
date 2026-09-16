@@ -73,6 +73,43 @@ _PYTHON_STAR_CACHE_MAX = 15_000
 _PYTHON_STAR_EXPORT_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
 _PYTHON_STAR_EXPORT_CACHE_LOCK = threading.RLock()
 
+# ``{module file: {top-level def name: return annotation text}}``, keyed by
+# the module's mtime and size the way the star-export cache is. Only the text
+# of an annotation the module actually wrote is stored; nothing is inferred
+# from a function body.
+_PYTHON_RETURN_ANNOTATION_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
+_PYTHON_RETURN_ANNOTATION_CACHE_LOCK = threading.RLock()
+
+# Marker separating expression-receiver evidence from name-receiver evidence
+# in the receiver-evidence map. ``\x00`` cannot occur in a Python identifier,
+# so the two key spaces cannot collide.
+_PY_EXPR_RECEIVER_KEY = "\x00expr:"
+
+_PY_TUPLE_ANNOTATION_NAMES = frozenset({"Tuple", "tuple"})
+_PY_TARGET_PATTERN_TYPES = frozenset({
+    # ``a, b = ...`` parses as a pattern; ``with f() as (a, b)`` spells the
+    # same target as an ordinary tuple.
+    "list", "list_pattern", "pattern_list", "tuple", "tuple_pattern",
+})
+_PY_SPLAT_PATTERN_TYPES = frozenset({"list_splat", "list_splat_pattern"})
+
+
+class _PyReceiverContext(NamedTuple):
+    """Everything one Python file says about the names it binds.
+
+    Read-only for the duration of a parse: the declaration scan fills it in
+    once, then the scope walk consults it. ``symbol_origins`` is the only
+    field that can lead outside the file, and it leads only to a module the
+    file's own ``from`` statement names — never to a guess.
+    """
+
+    file_path: str
+    class_names: frozenset[str]
+    imported_names: frozenset[str]
+    module_bindings: dict[str, set[str]]
+    symbol_origins: dict[str, str]
+    local_returns: dict[str, str]
+
 
 @lru_cache(maxsize=512)
 def _read_cargo_manifest(
@@ -5723,16 +5760,34 @@ class CodeParser:
         module_bindings: dict[str, set[str]] = {}
         imported_names: set[str] = set()
         class_names: set[str] = set()
+        symbol_origins: dict[str, str] = {}
+        local_returns: dict[str, str] = {}
+        ambiguous_returns: set[str] = set()
 
-        def scan_declarations(node, depth: int = 0) -> None:
+        def scan_declarations(node, in_class: bool, depth: int = 0) -> None:
             if depth > self._MAX_AST_DEPTH:
                 return
+            nested = in_class
             if node.type == "class_definition":
+                nested = True
                 name_node = node.child_by_field_name("name")
                 if name_node is not None:
                     class_names.add(
                         name_node.text.decode("utf-8", errors="replace"),
                     )
+            elif node.type == "function_definition" and not in_class:
+                # A module-local ``def`` with a return annotation types every
+                # name assigned from a call to it. Only the annotation is
+                # read; a function body is never inspected for a return type.
+                name_node = node.child_by_field_name("name")
+                type_node = node.child_by_field_name("return_type")
+                if name_node is not None and type_node is not None:
+                    name = name_node.text.decode("utf-8", errors="replace")
+                    annotation = type_node.text.decode("utf-8", errors="replace")
+                    if local_returns.get(name, annotation) != annotation:
+                        # Two same-named defs disagreeing is no evidence.
+                        ambiguous_returns.add(name)
+                    local_returns[name] = annotation
             elif node.type == "import_statement":
                 self._python_plain_import_bindings(
                     node, file_path, module_bindings, imported_names,
@@ -5740,11 +5795,23 @@ class CodeParser:
             elif node.type == "import_from_statement":
                 self._python_from_import_bindings(
                     node, file_path, module_bindings, imported_names,
+                    symbol_origins,
                 )
             for child in node.children:
-                scan_declarations(child, depth + 1)
+                scan_declarations(child, nested, depth + 1)
 
-        scan_declarations(root)
+        scan_declarations(root, False)
+        for name in ambiguous_returns:
+            local_returns.pop(name, None)
+
+        context = _PyReceiverContext(
+            file_path=file_path,
+            class_names=frozenset(class_names),
+            imported_names=frozenset(imported_names),
+            module_bindings=module_bindings,
+            symbol_origins=symbol_origins,
+            local_returns=local_returns,
+        )
 
         module_env: dict[str, tuple[str, str]] = {}
         # A name imported as a symbol is most often a class used as
@@ -5760,6 +5827,16 @@ class CodeParser:
             )
 
         evidence: dict[tuple[int, str], tuple[str, str]] = {}
+        expression_evidence: dict[tuple[int, str], list[tuple[str, str]]] = {}
+
+        def bind_targets(left, value, type_node, env) -> None:
+            """Record what one binding form says about each name it binds."""
+            for name, path in self._python_binding_targets(left):
+                bound = self._python_binding_evidence(
+                    value, type_node, path, context,
+                )
+                if bound is not None:
+                    env[name] = bound
 
         def walk(
             node,
@@ -5771,9 +5848,7 @@ class CodeParser:
                 return
             node_type = node.type
             if node_type == "class_definition":
-                fields = self._collect_python_class_fields(
-                    node, class_names, imported_names,
-                )
+                fields = self._collect_python_class_fields(node, context)
                 class_env = dict(env)
                 class_env.update(fields)
                 for child in node.children:
@@ -5793,15 +5868,32 @@ class CodeParser:
                 # The right-hand side is evaluated before the name is rebound.
                 for child in node.children:
                     walk(child, env, class_fields, depth + 1)
-                name = self._python_binding_target_name(
+                bind_targets(
                     node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                    node.child_by_field_name("type"),
+                    env,
                 )
-                if name:
-                    bound = self._python_assignment_evidence(
-                        node, class_names, imported_names,
+                return
+            if node_type == "as_pattern":
+                # ``with GraphStore(p) as store`` and
+                # ``with _get_store() as (store, root)`` bind exactly the way
+                # an assignment does; the grammar just spells them
+                # differently. The value is the ``as_pattern``'s first child
+                # and the alias its ``alias`` field.
+                for child in node.children:
+                    walk(child, env, class_fields, depth + 1)
+                alias = node.child_by_field_name("alias")
+                value = node.children[0] if node.children else None
+                if alias is not None and value is not None and value is not alias:
+                    bind_targets(
+                        alias.children[0]
+                        if alias.type == "as_pattern_target" and alias.children
+                        else alias,
+                        value,
+                        None,
+                        env,
                     )
-                    if bound is not None:
-                        env[name] = bound
                 return
             if node_type == "call":
                 receiver, method = self._get_member_call_receiver_method(
@@ -5811,17 +5903,35 @@ class CodeParser:
                     evidence[(node.start_point[0] + 1, receiver)] = env.get(
                         receiver, ("unknown", ""),
                     )
+                elif method:
+                    # ``CodeParser().parse_file(...)``: the receiver is an
+                    # expression, so it has no name to look up — but a
+                    # constructor expression says its own type outright.
+                    constructed = self._python_expression_receiver_evidence(
+                        node, context,
+                    )
+                    if constructed is not None:
+                        key = (
+                            node.start_point[0] + 1,
+                            _PY_EXPR_RECEIVER_KEY + method,
+                        )
+                        expression_evidence.setdefault(key, []).append(
+                            constructed,
+                        )
             for child in node.children:
                 walk(child, env, class_fields, depth + 1)
 
         walk(root, module_env, {})
+        for key, found in expression_evidence.items():
+            # Two expression receivers on one line sharing a method name are
+            # indistinguishable downstream, so they must agree to count.
+            evidence[key] = self._merge_python_evidence(found)
         return evidence
 
     def _collect_python_class_fields(
         self,
         class_node,
-        class_names: set[str],
-        imported_names: set[str],
+        context: _PyReceiverContext,
     ) -> dict[str, tuple[str, str]]:
         """Instance attributes a class declares, however it declares them.
 
@@ -5831,6 +5941,18 @@ class CodeParser:
         """
         gathered: dict[str, list[tuple[str, str]]] = {}
 
+        def record(left, value, type_node, nested: bool) -> None:
+            for name, path in self._python_binding_targets(left):
+                # Inside a method only ``self.x``/``cls.x`` is a field; a bare
+                # name there is a local and says nothing about the class.
+                if nested and not self._python_target_is_attribute(left, name):
+                    continue
+                bound = self._python_binding_evidence(
+                    value, type_node, path, context,
+                )
+                if bound is not None:
+                    gathered.setdefault(name, []).append(bound)
+
         def visit(node, in_function: bool, depth: int = 0) -> None:
             if depth > self._MAX_AST_DEPTH:
                 return
@@ -5839,19 +5961,27 @@ class CodeParser:
             nested = in_function or (
                 node is not class_node and node.type == "function_definition"
             )
+            if node.type == "as_pattern":
+                alias = node.child_by_field_name("alias")
+                value = node.children[0] if node.children else None
+                if alias is not None and value is not None and value is not alias:
+                    record(
+                        alias.children[0]
+                        if alias.type == "as_pattern_target" and alias.children
+                        else alias,
+                        value,
+                        None,
+                        nested,
+                    )
             if node.type == "assignment":
                 left = node.child_by_field_name("left")
-                # Inside a method only ``self.x``/``cls.x`` is a field; a bare
-                # name there is a local and says nothing about the class.
-                if left is not None and (
-                    left.type == "attribute" or not nested
-                ):
-                    name = self._python_binding_target_name(left)
-                    bound = self._python_assignment_evidence(
-                        node, class_names, imported_names,
+                if left is not None:
+                    record(
+                        left,
+                        node.child_by_field_name("right"),
+                        node.child_by_field_name("type"),
+                        nested,
                     )
-                    if name and bound is not None:
-                        gathered.setdefault(name, []).append(bound)
             for child in node.children:
                 visit(child, nested, depth + 1)
 
@@ -5869,51 +5999,428 @@ class CodeParser:
 
         ``unknown`` is the ABSENCE of evidence, not evidence against: a field
         a helper returns in one branch and constructs in another is still that
-        class. Two different classes, or a class and a container literal, do
-        contradict, and contradiction means no attribution.
+        class. Two different classes, a class and a module, or a class and a
+        container literal, do contradict, and contradiction means no
+        attribution.
         """
         classes = {detail for kind, detail in found if kind == "class"}
+        modules = {detail for kind, detail in found if kind == "module"}
         builtin = any(kind == "builtin" for kind, _ in found)
-        if len(classes) == 1 and not builtin:
+        kinds = (len(classes) > 0) + (len(modules) > 0) + builtin
+        if kinds != 1:
+            return "unknown", ""
+        if len(classes) == 1:
             return "class", next(iter(classes))
-        if builtin and not classes:
+        if len(modules) == 1:
+            return "module", next(iter(modules))
+        if builtin:
             return "builtin", ""
         return "unknown", ""
 
-    def _python_assignment_evidence(
+    @classmethod
+    def _python_binding_targets(
+        cls, left,
+    ) -> list[tuple[str, tuple[int, ...]]]:
+        """Names one binding form binds, each with its position in the value.
+
+        ``store = ...`` binds ``store`` to the whole value, spelled as the
+        empty path. ``store, root = ...`` binds ``store`` to position 0 and
+        ``root`` to position 1, and ``a, (b, c) = ...`` nests the same way.
+
+        A starred element costs its own position and every position after it —
+        the length of the value is not visible here, so nothing after a star
+        can be numbered — but the names BEFORE it keep their positions rather
+        than the whole statement being thrown away.
+        """
+        found: list[tuple[str, tuple[int, ...]]] = []
+
+        def visit(node, path: tuple[int, ...], depth: int = 0) -> None:
+            if node is None or depth > 8:
+                return
+            if node.type == "parenthesized_expression":
+                inner = node.named_children
+                if len(inner) == 1:
+                    visit(inner[0], path, depth + 1)
+                return
+            if node.type in _PY_TARGET_PATTERN_TYPES:
+                for index, child in enumerate(node.named_children):
+                    if child.type in _PY_SPLAT_PATTERN_TYPES:
+                        return
+                    visit(child, path + (index,), depth + 1)
+                return
+            name = cls._python_binding_target_name(node)
+            if name:
+                found.append((name, path))
+
+        visit(left, ())
+        return found
+
+    @staticmethod
+    def _python_target_is_attribute(left, name: str) -> bool:
+        """Is *name* bound through ``self.x``/``cls.x`` rather than bare?"""
+        if left is None:
+            return False
+        if left.type == "attribute":
+            return True
+        for node in left.named_children:
+            if node.type == "attribute":
+                attribute = node.child_by_field_name("attribute")
+                if (
+                    attribute is not None
+                    and attribute.text.decode("utf-8", errors="replace") == name
+                ):
+                    return True
+        return False
+
+    def _python_binding_evidence(
         self,
-        node,
-        class_names: set[str],
-        imported_names: set[str],
+        value,
+        type_node,
+        path: tuple[int, ...],
+        context: _PyReceiverContext,
     ) -> Optional[tuple[str, str]]:
-        """What one assignment says its target holds, or None for "nothing"."""
-        type_node = node.child_by_field_name("type")
+        """What one binding says its target holds, or None for "nothing"."""
         if type_node is not None:
-            type_name = self._base_type_name(
-                type_node.text.decode("utf-8", errors="replace"),
+            annotation = self._python_annotation_at_path(
+                type_node.text.decode("utf-8", errors="replace"), path,
             )
+            if annotation is None:
+                return None
+            type_name = self._base_type_name(annotation)
             # An annotation the type reader rejects names a builtin or a
             # container: still evidence, just not a class.
             return ("class", type_name) if type_name else ("builtin", "")
-        right = node.child_by_field_name("right")
-        if right is None:
+        if value is None:
             return None
-        if right.type == "none":
+        if value.type == "none":
             # ``x = None`` says nothing about what ``x`` later holds, so it
             # must neither create nor destroy evidence.
             return None
-        if right.type in _PY_LITERAL_VALUE_TYPES:
+        if value.type in ("tuple", "list") and path:
+            # ``store, root = GraphStore(p), root`` — the value spells out its
+            # own elements, so take the one this name is bound to.
+            elements = value.named_children
+            if path[0] >= len(elements):
+                return "unknown", ""
+            return self._python_binding_evidence(
+                elements[path[0]], None, path[1:], context,
+            )
+        if value.type in _PY_LITERAL_VALUE_TYPES:
             return "builtin", ""
-        if right.type == "call":
-            callee = right.child_by_field_name("function")
-            if callee is not None and callee.type == "identifier":
-                name = callee.text.decode("utf-8", errors="replace")
-                # A constructor call only counts when the callee is a class
-                # this file defines or a name it imports — otherwise any local
-                # factory function would manufacture class evidence.
-                if name in class_names or name in imported_names:
-                    return "class", name
+        if value.type == "call":
+            return self._python_call_evidence(value, path, context)
         return "unknown", ""
+
+    def _python_call_evidence(
+        self,
+        call,
+        path: tuple[int, ...],
+        context: _PyReceiverContext,
+    ) -> tuple[str, str]:
+        """What a call expression says the value it returns is.
+
+        An annotated return type wins over the constructor rule, because it
+        is what the source actually claims; the constructor rule is the
+        fallback for a class that, being a class, has no return annotation.
+        """
+        callee = call.child_by_field_name("function")
+        if callee is None:
+            return "unknown", ""
+        annotation = self._python_callee_return_annotation(callee, context)
+        if annotation is not None:
+            element = self._python_annotation_at_path(annotation, path)
+            if element is not None:
+                type_name = self._base_type_name(element)
+                return ("class", type_name) if type_name else ("builtin", "")
+            return "unknown", ""
+        if path:
+            # Nothing says how many values this call returns, so a position
+            # in it cannot be typed.
+            return "unknown", ""
+        constructed = self._python_constructor_class(callee, context)
+        return ("class", constructed) if constructed else ("unknown", "")
+
+    def _python_constructor_class(
+        self, callee, context: _PyReceiverContext,
+    ) -> Optional[str]:
+        """Class a constructor call names, bare or dotted, or None.
+
+        ``GraphStore(...)`` counts when the file defines or imports the name —
+        otherwise a local factory function would manufacture class evidence.
+        ``graph.GraphStore(...)`` and ``code_review_graph.graph.GraphStore(...)``
+        count on the same terms, resolved through the file's import map: the
+        root of the dotted chain has to be a name an import bound, and the
+        last segment has to be spelled like a class. Without the spelling
+        rule ``os.path.join(...)`` would claim a class named ``join`` and
+        contradict the real evidence for that name elsewhere in the scope.
+        """
+        callee = self._python_unwrap_callee(callee)
+        if callee is None:
+            return None
+        if callee.type == "identifier":
+            name = callee.text.decode("utf-8", errors="replace")
+            if name in context.class_names or name in context.imported_names:
+                return name
+            return None
+        if callee.type != "attribute":
+            return None
+        attribute = callee.child_by_field_name("attribute")
+        if attribute is None:
+            return None
+        name = attribute.text.decode("utf-8", errors="replace")
+        root = self._python_dotted_root(callee.child_by_field_name("object"))
+        if root is None:
+            return None
+        if root not in context.module_bindings and root not in context.imported_names:
+            return None
+        if name in context.class_names:
+            return name
+        return name if name[:1].isupper() else None
+
+    @staticmethod
+    def _python_unwrap_callee(node):
+        """Strip the wrappers the grammar puts around a callee name.
+
+        ``*CodeParser().parse_file(p)`` parses with the splat INSIDE the
+        constructor call — ``call(list_splat(identifier))`` — so the callee of
+        the inner call is a ``list_splat``, not the class name it plainly is.
+        """
+        for _ in range(4):
+            if node is None:
+                return None
+            if node.type in _PY_SPLAT_PATTERN_TYPES:
+                named = node.named_children
+                node = named[0] if len(named) == 1 else None
+                continue
+            if node.type == "parenthesized_expression":
+                named = node.named_children
+                node = named[0] if len(named) == 1 else None
+                continue
+            return node
+        return None
+
+    @staticmethod
+    def _python_dotted_root(node) -> Optional[str]:
+        """Leftmost identifier of a pure ``a.b.c`` chain, or None."""
+        for _ in range(8):
+            if node is None:
+                return None
+            if node.type == "identifier":
+                return node.text.decode("utf-8", errors="replace")
+            if node.type != "attribute":
+                return None
+            node = node.child_by_field_name("object")
+        return None
+
+    def _python_callee_return_annotation(
+        self, callee, context: _PyReceiverContext,
+    ) -> Optional[str]:
+        """Return annotation the source writes for this call's callee.
+
+        Three places, in the order a reader would look: a ``def`` in this very
+        file, the module a ``from X import f`` statement names, and the module
+        an ``import m`` binding names for ``m.f(...)``. Only the annotation
+        text is ever read — no return statement is inspected, in this file or
+        any other, so nothing here is inferred.
+        """
+        if callee.type == "identifier":
+            name = callee.text.decode("utf-8", errors="replace")
+            local = context.local_returns.get(name)
+            if local is not None:
+                return local
+            origin = context.symbol_origins.get(name)
+            if origin:
+                return self._python_module_return_annotations(origin).get(name)
+            return None
+        if callee.type != "attribute":
+            return None
+        attribute = callee.child_by_field_name("attribute")
+        obj = callee.child_by_field_name("object")
+        if attribute is None or obj is None or obj.type != "identifier":
+            return None
+        module_files = context.module_bindings.get(
+            obj.text.decode("utf-8", errors="replace"), set(),
+        )
+        if len(module_files) != 1:
+            return None
+        return self._python_module_return_annotations(
+            next(iter(module_files)),
+        ).get(attribute.text.decode("utf-8", errors="replace"))
+
+    def _python_expression_receiver_evidence(
+        self, call, context: _PyReceiverContext,
+    ) -> Optional[tuple[str, str]]:
+        """What a nameless Python call receiver is, or None for "nothing".
+
+        Two shapes carry their own answer. ``CodeParser().parse_file(...)``
+        calls a method on a constructor expression, so the class is written
+        right there. ``pkg.graph.GraphStore(...)`` is not a member call at all
+        — it is a dotted module path, and the name it calls is a top-level
+        name of the module that path resolves to.
+        """
+        callee = call.child_by_field_name("function")
+        if callee is None or callee.type != "attribute":
+            return None
+        obj = callee.child_by_field_name("object")
+        if obj is None:
+            return None
+        if obj.type == "call":
+            inner = obj.child_by_field_name("function")
+            if inner is None:
+                return None
+            constructed = self._python_constructor_class(inner, context)
+            return ("class", constructed) if constructed else None
+        module_file = self._python_dotted_module_file(obj, context)
+        return ("module", module_file) if module_file else None
+
+    def _python_dotted_module_file(
+        self, prefix, context: _PyReceiverContext,
+    ) -> Optional[str]:
+        """File the dotted module path *prefix* names, through this file's imports.
+
+        The root of the chain has to be a name one of this file's own
+        ``import`` statements bound to a module; otherwise the chain is an
+        attribute walk over some object and names no module at all.
+        """
+        if prefix is None or prefix.type != "attribute":
+            return None
+        root = self._python_dotted_root(prefix)
+        if root is None or root not in context.module_bindings:
+            return None
+        return self._resolve_module_to_file(
+            prefix.text.decode("utf-8", errors="replace"),
+            context.file_path,
+            "python",
+        )
+
+    @classmethod
+    def _python_annotation_at_path(
+        cls, annotation: str, path: tuple[int, ...],
+    ) -> Optional[str]:
+        """Element of *annotation* at a tuple position, or None if unnamed."""
+        current = annotation.strip()
+        if len(current) >= 2 and current[0] in "\"'" and current[-1] == current[0]:
+            current = current[1:-1].strip()
+        for index in path:
+            elements = cls._python_tuple_annotation_elements(current)
+            if elements is None:
+                return None
+            if len(elements) == 2 and elements[1] == "...":
+                # ``tuple[Node, ...]`` is homogeneous: every position is the
+                # same type.
+                current = elements[0]
+                continue
+            if index >= len(elements):
+                return None
+            current = elements[index]
+        return current
+
+    @staticmethod
+    def _python_tuple_annotation_elements(
+        annotation: str,
+    ) -> Optional[list[str]]:
+        """Split ``tuple[A, B]`` into its element annotations, or None."""
+        opening = annotation.find("[")
+        if opening < 0 or not annotation.rstrip().endswith("]"):
+            return None
+        head = annotation[:opening].strip().rsplit(".", 1)[-1]
+        if head not in _PY_TUPLE_ANNOTATION_NAMES:
+            return None
+        inner = annotation.rstrip()[opening + 1:-1]
+        elements: list[str] = []
+        depth = 0
+        start = 0
+        quote = ""
+        for position, character in enumerate(inner):
+            if quote:
+                if character == quote:
+                    quote = ""
+                continue
+            if character in "\"'":
+                quote = character
+            elif character in "[({":
+                depth += 1
+            elif character in "])}":
+                depth -= 1
+            elif character == "," and depth == 0:
+                elements.append(inner[start:position].strip())
+                start = position + 1
+        elements.append(inner[start:].strip())
+        return [element for element in elements if element]
+
+    def _python_module_return_annotations(
+        self, module_file: str,
+    ) -> dict[str, str]:
+        """Return annotations of every top-level ``def`` in *module_file*.
+
+        Cached on the module's identity and mtime the way star exports are,
+        so a repository-wide build reads each imported module at most once.
+        """
+        if not module_file.endswith(".py"):
+            return {}
+        try:
+            module_path = Path(module_file).resolve()
+            file_stat = module_path.stat()
+        except (OSError, ValueError):
+            return {}
+        resolved = normalize_file_path(module_path)
+        if self._excluded_files and resolved in self._excluded_files:
+            return {}
+        cache_key = (resolved, file_stat.st_mtime_ns, file_stat.st_size)
+        with _PYTHON_RETURN_ANNOTATION_CACHE_LOCK:
+            cached = _PYTHON_RETURN_ANNOTATION_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            annotations = self._read_python_return_annotations(module_path)
+            for stale in [
+                key for key in _PYTHON_RETURN_ANNOTATION_CACHE
+                if key[0] == resolved and key != cache_key
+            ]:
+                _PYTHON_RETURN_ANNOTATION_CACHE.pop(stale, None)
+            if len(_PYTHON_RETURN_ANNOTATION_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                for oldest in list(_PYTHON_RETURN_ANNOTATION_CACHE)[
+                    : _PYTHON_STAR_CACHE_MAX // 2
+                ]:
+                    _PYTHON_RETURN_ANNOTATION_CACHE.pop(oldest, None)
+            _PYTHON_RETURN_ANNOTATION_CACHE[cache_key] = annotations
+            return annotations
+
+    def _read_python_return_annotations(
+        self, module_path: Path,
+    ) -> dict[str, str]:
+        """Parse one module for the return annotations of its top-level defs."""
+        try:
+            source = module_path.read_bytes()
+        except (OSError, PermissionError):
+            return {}
+        parser = self._get_parser("python")
+        if not parser:
+            return {}
+        try:
+            tree = parser.parse(source)  # type: ignore[union-attr]
+        except (RecursionError, ValueError) as exc:  # pragma: no cover
+            logger.debug("Return-annotation parse failed for %s: %s", module_path, exc)
+            return {}
+        annotations: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        for child in tree.root_node.children:
+            node = child
+            if node.type == "decorated_definition":
+                node = node.child_by_field_name("definition") or node
+            if node.type != "function_definition":
+                continue
+            name_node = node.child_by_field_name("name")
+            type_node = node.child_by_field_name("return_type")
+            if name_node is None or type_node is None:
+                continue
+            name = name_node.text.decode("utf-8", errors="replace")
+            annotation = type_node.text.decode("utf-8", errors="replace")
+            if annotations.get(name, annotation) != annotation:
+                ambiguous.add(name)
+            annotations[name] = annotation
+        for name in ambiguous:
+            annotations.pop(name, None)
+        return annotations
 
     def _python_plain_import_bindings(
         self,
@@ -5954,8 +6461,14 @@ class CodeParser:
         file_path: str,
         module_bindings: dict[str, set[str]],
         imported_names: set[str],
+        symbol_origins: Optional[dict[str, str]] = None,
     ) -> None:
-        """Record names bound by ``from X import a, b as c``."""
+        """Record names bound by ``from X import a, b as c``.
+
+        *symbol_origins*, when given, also records the module file each
+        non-module name came from, so a caller can read that module's own
+        annotation for the symbol.
+        """
         module_node = node.child_by_field_name("module_name")
         if module_node is None:
             return
@@ -5966,6 +6479,11 @@ class CodeParser:
             if package_dir is not None
             else set()
         )
+        module_file = (
+            self._resolve_module_to_file(module, file_path, "python")
+            if symbol_origins is not None
+            else None
+        )
 
         def bind(local: str, imported: str) -> None:
             if package_dir is not None and imported in submodules:
@@ -5974,6 +6492,12 @@ class CodeParser:
                     module_bindings.setdefault(local, set()).add(target)
                     return
             imported_names.add(local)
+            if symbol_origins is not None and module_file:
+                # A package re-export names the file that really defines the
+                # symbol; a plain module names itself.
+                symbol_origins[local] = self._python_reexport_origin(
+                    module_file, imported,
+                )
 
         seen_import_keyword = False
         for child in node.children:
@@ -6030,10 +6554,15 @@ class CodeParser:
             ):
                 annotated.append(edge)
                 continue
-            kind, detail = (
-                evidence.get((edge.line, receiver), ("unknown", ""))
-                if receiver
-                else ("unknown", "")
+            kind, detail = evidence.get(
+                (
+                    edge.line,
+                    receiver if receiver
+                    # An expression receiver has no name, so its evidence is
+                    # filed under the method it called on that line.
+                    else _PY_EXPR_RECEIVER_KEY + edge.target,
+                ),
+                ("unknown", ""),
             )
             extra = dict(edge.extra)
             extra["receiver_binding"] = kind

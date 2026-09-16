@@ -226,15 +226,21 @@ class _FileFacts:
     """Everything one source file says about its own names."""
 
     __slots__ = (
-        "calls", "classes", "class_members", "module_bindings",
-        "symbol_sources", "toplevel", "var_classes",
+        "calls", "classes", "class_members", "local_returns",
+        "module_bindings", "module_returns", "symbol_sources", "toplevel",
+        "var_classes",
     )
 
     def __init__(self) -> None:
         self.calls: dict[int, list[_CallSite]] = defaultdict(list)
         self.classes: set[str] = set()
         self.class_members: dict[str, set[str]] = defaultdict(set)
+        # Return annotations, split the way a reader can see them: any
+        # non-class ``def`` for this file's own calls, module-level ``def``s
+        # only for a call that reaches this file through an import.
+        self.local_returns: dict[str, ast.expr] = {}
         self.module_bindings: dict[str, set[str]] = defaultdict(set)
+        self.module_returns: dict[str, ast.expr] = {}
         self.symbol_sources: dict[str, set[str]] = defaultdict(set)
         self.toplevel: set[str] = set()
         self.var_classes: dict[str, set[str]] = defaultdict(set)
@@ -259,6 +265,13 @@ def _annotation_class(annotation: Optional[ast.expr]) -> Optional[str]:
         if isinstance(inner, ast.Tuple) and inner.elts:
             inner = inner.elts[0]
         return _annotation_class(inner)
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        # PEP 604: ``EmbeddingProvider | None`` is the modern spelling of
+        # ``Optional[EmbeddingProvider]``, which this reader already unwraps.
+        return (
+            _annotation_class(annotation.left)
+            or _annotation_class(annotation.right)
+        )
     return None
 
 
@@ -273,6 +286,100 @@ def _assigned_name(target: ast.expr) -> Optional[str]:
     ):
         return target.attr
     return None
+
+
+def _binding_positions(
+    target: ast.expr,
+) -> list[tuple[str, tuple[int, ...]]]:
+    """Names one target binds, each with its position inside the value.
+
+    ``x = ...`` is the empty path; ``a, b = ...`` numbers its elements;
+    ``a, (b, c) = ...`` nests. A starred element ends the numbering, because
+    nothing after it has a position anyone can name.
+    """
+    found: list[tuple[str, tuple[int, ...]]] = []
+
+    def visit(node: ast.expr, path: tuple[int, ...]) -> None:
+        if isinstance(node, (ast.Tuple, ast.List)):
+            for index, element in enumerate(node.elts):
+                if isinstance(element, ast.Starred):
+                    return
+                visit(element, path + (index,))
+            return
+        name = _assigned_name(node)
+        if name is not None:
+            found.append((name, path))
+
+    visit(target, ())
+    return found
+
+
+def _dotted_path(node: ast.expr) -> Optional[str]:
+    """``a.b.c`` as text, or None for anything that is not a pure name path."""
+    parts: list[str] = []
+    current: ast.expr = node
+    for _ in range(8):
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+            return ".".join(reversed(parts))
+        if not isinstance(current, ast.Attribute):
+            return None
+        parts.append(current.attr)
+        current = current.value
+    return None
+
+
+def _constructor_class(func: ast.expr) -> Optional[str]:
+    """Class a call expression constructs, bare or dotted, by the same rule.
+
+    ``GraphStore(...)`` and ``pkg.graph.GraphStore(...)`` both name the class
+    in their last segment. The capitalisation rule keeps ``os.path.join(...)``
+    from claiming a class called ``join``; it mirrors the parser's rule so
+    the two can disagree about facts, never about which shapes count.
+    """
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and _dotted_path(func.value):
+        return func.attr if func.attr[:1].isupper() else None
+    return None
+
+
+def _annotation_at_path(
+    annotation: Optional[ast.expr], path: tuple[int, ...],
+) -> Optional[ast.expr]:
+    """Walk a ``tuple[...]`` annotation down to one position."""
+    current = annotation
+    for index in path:
+        if isinstance(current, ast.Constant) and isinstance(current.value, str):
+            try:
+                current = ast.parse(current.value, mode="eval").body
+            except (SyntaxError, ValueError):
+                return None
+        if not isinstance(current, ast.Subscript):
+            return None
+        head = current.value
+        head_name = (
+            head.id if isinstance(head, ast.Name)
+            else head.attr if isinstance(head, ast.Attribute)
+            else None
+        )
+        if head_name not in ("Tuple", "tuple"):
+            return None
+        inner = current.slice
+        if not isinstance(inner, ast.Tuple) or not inner.elts:
+            return None
+        elements = inner.elts
+        if (
+            len(elements) == 2
+            and isinstance(elements[1], ast.Constant)
+            and elements[1].value is Ellipsis
+        ):
+            current = elements[0]
+            continue
+        if index >= len(elements):
+            return None
+        current = elements[index]
+    return current
 
 
 def _file_facts(
@@ -310,28 +417,6 @@ def _file_facts(
                     facts.module_bindings[local].add(_posix(submodule))
                 elif package is not None:
                     facts.symbol_sources[local].add(_posix(package))
-        elif isinstance(node, (ast.AnnAssign, ast.Assign)):
-            targets = (
-                [node.target] if isinstance(node, ast.AnnAssign) else node.targets
-            )
-            annotated = (
-                _annotation_class(node.annotation)
-                if isinstance(node, ast.AnnAssign)
-                else None
-            )
-            constructed = (
-                node.value.func.id
-                if isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                else None
-            )
-            for target in targets:
-                name = _assigned_name(target)
-                if name is None:
-                    continue
-                for class_name in (annotated, constructed):
-                    if class_name:
-                        facts.var_classes[name].add(class_name)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             arguments = node.args
             for argument in (
@@ -346,6 +431,52 @@ def _file_facts(
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             facts.toplevel.add(node.name)
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.returns is not None
+        ):
+            facts.module_returns[node.name] = node.returns
+
+    def collect_returns(node: ast.AST) -> None:
+        """Every ``def`` outside a class body, with its return annotation."""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                continue
+            if (
+                isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.returns is not None
+            ):
+                facts.local_returns[child.name] = child.returns
+            collect_returns(child)
+
+    collect_returns(tree)
+    # Imports and annotations are in hand now, so a binding can be read
+    # against the file's complete account of its own names.
+    cache[key] = facts
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AnnAssign, ast.Assign, ast.With, ast.AsyncWith)):
+            continue
+        bindings: list[tuple[ast.expr, Optional[ast.expr], Optional[ast.expr]]]
+        if isinstance(node, ast.AnnAssign):
+            bindings = [(node.target, node.value, node.annotation)]
+        elif isinstance(node, ast.Assign):
+            bindings = [(target, node.value, None) for target in node.targets]
+        else:
+            # ``with GraphStore(p) as store`` binds exactly like an
+            # assignment; only the grammar differs.
+            bindings = [
+                (item.optional_vars, item.context_expr, None)
+                for item in node.items
+                if item.optional_vars is not None
+            ]
+        for target, value, annotation in bindings:
+            for name, path in _binding_positions(target):
+                for class_name in (
+                    _annotation_class(_annotation_at_path(annotation, path)),
+                    _value_class(value, path, facts, boundary, cache),
+                ):
+                    if class_name:
+                        facts.var_classes[name].add(class_name)
 
     def visit(node: ast.AST, class_stack: list[str]) -> None:
         for child in ast.iter_child_nodes(node):
@@ -369,12 +500,76 @@ def _file_facts(
     return facts
 
 
+def _callee_return_annotation(
+    func: ast.expr,
+    facts: _FileFacts,
+    boundary: Path,
+    cache: dict[str, _FileFacts],
+) -> Optional[ast.expr]:
+    """Return annotation the source writes for the callee of one call.
+
+    A ``def`` in this file, the module a ``from X import f`` names, or the
+    module an ``import m`` binding names for ``m.f(...)``. Annotations only:
+    no function body is read here or anywhere else.
+    """
+    if isinstance(func, ast.Name):
+        local = facts.local_returns.get(func.id)
+        if local is not None:
+            return local
+        for origin in _expand_reexports(
+            facts.symbol_sources.get(func.id, set()), func.id, boundary, cache,
+        ):
+            other = _file_facts(Path(origin), boundary, cache)
+            if other is not None and func.id in other.module_returns:
+                return other.module_returns[func.id]
+        return None
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        modules = facts.module_bindings.get(func.value.id, set())
+        if len(modules) != 1:
+            return None
+        other = _file_facts(Path(next(iter(modules))), boundary, cache)
+        return None if other is None else other.module_returns.get(func.attr)
+    return None
+
+
+def _value_class(
+    value: Optional[ast.expr],
+    path: tuple[int, ...],
+    facts: _FileFacts,
+    boundary: Path,
+    cache: dict[str, _FileFacts],
+) -> Optional[str]:
+    """Class the source says a bound value is, at one position inside it."""
+    if value is None:
+        return None
+    if isinstance(value, (ast.Tuple, ast.List)) and path:
+        if path[0] >= len(value.elts):
+            return None
+        return _value_class(value.elts[path[0]], path[1:], facts, boundary, cache)
+    if not isinstance(value, ast.Call):
+        return None
+    annotation = _callee_return_annotation(value.func, facts, boundary, cache)
+    if annotation is not None:
+        return _annotation_class(_annotation_at_path(annotation, path))
+    if path:
+        return None
+    return _constructor_class(value.func)
+
+
 def _classify_call(call: ast.Call, class_stack: list[str]) -> _CallSite:
     func = call.func
     if isinstance(func, ast.Name):
         return _CallSite(func.id, "plain")
     if isinstance(func, ast.Attribute):
         receiver = func.value
+        if isinstance(receiver, ast.Call):
+            # ``CodeParser().parse_file(...)``: the receiver has no name, but
+            # the expression states its own class.
+            constructed = _constructor_class(receiver.func)
+            return _CallSite(
+                func.attr, "expr",
+                f"class:{constructed}" if constructed else "",
+            )
         if isinstance(receiver, ast.Name):
             if receiver.id in ("self", "cls"):
                 return _CallSite(
@@ -388,6 +583,12 @@ def _classify_call(call: ast.Call, class_stack: list[str]) -> _CallSite:
             and receiver.value.id in ("self", "cls")
         ):
             return _CallSite(func.attr, "name", receiver.attr)
+        if isinstance(receiver, ast.Attribute):
+            dotted = _dotted_path(receiver)
+            if dotted and dotted.split(".", 1)[0] not in ("self", "cls"):
+                # ``pkg.graph.GraphStore(...)`` is a dotted module path, not a
+                # member call; the name it calls is a top-level name there.
+                return _CallSite(func.attr, "expr", f"module:{dotted}")
         return _CallSite(func.attr, "expr")
     return _CallSite("", "expr")
 
@@ -465,6 +666,21 @@ def _attribution_is_justified(
             return True
         # ``Klass.method()``: the receiver names the class itself.
         return parent is not None and receiver == parent
+    if site.kind == "expr":
+        # A nameless receiver still says what it is in two shapes.
+        if site.detail.startswith("class:"):
+            return parent is not None and parent == site.detail[len("class:"):]
+        if site.detail.startswith("module:"):
+            dotted = site.detail[len("module:"):]
+            root = dotted.split(".", 1)[0]
+            if root not in facts.module_bindings:
+                return False
+            resolved = _module_file(boundary, dotted)
+            if resolved is None or _posix(resolved) != target_file:
+                return False
+            return parent is None and (
+                target_facts is None or leaf in target_facts.toplevel
+            )
     return False
 
 
