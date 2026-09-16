@@ -157,6 +157,7 @@ norecursedirs = ["tests/fixtures"]
 markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
+    "exports: slow conformance checks for every artefact the tool writes (visualize --format html/json/graphml/cypher/obsidian/svg, and wiki)",
 ]
 
 [dependency-groups]
