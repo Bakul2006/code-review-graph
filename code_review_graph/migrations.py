@@ -66,6 +66,24 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return row[0] > 0
 
 
+# The current shape of the FTS5 index over ``nodes``. Shared with
+# ``search.rebuild_fts_index`` so the DDL cannot drift between the migration
+# that creates the table and the rebuild that recreates it. Column order is
+# load-bearing: ``search._fts_search`` maps per-column BM25 weights by name
+# using ``PRAGMA table_info``, and an external-content table can only name
+# columns that exist on ``nodes``.
+NODES_FTS_DDL = """
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+    name, qualified_name, file_path, signature, docstring, name_tokens,
+    content='nodes', content_rowid='rowid',
+    tokenize='porter unicode61'
+)
+"""
+
+# Rows updated per executemany() batch in the v11 backfill.
+_BACKFILL_BATCH = 5_000
+
+
 # ---------------------------------------------------------------------------
 # Migration functions
 # ---------------------------------------------------------------------------
@@ -262,6 +280,60 @@ def _migrate_v10(conn: sqlite3.Connection) -> None:
     logger.info("Migration v10: added indexed nodes.symbol column")
 
 
+def _migrate_v11(conn: sqlite3.Connection) -> None:
+    """v11: index node docstrings and identifier word splits in FTS5.
+
+    ``nodes.extra['docstring']`` was already extracted by the parser and fed
+    to the embedding text builder, but the FTS5 index could not see it: an
+    external-content table can only index real columns of its content table.
+    Two columns are added and backfilled, then ``nodes_fts`` is recreated
+    with both so existing graphs gain the prose without a full reparse.
+
+    ``name_tokens`` carries the camelCase/PascalCase splits that the
+    ``unicode61`` tokenizer cannot produce (``hashPassword`` is one token to
+    it, so ``password`` never matched).
+    """
+    # Imported here, not at module scope: graph imports migrations, so the
+    # reverse edge can only be taken at call time. run_migrations is invoked
+    # from GraphStore.__init__, by which point graph is fully imported.
+    from .graph import node_index_tokens
+
+    if not _has_column(conn, "nodes", "docstring"):
+        conn.execute("ALTER TABLE nodes ADD COLUMN docstring TEXT")
+    if not _has_column(conn, "nodes", "name_tokens"):
+        conn.execute("ALTER TABLE nodes ADD COLUMN name_tokens TEXT")
+
+    # The docstring backfill is pure SQL; json_extract returns NULL for rows
+    # whose extra holds no docstring, which is exactly the wanted value.
+    conn.execute(
+        "UPDATE nodes SET docstring = "
+        "substr(trim(json_extract(extra, '$.docstring')), 1, 400) "
+        "WHERE docstring IS NULL AND extra IS NOT NULL AND json_valid(extra) "
+        "AND json_type(extra, '$.docstring') = 'text'"
+    )
+
+    # The camelCase split has no SQL equivalent, so it runs in Python once.
+    pending: list[tuple[str, int]] = []
+    cursor = conn.execute(
+        "SELECT id, kind, name, parent_name, file_path FROM nodes"
+    )
+    for row in cursor.fetchall():
+        node_id, kind, name, parent, path = (row[0], row[1], row[2], row[3], row[4])
+        pending.append((node_index_tokens(kind, name, parent, path), node_id))
+        if len(pending) >= _BACKFILL_BATCH:
+            conn.executemany(
+                "UPDATE nodes SET name_tokens = ? WHERE id = ?", pending
+            )
+            pending.clear()
+    if pending:
+        conn.executemany("UPDATE nodes SET name_tokens = ? WHERE id = ?", pending)
+
+    conn.execute("DROP TABLE IF EXISTS nodes_fts")
+    conn.execute(NODES_FTS_DDL)
+    conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+    logger.info("Migration v11: indexed nodes.docstring and nodes.name_tokens")
+
+
 # ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
@@ -276,6 +348,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_v8,
     9: _migrate_v9,
     10: _migrate_v10,
+    11: _migrate_v11,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())

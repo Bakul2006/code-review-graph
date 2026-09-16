@@ -12,10 +12,39 @@ import re
 import sqlite3
 from typing import Any, Optional
 
-from .graph import GraphStore, _sanitize_name
+from .graph import GraphStore, _sanitize_name, identifier_words
+from .migrations import NODES_FTS_DDL
 from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
+
+# Per-column BM25 weights for the FTS5 index, looked up by column name so the
+# weight vector follows the table's real shape (see NODES_FTS_DDL). A name hit
+# is the strongest evidence; a docstring hit is the weakest, which is what
+# keeps a symbol ahead of the prose that merely mentions it.
+_FTS_COLUMN_WEIGHTS: dict[str, float] = {
+    "name": 10.0,
+    "qualified_name": 6.0,
+    "file_path": 1.0,
+    "signature": 2.0,
+    "docstring": 1.5,
+    "name_tokens": 4.0,
+}
+_FTS_DEFAULT_WEIGHT = 1.0
+
+# Score multipliers for a query that is exactly one identifier. The first
+# applies when the node's own name is that identifier, the second when the
+# identifier is the tail of its qualified name (a method named by its class).
+_EXACT_NAME_BOOST = 4.0
+_EXACT_SYMBOL_BOOST = 3.0
+
+# A symbol named after the query is almost always the wanted one. BM25 cannot
+# say so here: every row carries its whole file path in two columns, so path
+# tokens dominate the length normalization and a long test name that repeats
+# the query words outscores the short function the query describes. These
+# multiply a hit by how much of the query its own symbol name accounts for.
+_NAME_COVERAGE_BOOST = 1.0
+_NAME_EXACT_COVERAGE_BOOST = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -44,15 +73,10 @@ def rebuild_fts_index(store: GraphStore) -> int:
         conn.rollback()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # Drop and recreate the FTS table with content sync to match migration v5
+        # Drop and recreate the FTS table with content sync. The DDL lives in
+        # migrations so this cannot drift from the shape migration v11 creates.
         conn.execute("DROP TABLE IF EXISTS nodes_fts")
-        conn.execute("""
-            CREATE VIRTUAL TABLE nodes_fts USING fts5(
-                name, qualified_name, file_path, signature,
-                content='nodes', content_rowid='rowid',
-                tokenize='porter unicode61'
-            )
-        """)
+        conn.execute(NODES_FTS_DDL)
 
         # Rebuild from the content table (nodes) using the FTS5 rebuild command
         conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
@@ -73,6 +97,9 @@ def rebuild_fts_index(store: GraphStore) -> int:
 # ---------------------------------------------------------------------------
 
 
+# A query that is one identifier and nothing else: the user is naming a
+# symbol, not describing behaviour.
+_EXACT_IDENT_QUERY_RE = re.compile(r'^[A-Za-z_][\w.]*$')
 _DOTTED_IDENT_RE = re.compile(r'\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+\b')
 _SNAKE_IDENT_RE = re.compile(r'\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b')
 _PASCAL_IDENT_RE = re.compile(r'\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b')
@@ -109,11 +136,15 @@ def detect_query_kind_boost(query: str) -> dict[str, Any]:
     - Identifier-shaped tokens *anywhere* in the query (dotted, snake_case,
       CamelCase) boost results whose qualified_name contains them by 2.0x.
       See ``extract_query_identifiers``.
+    - A query that is *only* an identifier names one symbol, so the node
+      whose name is exactly that identifier is boosted hardest. This is what
+      keeps ``_sanitize_name`` first now that prefix matching widens the
+      candidate set and docstrings that merely mention a symbol are indexed.
 
     Returns:
         Dict whose keys are either node kind strings (mapped to float
         multipliers) or one of the special keys ``_qualified``,
-        ``_qualified_identifiers``.
+        ``_qualified_identifiers``, ``_exact_name``.
     """
     boosts: dict[str, Any] = {}
 
@@ -139,6 +170,11 @@ def detect_query_kind_boost(query: str) -> dict[str, Any]:
     idents = extract_query_identifiers(q)
     if idents:
         boosts["_qualified_identifiers"] = idents
+
+    # The whole query is one identifier: an exact symbol match outranks
+    # everything that merely contains or documents it.
+    if _EXACT_IDENT_QUERY_RE.match(q):
+        boosts["_exact_name"] = q.lower()
 
     return boosts
 
@@ -179,6 +215,123 @@ def rrf_merge(*result_lists: list[tuple[int, float]], k: int = 60) -> list[tuple
 # ---------------------------------------------------------------------------
 
 
+_EXPLICIT_PHRASE_RE = re.compile(r'"([^"]*)"')
+_HAS_ALNUM_RE = re.compile(r"[0-9A-Za-z]")
+# A prefix term is only useful once it carries some signal. "a*" matches
+# nearly every document in the index, so short tokens stay exact.
+_MIN_PREFIX_ALNUM = 3
+
+
+def _quote_term(text: str) -> str:
+    """Return *text* as a single FTS5 string, with inner quotes doubled.
+
+    Quoting is what keeps the term a term: it neutralizes the operators
+    (``AND``/``OR``/``NOT``/``NEAR``), the column filter ``col:``, the
+    initial-token ``^``, parentheses and ``*`` that a user may legitimately
+    have typed as part of what they are looking for.
+    """
+    return '"' + text.replace('"', '""') + '"'
+
+
+def _alnum_count(text: str) -> int:
+    return sum(1 for ch in text if ch.isalnum())
+
+
+def build_fts_queries(query: str) -> list[str]:
+    """Build the FTS5 MATCH expressions to try for *query*, in order.
+
+    The previous implementation wrapped the entire query in one pair of
+    double quotes, which made every search an exact-adjacency phrase match:
+    ``password hashing`` found nothing unless some node carried those two
+    tokens side by side. Instead the query is split into tokens, each token
+    is quoted (and given a prefix ``*`` when long enough), and the tokens are
+    combined:
+
+    * the first expression ``AND``s the tokens, which is the precise reading
+      of a multi-word query;
+    * the second ``OR``s them, and is only reached when the ``AND`` finds
+      nothing, so recall is widened without ever costing precision.
+
+    A phrase the user typed in double quotes is kept as a phrase, takes no
+    prefix, and suppresses the ``OR`` widening: the quotes are a request for
+    exactness and are honoured.
+
+    Degenerate inputs collapse to an empty list, which the caller treats as
+    "FTS has nothing to say" and falls through to the LIKE keyword path:
+    an empty query, whitespace, and text with no alphanumeric character at
+    all (``...``).
+
+    Returns:
+        Zero, one or two FTS5 MATCH expressions.
+    """
+    if not query or not query.strip():
+        return []
+
+    phrases: list[str] = []
+    loose: list[str] = []
+    cursor = 0
+    for match in _EXPLICIT_PHRASE_RE.finditer(query):
+        loose.extend(query[cursor:match.start()].split())
+        phrases.append(match.group(1))
+        cursor = match.end()
+    loose.extend(query[cursor:].split())
+
+    terms: list[str] = []
+    for phrase in phrases:
+        if _HAS_ALNUM_RE.search(phrase):
+            terms.append(_quote_term(phrase))
+    for token in loose:
+        if not _HAS_ALNUM_RE.search(token):
+            continue
+        prefix = "*" if _alnum_count(token) >= _MIN_PREFIX_ALNUM else ""
+        terms.append(_quote_term(token) + prefix)
+
+    if not terms:
+        return []
+    if len(terms) == 1:
+        return [terms[0]]
+
+    conjunction = " AND ".join(terms)
+    if phrases:
+        return [conjunction]
+    return [conjunction, " OR ".join(terms)]
+
+
+def _covered_word_count(query_words: set[str], symbol_words: set[str]) -> int:
+    """Count query words this symbol's own name accounts for.
+
+    A query word counts when a symbol word equals it or starts with it, which
+    is the same rule the prefix terms in :func:`build_fts_queries` apply, so
+    ``parse`` is accounted for by ``CodeParser``. Words shorter than the
+    prefix threshold must match exactly, for the same reason a one or two
+    character prefix term is not issued.
+    """
+    covered = 0
+    for word in query_words:
+        if word in symbol_words:
+            covered += 1
+        elif len(word) >= _MIN_PREFIX_ALNUM and any(
+            other.startswith(word) for other in symbol_words
+        ):
+            covered += 1
+    return covered
+
+
+def _fts_column_weights(conn: sqlite3.Connection) -> str:
+    """Return the BM25 weight arguments matching the live nodes_fts shape.
+
+    Read from the table itself rather than hard-coded so an index created by
+    an older schema version (no ``docstring``/``name_tokens`` columns) still
+    gets a well-formed ``bm25()`` call instead of a wrong-arity error.
+    """
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)")]
+    weights = [
+        _FTS_COLUMN_WEIGHTS.get(str(column), _FTS_DEFAULT_WEIGHT)
+        for column in columns
+    ]
+    return ", ".join(f"{weight:.1f}" for weight in weights)
+
+
 def _fts_search(
     conn: sqlite3.Connection,
     query: str,
@@ -186,23 +339,40 @@ def _fts_search(
 ) -> list[tuple[int, float]]:
     """Run an FTS5 BM25 search against the nodes_fts table.
 
+    Tries each expression from :func:`build_fts_queries` in turn and returns
+    the first non-empty result, so the precise reading of a query wins and
+    the widened one is only a fallback.
+
     Returns list of ``(node_id, bm25_score)`` tuples. The BM25 score is
     negated so higher = better (FTS5 returns negative BM25).
     """
-    # Sanitize: wrap in double quotes to prevent FTS5 operator injection
-    safe_query = '"' + query.replace('"', '""') + '"'
+    expressions = build_fts_queries(query)
+    if not expressions:
+        return []
 
     try:
-        rows = conn.execute(
-            "SELECT rowid, rank FROM nodes_fts WHERE nodes_fts MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (safe_query, limit),
-        ).fetchall()
-        # FTS5 rank is negative BM25 (lower = better), negate for consistency
-        return [(row[0], -row[1]) for row in rows]
-    except sqlite3.OperationalError as e:
-        logger.warning("FTS5 search failed: %s", e)
+        weights = _fts_column_weights(conn)
+    except sqlite3.OperationalError as exc:
+        logger.warning("FTS5 index unavailable: %s", exc)
         return []
+
+    # The weights are floats formatted from a module constant, never from the
+    # query, so there is no user-controlled text in this statement. The MATCH
+    # expression itself stays a bound parameter.
+    sql = (  # nosec B608
+        f"SELECT rowid, bm25(nodes_fts, {weights}) AS score FROM nodes_fts "
+        "WHERE nodes_fts MATCH ? ORDER BY score LIMIT ?"
+    )
+    for expression in expressions:
+        try:
+            rows = conn.execute(sql, (expression, limit)).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("FTS5 search failed for %r: %s", expression, e)
+            return []
+        if rows:
+            # bm25() is negative (lower = better); negate for consistency.
+            return [(row[0], -row[1]) for row in rows]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +566,8 @@ def hybrid_search(
         {normalize_file_path(p) for p in context_files} if context_files else set()
     )
 
+    query_words = identifier_words(query)
+
     # Batch-fetch all candidate nodes in one query
     candidate_ids = [node_id for node_id, _ in merged]
     node_rows: dict[int, Any] = {}
@@ -432,6 +604,21 @@ def hybrid_search(
             qn_lo = qualified_name.lower()
             if any(ident in qn_lo for ident in idents):
                 boost *= 2.0
+        if query_words:
+            symbol = row["symbol"] if "symbol" in row.keys() else None
+            symbol_words = identifier_words(symbol or row["name"])
+            covered = _covered_word_count(query_words, symbol_words)
+            if covered:
+                boost *= 1.0 + _NAME_COVERAGE_BOOST * covered / len(query_words)
+                if symbol_words == query_words:
+                    boost *= _NAME_EXACT_COVERAGE_BOOST
+
+        exact = kind_boosts.get("_exact_name")
+        if exact:
+            if row["name"].lower() == exact:
+                boost *= _EXACT_NAME_BOOST
+            elif qualified_name.lower().endswith("::" + exact):
+                boost *= _EXACT_SYMBOL_BOOST
         if context_set and file_path in context_set:
             boost *= 1.5
 
