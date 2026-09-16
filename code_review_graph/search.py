@@ -10,10 +10,18 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections.abc import Sequence
 from typing import Any, Optional
 
 from .graph import GraphStore, _sanitize_name, identifier_words
-from .migrations import NODES_FTS_DDL
+from .migrations import (
+    FTS_STATE_METADATA_KEY,
+    FTS_STATE_VERSION,
+    NODES_FTS_COLUMNS,
+    NODES_FTS_DDL,
+    NODES_FTS_STATE_TABLE,
+    ensure_nodes_fts_state,
+)
 from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
@@ -51,6 +59,48 @@ _NAME_EXACT_COVERAGE_BOOST = 2.0
 # FTS5 index management
 # ---------------------------------------------------------------------------
 
+# ``nodes_fts`` is an *external content* table: it stores the inverted index
+# but reads column values from ``nodes``.  Removing an entry therefore needs
+# the values that were indexed, and once the node row is gone those values
+# are unrecoverable, leaving an entry that still matches a query but no
+# longer resolves to a node.  ``nodes_fts_state`` mirrors what the index
+# currently holds so a delta always has the old values to delete with.
+# The table name, the columns it carries and the flag that says it is
+# current all live in migrations, next to the index DDL they mirror.
+_FTS_STATE_TABLE = NODES_FTS_STATE_TABLE
+_FTS_STATE_METADATA_KEY = FTS_STATE_METADATA_KEY
+_FTS_STATE_VERSION = FTS_STATE_VERSION
+
+# Column lists built once from the single source of truth, so the mirror,
+# the delta delete and the delta insert always name the same columns in the
+# same order as the index itself.
+_FTS_COLUMN_SQL = ", ".join(NODES_FTS_COLUMNS)
+_FTS_COLUMN_PLACEHOLDERS = ", ".join("?" * len(NODES_FTS_COLUMNS))
+
+# Above this share of the graph a delta stops paying for itself: the per-row
+# delete/insert work approaches a rebuild while keeping tombstones around.
+# The floor keeps small graphs on the delta path, where a few hundred rows
+# are cheaper to rewrite than the whole index is to drop and repopulate.
+_FTS_DELTA_MAX_RATIO = 0.35
+_FTS_DELTA_MIN_ROWS = 500
+
+# SQLite caps host parameters per statement; mirrors communities._SQL_BATCH.
+_FTS_SQL_BATCH = 450
+
+
+def _ensure_fts_state_table(conn: sqlite3.Connection) -> None:
+    """Create the index-state mirror, or widen one that predates a column."""
+    ensure_nodes_fts_state(conn)
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type IN ('table', 'view') "
+        "AND name = ?",
+        (name,),
+    ).fetchone()
+    return bool(row and row[0])
+
 
 def rebuild_fts_index(store: GraphStore) -> int:
     """Rebuild the FTS5 index from the nodes table.
@@ -81,6 +131,19 @@ def rebuild_fts_index(store: GraphStore) -> int:
         # Rebuild from the content table (nodes) using the FTS5 rebuild command
         conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
 
+        # Record what the index now holds so the next delta can delete with
+        # the same values 'rebuild' just indexed.
+        _ensure_fts_state_table(conn)
+        conn.execute(f"DELETE FROM {_FTS_STATE_TABLE}")  # nosec B608
+        conn.execute(
+            f"INSERT INTO {_FTS_STATE_TABLE} "  # nosec B608
+            f"(node_id, {_FTS_COLUMN_SQL}) "
+            f"SELECT id, {_FTS_COLUMN_SQL} FROM nodes"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (_FTS_STATE_METADATA_KEY, _FTS_STATE_VERSION),
+        )
 
         conn.commit()
     except BaseException:
@@ -90,6 +153,239 @@ def rebuild_fts_index(store: GraphStore) -> int:
     count = conn.execute("SELECT count(*) FROM nodes_fts").fetchone()[0]
     logger.info("FTS index rebuilt: %d rows indexed", count)
     return count
+
+
+def _stored_path_hints(file_paths: Sequence[str] | None) -> list[str]:
+    """Normalise caller-supplied paths to the spelling stored in ``nodes``."""
+    if not file_paths:
+        return []
+    seen: dict[str, None] = {}
+    for raw in file_paths:
+        if not raw:
+            continue
+        seen.setdefault(normalize_file_path(raw), None)
+    return list(seen)
+
+
+def _batched(values: list[Any]) -> list[list[Any]]:
+    return [
+        values[i:i + _FTS_SQL_BATCH]
+        for i in range(0, len(values), _FTS_SQL_BATCH)
+    ]
+
+
+def _collect_delta_rowids(
+    conn: sqlite3.Connection,
+    paths: list[str],
+) -> set[int]:
+    """Return every rowid whose index entry has to be rewritten.
+
+    Two of the three sources run whatever the caller passed, because they
+    are what keeps the index honest: a node with no index entry would be
+    unfindable, and an index entry with no node is a phantom hit.  The
+    third narrows the rewrite to the files the caller named; without a
+    hint it compares the indexed text against the nodes table instead.
+    """
+    ids: set[int] = set()
+
+    # Nodes in the graph that the index has never seen.
+    ids.update(
+        row[0]
+        for row in conn.execute(
+            f"SELECT n.id FROM nodes n "  # nosec B608
+            f"LEFT JOIN {_FTS_STATE_TABLE} s ON s.node_id = n.id "
+            "WHERE s.node_id IS NULL"
+        )
+    )
+    # Index entries whose node is gone: the phantom-hit case.
+    ids.update(
+        row[0]
+        for row in conn.execute(
+            f"SELECT s.node_id FROM {_FTS_STATE_TABLE} s "  # nosec B608
+            "LEFT JOIN nodes n ON n.id = s.node_id "
+            "WHERE n.id IS NULL"
+        )
+    )
+
+    if paths:
+        for batch in _batched(paths):
+            placeholders = ",".join("?" * len(batch))
+            ids.update(
+                row[0]
+                for row in conn.execute(
+                    f"SELECT id FROM nodes WHERE file_path IN ({placeholders})",  # nosec B608
+                    batch,
+                )
+            )
+            ids.update(
+                row[0]
+                for row in conn.execute(
+                    f"SELECT node_id FROM {_FTS_STATE_TABLE} "  # nosec B608
+                    f"WHERE file_path IN ({placeholders})",
+                    batch,
+                )
+            )
+    else:
+        # No hint: find rows whose indexed text drifted from the node.
+        drift = " OR ".join(
+            f"n.{column} IS NOT s.{column}" for column in NODES_FTS_COLUMNS
+        )
+        ids.update(
+            row[0]
+            for row in conn.execute(
+                f"SELECT n.id FROM nodes n "  # nosec B608
+                f"JOIN {_FTS_STATE_TABLE} s ON s.node_id = n.id "
+                f"WHERE {drift}"
+            )
+        )
+
+    return ids
+
+
+def _apply_fts_delta(conn: sqlite3.Connection, rowids: list[int]) -> tuple[int, int]:
+    """Re-sync *rowids* in the index, one batch at a time.
+
+    Deletes come first within a batch: a rowid whose text changed is present
+    on both sides, and inserting before deleting would index it twice.
+    """
+    removed = 0
+    added = 0
+    delete_sql = (  # nosec B608
+        f"INSERT INTO nodes_fts(nodes_fts, rowid, {_FTS_COLUMN_SQL}) "
+        f"VALUES('delete', ?, {_FTS_COLUMN_PLACEHOLDERS})"
+    )
+    insert_sql = (  # nosec B608
+        f"INSERT INTO nodes_fts(rowid, {_FTS_COLUMN_SQL}) "
+        f"VALUES(?, {_FTS_COLUMN_PLACEHOLDERS})"
+    )
+    state_sql = (  # nosec B608
+        f"INSERT INTO {_FTS_STATE_TABLE} (node_id, {_FTS_COLUMN_SQL}) "
+        f"VALUES(?, {_FTS_COLUMN_PLACEHOLDERS})"
+    )
+
+    for batch in _batched(rowids):
+        placeholders = ",".join("?" * len(batch))
+        old_rows = [
+            tuple(row)
+            for row in conn.execute(
+                f"SELECT node_id, {_FTS_COLUMN_SQL} "  # nosec B608
+                f"FROM {_FTS_STATE_TABLE} WHERE node_id IN ({placeholders})",
+                batch,
+            )
+        ]
+        if old_rows:
+            conn.executemany(delete_sql, old_rows)
+            conn.execute(
+                f"DELETE FROM {_FTS_STATE_TABLE} "  # nosec B608
+                f"WHERE node_id IN ({placeholders})",
+                batch,
+            )
+            removed += len(old_rows)
+
+        new_rows = [
+            tuple(row)
+            for row in conn.execute(
+                f"SELECT id, {_FTS_COLUMN_SQL} "  # nosec B608
+                f"FROM nodes WHERE id IN ({placeholders})",
+                batch,
+            )
+        ]
+        if new_rows:
+            conn.executemany(insert_sql, new_rows)
+            conn.executemany(state_sql, new_rows)
+            added += len(new_rows)
+
+    return removed, added
+
+
+def update_fts_index(
+    store: GraphStore,
+    file_paths: Sequence[str] | None = None,
+    *,
+    _out_mode: Optional[list[str]] = None,
+) -> int:
+    """Bring the FTS5 index in step with ``nodes`` without a full rebuild.
+
+    Rewrites only the entries that changed: the rows of the files in
+    *file_paths* plus any row that drifted out of sync.  Falls back to
+    :func:`rebuild_fts_index` when the index state is unusable (a database
+    that predates it, or one whose state was cleared) or when so much of the
+    graph moved that a rebuild is the cheaper way to get there.
+
+    Args:
+        store: An open GraphStore.
+        file_paths: Files whose rows changed, in any path spelling. Omitting
+            them is safe: the drift comparison then covers the whole table.
+        _out_mode: Optional output list; a single ``"delta"`` or
+            ``"rebuild"`` is appended to say which path ran.
+
+    Returns:
+        Number of rows the index now covers.
+    """
+    conn = store._conn
+
+    def _rebuild() -> int:
+        if _out_mode is not None:
+            _out_mode.append("rebuild")
+        return rebuild_fts_index(store)
+
+    if not _table_exists(conn, "nodes_fts") or not _table_exists(
+        conn, _FTS_STATE_TABLE
+    ):
+        return _rebuild()
+
+    if store.get_metadata(_FTS_STATE_METADATA_KEY) != _FTS_STATE_VERSION:
+        # This index was last written without the mirror, so nothing here
+        # describes what it holds. One rebuild re-establishes both.
+        return _rebuild()
+
+    total_nodes = conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+    state_rows = conn.execute(
+        f"SELECT count(*) FROM {_FTS_STATE_TABLE}"  # nosec B608
+    ).fetchone()[0]
+    if total_nodes and not state_rows:
+        # The mirror was emptied without the index being emptied with it;
+        # inserting every row again would index each one twice.
+        return _rebuild()
+
+    delta_ids = _collect_delta_rowids(conn, _stored_path_hints(file_paths))
+    rebuild_threshold = max(
+        _FTS_DELTA_MIN_ROWS, int(total_nodes * _FTS_DELTA_MAX_RATIO)
+    )
+    if len(delta_ids) >= rebuild_threshold:
+        return _rebuild()
+
+    if _out_mode is not None:
+        _out_mode.append("delta")
+
+    if delta_ids:
+        if conn.in_transaction:
+            logger.warning(
+                "Rolling back uncommitted transaction before BEGIN IMMEDIATE"
+            )
+            conn.rollback()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            removed, added = _apply_fts_delta(conn, sorted(delta_ids))
+            conn.commit()
+        except sqlite3.DatabaseError as exc:
+            # The index state did not describe the index after all (a
+            # database written by a version without the mirror, say). A
+            # rebuild is the one operation that needs no old values.
+            conn.rollback()
+            logger.warning("FTS delta failed, rebuilding index: %s", exc)
+            return _rebuild()
+        except BaseException:
+            conn.rollback()
+            raise
+        logger.info(
+            "FTS index delta: %d entries removed, %d indexed", removed, added
+        )
+
+    # ``SELECT count(*) FROM nodes_fts`` scans the external content table to
+    # answer exactly this; every node now has one index entry, so read the
+    # count straight off ``nodes`` instead.
+    return total_nodes
 
 
 # ---------------------------------------------------------------------------
