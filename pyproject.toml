@@ -157,6 +157,7 @@ norecursedirs = ["tests/fixtures"]
 markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
+    "surface: drives every registered MCP tool and prompt through a real client over stdio",
 ]
 
 [dependency-groups]
