@@ -1,4 +1,4 @@
-"""PHP include/require import edge regressions (#819)."""
+"""PHP include/require import edge regressions (PR #819)."""
 
 from pathlib import Path
 

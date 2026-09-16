@@ -157,7 +157,7 @@ def test_no_stale_sdk_references_outside_lock():
             parts = path.relative_to(ROOT).parts
             if parts[0] in {".git", ".venv", "node_modules", ".claude", "evaluate"}:
                 continue
-            if " 2." in path.name or path.name == "test_pr856_edges.py":
+            if " 2." in path.name or path.name == "test_genai_packaging.py":
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
