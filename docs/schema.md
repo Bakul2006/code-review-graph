@@ -86,11 +86,12 @@ A synthesised node for a Spring application event, created after the build by
 ## Edge Types
 
 Every edge has `source_qualified`, `target_qualified`, `file_path` (where the relationship
-was seen), `line`, `extra` (JSON), `confidence` and `confidence_tier`.
+was seen), `line`, `extra` (JSON), `confidence`, `confidence_tier` and, for
+`CALLS` and `REFERENCES`, `target_resolution`.
 
 | Kind | Source -> target | Notes |
 |---|---|---|
-| CALLS | caller -> called function | Target may be a bare name until a resolver qualifies it |
+| CALLS | caller -> called function | Target may be a bare name until a resolver qualifies it; `target_resolution` records which |
 | IMPORTS_FROM | importing file -> imported module or file | `file_path` equals the source |
 | INHERITS | child class -> parent class | |
 | IMPLEMENTS | implementing class -> interface | |
@@ -159,6 +160,7 @@ CREATE TABLE edges (
     extra TEXT DEFAULT '{}',
     confidence REAL DEFAULT 1.0,              -- v9
     confidence_tier TEXT DEFAULT 'EXTRACTED', -- v9
+    target_resolution TEXT,                   -- v11; 'direct' | 'unresolved' | NULL
     updated_at REAL NOT NULL
 );
 
@@ -266,7 +268,7 @@ CREATE TABLE embeddings (
 
 | Key | Set by |
 |---|---|
-| `schema_version` | `migrations.py`; `10` on a current database |
+| `schema_version` | `migrations.py`; `11` on a current database |
 | `last_updated` | Full and incremental builds |
 | `last_build_type` | Full and incremental builds |
 | `git_head_sha`, `git_branch` | Builds in a git checkout |
@@ -295,6 +297,7 @@ CREATE TABLE embeddings (
 | `idx_risk_index_score` | `risk_index(risk_score DESC)` | v6 |
 | `idx_edges_composite` | `edges(kind, source_qualified, target_qualified, file_path, line)` | v8 |
 | `idx_nodes_symbol` | `nodes(symbol)` | v10 |
+| `idx_edges_kind_target_resolution` | `edges(kind, target_resolution)` | v11 |
 
 ### Migrations
 
@@ -311,3 +314,4 @@ Each migration runs in its own transaction and updates `schema_version` on succe
 | 8 | `idx_edges_composite` |
 | 9 | `edges.confidence`, `edges.confidence_tier` |
 | 10 | `nodes.symbol`, back-filled from `qualified_name`, and `idx_nodes_symbol` |
+| 11 | `edges.target_resolution`, back-filled for `CALLS`/`REFERENCES`, and `idx_edges_kind_target_resolution` |

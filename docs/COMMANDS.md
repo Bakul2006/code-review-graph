@@ -75,7 +75,13 @@ max_depth: int = 2               # Hops in graph
 repo_root: str | None
 base: str = "HEAD~1"
 detail_level: str = "standard"   # "standard" or "minimal"
+resolution: str = "all"          # "all" or "direct" (only calls bound to a node)
 ```
+An impacted node that calls or references the changed code in one hop carries
+`call_site` (`line`, plus `file` only when the call is written outside the node's
+own `file_path`) and `call_site_count` when there is more than one.
+`unresolved_call_sites` counts call sites that name a changed symbol but were
+never bound to it, so an empty radius is not read as proof of absence.
 Responses may include estimated `context_savings` metadata.
 
 #### `query_graph_tool`
@@ -86,7 +92,15 @@ target: str     # Node name, qualified name, or file path
 repo_root: str | None
 detail_level: str = "standard"   # "standard" or "minimal"
 max_results: int = 100           # Minimal mode also caps visible results at 5
+resolution: str = "all"          # "all", "direct", or "unresolved"
 ```
+`callers_of`, `callees_of` and `references_to` return one row per call site, not
+one per node. Each row carries `call_site` (`line`, plus `file` only when the
+call is written outside the row's own `file_path`), and rows whose target was
+matched by bare name alone carry `target_resolution: "unresolved"`. The response
+adds `distinct_nodes` and a `resolution_split` of the whole answer. Call sites
+are ordered so every distinct node appears before any node's second call site,
+so truncation never costs a caller.
 
 #### `get_review_context_tool`
 ```
