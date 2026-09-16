@@ -30,6 +30,16 @@ def _touch(root: Path, name: str, text: str = "export const x = 1;\n") -> Path:
     return p
 
 
+def _parse(tmp_path: Path, source: str, suffix: str = ".js", name: str = "app"):
+    path = tmp_path / f"{name}{suffix}"
+    path.write_text(source, encoding="utf-8")
+    return path, CodeParser().parse_file(path)
+
+
+def _import_targets(edges):
+    return [edge.target for edge in edges if edge.kind == "IMPORTS_FROM"]
+
+
 class TestDottedStemEdges:
     def test_multi_dot_stem_with_decoys_at_every_truncation(self, tmp_path, parser):
         """`./a.b.c` must hit `a.b.c.ts`, not the `a.b.ts` / `a.ts` decoys."""
@@ -252,16 +262,6 @@ class TestEndToEnd:
         targets = [e.target for e in imports]
         assert any(t.endswith("outlet.entity.ts") for t in targets), targets
         assert not any(t.endswith("/outlet.ts") for t in targets), targets
-
-
-def _parse(tmp_path: Path, source: str, suffix: str = ".js", name: str = "app"):
-    path = tmp_path / f"{name}{suffix}"
-    path.write_text(source, encoding="utf-8")
-    return path, CodeParser().parse_file(path)
-
-
-def _import_targets(edges):
-    return [edge.target for edge in edges if edge.kind == "IMPORTS_FROM"]
 
 
 def test_multi_dot_stem_resolves_full_filename(tmp_path):

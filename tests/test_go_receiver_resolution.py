@@ -36,6 +36,10 @@ def _resolution(edges, method_suffix: str, target_suffix: str, receiver: str = "
     ]
 
 
+def _parents(nodes):
+    return {n.name: n.parent_name for n in nodes if n.kind == "Function"}
+
+
 class TestClosureCapture:
     def test_goroutine_and_defer_closures_keep_receiver(self):
         _, edges = _parse(
@@ -333,10 +337,6 @@ class TestScale:
             "func (a *A) M() {\n" + "".join(blocks) + "}\n"
         )
         assert _resolution(edges, "::A.M", "::A.Save") == [False, True] * 150
-
-
-def _parents(nodes):
-    return {n.name: n.parent_name for n in nodes if n.kind == "Function"}
 
 
 class TestGoGenericReceiverEdges:
