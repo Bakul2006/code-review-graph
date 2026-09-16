@@ -157,6 +157,12 @@ norecursedirs = ["tests/fixtures"]
 markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
+    # Skipped unless selected: see the pytest_collection_modifyitems hook in
+    # tests/conftest.py. Builds a wheel and an sdist, installs each into its
+    # own virtual environment and drives the installed program, so it needs
+    # network access and takes minutes. Run it on demand with
+    # `pytest tests/test_packaging.py -m packaging`.
+    "packaging: builds the distribution artefacts and smoke-tests them from a clean install",
 ]
 
 [dependency-groups]
