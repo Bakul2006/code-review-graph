@@ -158,6 +158,7 @@ markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
     "platform_lifecycle: drives install/reinstall/uninstall for every supported platform",
+    "packaging: builds the distribution artefacts and smoke-tests them from a clean install",
 ]
 
 [dependency-groups]
