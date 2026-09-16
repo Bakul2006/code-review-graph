@@ -40,3 +40,21 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
     # unset, a miss would be silently destructive; set, it cannot be.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("hermes-home")))
     return home
+
+
+def pytest_collection_modifyitems(config, items):
+    """Keep the opt-in ``cli_surface`` gate out of the ordinary suite.
+
+    ``tests/test_cli_surface.py`` runs the CLI as ~300 subprocesses against
+    scratch repositories it builds from scratch. That is a release gate, not
+    something every ``pytest tests/`` should pay for, so it is skipped unless
+    the run asks for the marker by name (``-m cli_surface``). Registering the
+    marker alone would not do that: an unfiltered run collects and runs it.
+    """
+    selected = config.getoption("-m", default="") or ""
+    if "cli_surface" in selected:
+        return
+    skip = pytest.mark.skip(reason="opt-in: run with -m cli_surface")
+    for item in items:
+        if "cli_surface" in item.keywords:
+            item.add_marker(skip)
