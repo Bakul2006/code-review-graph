@@ -110,13 +110,20 @@ action maps the score to levels:
 - A `Powered by code-review-graph` footer.
 
 If `detect-changes` capped the analysed functions (`CRG_MAX_CHANGED_FUNCS`,
-default 500), the comment says so. Bodies over 60,000 characters are cut and
-marked `Report truncated`.
+default 500), the comment says so. A body over 60,000 UTF-8 bytes is cut on a
+line boundary and marked `Report truncated`; that limit is the finished body,
+notice and footer included, so a truncated report still fits the cap the
+trusted commenting workflow enforces (`MAX_REPORT_BYTES`).
 
 The comment starts with a hidden HTML marker
-(`<!-- code-review-graph-report -->`). On each run the action looks the marker
-up with `gh api` and PATCHes the existing comment instead of creating a new
-one.
+(`<!-- code-review-graph-report -->`). On each run the action looks up a
+comment that both starts with the marker and was written by the token's own
+account, and PATCHes that one instead of creating a new comment. Both
+conditions matter: the marker is documented here, so a pull request
+participant can post a comment carrying it, and an author filter is what
+stops the action adopting it. When the token's identity cannot be
+established the action posts a comment of its own rather than editing
+someone else's.
 
 ## Cache behavior
 
@@ -136,7 +143,9 @@ database) with `actions/cache`:
 - **On cache hit**: the action runs `code-review-graph update --base
   origin/<base-branch>`, which re-parses only the files that differ from the
   PR's base. If the restored database is unusable, it falls back to a full
-  `build`.
+  `build`; `build` discards a `graph.db` SQLite cannot read and rebuilds from
+  scratch, so a corrupt cache costs one slow run rather than turning every
+  run red until someone clears the cache by hand.
 - **On cache miss**: a full `code-review-graph build` runs. Later runs are
   incremental.
 

@@ -110,10 +110,25 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
         marker='<!-- code-review-graph-report -->'
+        # Only ever edit a comment this Action itself posted. The marker is
+        # published in docs/GITHUB_ACTION.md, so any pull request
+        # participant can post a comment carrying it; without an author
+        # filter the Action would adopt that comment and every later run
+        # would rewrite it (or stall on it) instead of keeping its own
+        # report. `gh api user` is unavailable to the default GITHUB_TOKEN,
+        # whose comments are authored by github-actions[bot]; a personal
+        # access token answers with its own login. An identity we cannot
+        # establish posts a fresh comment rather than adopting someone
+        # else's.
+        author=$(gh api user --jq '.login' 2>/dev/null || true)
+        if [ -z "${author}" ]; then
+          author='github-actions[bot]'
+        fi
         comment_id=$(gh api \
           "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
           --paginate \
-          --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n 1)
+          --jq ".[] | select(.user.login == \"${author}\" and
+                 (.body | startswith(\"${marker}\"))) | .id" | head -n 1)
         if [ -n "${comment_id}" ]; then
           gh api --method PATCH --silent \
             "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" \

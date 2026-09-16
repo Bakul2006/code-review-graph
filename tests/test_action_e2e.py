@@ -1498,15 +1498,6 @@ def test_missing_report_file_exits_two_without_a_traceback():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: a corrupt restored cache is not recoverable. action.yml's "
-        "'update || build' fallback fails because build also aborts with an "
-        "uncaught sqlite3.DatabaseError traceback, so every PR run stays red "
-        "until the cache is cleared by hand."
-    ),
-)
 def test_corrupt_cached_graph_falls_back_to_a_full_build(
     tmp_path_factory: pytest.TempPathFactory,
 ):
@@ -1521,6 +1512,13 @@ def test_corrupt_cached_graph_falls_back_to_a_full_build(
     build = runner.run_step(steps[STEP_BUILD], check=False)
     assert "Traceback (most recent call last)" not in build.stderr
     assert build.returncode == 0, build.stderr[-2000:]
+    # Recovered, not merely survived: the bad file is gone and a usable
+    # graph stands in its place.
+    rebuilt = cache / "graph.db"
+    assert rebuilt.read_bytes()[:16] == b"SQLite format 3\x00"
+    runner.run_step(steps[STEP_ANALYZE])
+    report = json.loads((runner.runner_temp / "crg-report.json").read_text())
+    assert report.get("changed_functions") is not None, report
 
 
 @pytest.mark.xfail(
@@ -1564,16 +1562,6 @@ def test_non_finite_risk_score_is_rejected(tmp_path: Path, literal: str):
     assert "inf" not in body.lower() and "nan" not in body.lower(), body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: the renderer's 60,000-character cap and the privileged workflow's "
-        "MAX_REPORT_BYTES=60000 are equal, but the renderer appends the "
-        "'Report truncated' notice and footer after truncating. Every truncated "
-        "report therefore exceeds the consumer's cap and the commenting "
-        "workflow aborts instead of posting."
-    ),
-)
 def test_truncated_report_is_accepted_by_the_trusted_workflow(tmp_path: Path):
     entries = [
         {
@@ -1596,6 +1584,9 @@ def test_truncated_report_is_accepted_by_the_trusted_workflow(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     body = (tmp_path / "out.md").read_text(encoding="utf-8")
     assert "*Report truncated.*" in body, "this fixture must trigger truncation"
+    # The notice and footer are inside the budget the consumer enforces, not
+    # bolted on after it.
+    assert len(body.encode("utf-8")) <= _WORKFLOW_MAX_REPORT_BYTES, len(body)
     run_trusted_validator(tmp_path, body)
 
 
@@ -1630,16 +1621,6 @@ def test_line_start_is_escaped_like_every_other_cell(tmp_path: Path):
             assert len(table_cells(row)) == width, row
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: changes._parse_unified_diff matches '^\\\\+\\\\+\\\\+ b/(.+)$', which "
-        "keeps the tab git appends when a path contains a space and never "
-        "matches git's C-quoted form for non-ASCII paths. Symbols in those "
-        "files vanish from changed_functions, review_priorities and test_gaps, "
-        "so the PR comment under-reports risk."
-    ),
-)
 @pytest.mark.parametrize("odd_name", ["my module.py", "café.py"])
 def test_paths_git_quotes_still_report_their_changed_symbols(
     tmp_path_factory: pytest.TempPathFactory, odd_name: str
@@ -1805,19 +1786,13 @@ def test_docs_security_claims_match_the_workflows():
     assert "no source code is sent to any external service" in action_prose
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: action.yml's own sticky upsert selects the first comment whose "
-        "body merely contains the marker, with no author filter. The marker is "
-        "published in docs/GITHUB_ACTION.md, so any PR participant can post a "
-        "comment containing it and the Action will target that comment instead "
-        "of its own. The privileged workflow gets this right "
-        "(.user.login == 'github-actions[bot]' plus startswith)."
-    ),
-)
 def test_sticky_upsert_only_targets_its_own_comment():
     script = action_steps()[STEP_COMMENT]["run"]
     assert "user.login" in script, (
         "the comment lookup must filter by author before PATCHing"
     )
+    # A marker anywhere in the body is not enough: the marker is published
+    # in docs/GITHUB_ACTION.md, so a participant can put it in a comment of
+    # their own and have it adopted.
+    assert "contains(" not in script, script
+    assert "startswith(" in script, script

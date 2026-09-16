@@ -691,6 +691,38 @@ def _warn_failed_files(result: dict) -> None:
     )
 
 
+def _open_graph_store(db_path: Path, command: str):
+    """Open the graph store, recovering from an unreadable database file.
+
+    A restored CI cache can hold a truncated or half-written ``graph.db``.
+    SQLite then refuses to open it and the command dies with a traceback,
+    which is why ``action.yml``'s ``update || build`` fallback could not
+    recover: the full build failed for exactly the same reason. ``build``
+    rewrites the graph from scratch, so there the bad file is discarded and
+    the build proceeds; every other command reports one actionable line.
+    """
+    from .graph import CorruptGraphDatabaseError, GraphStore, discard_corrupt_database
+
+    try:
+        return GraphStore(db_path)
+    except CorruptGraphDatabaseError as exc:
+        if command != "build":
+            print(
+                f"The graph database at {db_path} is unreadable "
+                f"({exc.reason}). Run `code-review-graph build` to rebuild "
+                "it from scratch.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+        logging.warning(
+            "Graph database at %s is unreadable (%s); discarding it and "
+            "building from scratch.",
+            db_path, exc.reason,
+        )
+        discard_corrupt_database(db_path)
+        return GraphStore(db_path)
+
+
 def main() -> None:
     """Main CLI entry point."""
     _configure_utf8_stdio()
@@ -1622,7 +1654,6 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    from .graph import GraphStore
     from .incremental import (
         find_project_root,
         find_repo_root,
@@ -1634,7 +1665,7 @@ def main() -> None:
         repo_root = Path(args.repo) if args.repo else find_project_root()
         _handle_data_dir_option(args, repo_root)
         db_path = get_db_path(repo_root)
-        store = GraphStore(db_path)
+        store = _open_graph_store(db_path, args.command)
         try:
             from .tools.build import run_postprocess
 
@@ -1744,7 +1775,7 @@ def main() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
-    store = GraphStore(db_path)
+    store = _open_graph_store(db_path, args.command)
 
     try:
         if args.command == "dead-code":

@@ -40,7 +40,13 @@ RISK_THRESHOLDS: dict[str, float] = {"critical": 0.85, "high": 0.7, "medium": 0.
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MAX_CELL = 120
-# GitHub rejects comment bodies over 65,536 characters; leave headroom.
+# GitHub rejects comment bodies over 65,536 characters, and the trusted
+# workflow that publishes this report (.github/workflows/pr-review-comment.yml)
+# rejects an artifact larger than MAX_REPORT_BYTES. This is that same budget,
+# and it is a budget for the *finished* body: the truncation notice and the
+# footer have to fit inside it, or every truncated report is rejected by the
+# consumer and the largest pull requests get no comment at all. Measured in
+# UTF-8 bytes, because that is what the consumer measures.
 _MAX_BODY = 60_000
 
 
@@ -260,10 +266,27 @@ def render_markdown(
         )
 
     lines.extend(["", "---", "", FOOTER])
-    body = "\n".join(lines)
-    if len(body) > _MAX_BODY:
-        body = body[:_MAX_BODY] + "\n\n*Report truncated.*\n\n" + FOOTER
-    return body
+    return _fit_to_budget("\n".join(lines))
+
+
+def _fit_to_budget(body: str) -> str:
+    """Return *body* trimmed so the finished comment fits ``_MAX_BODY``.
+
+    The truncation notice and the footer are part of what is measured, so
+    the budget is reduced by their size before the report is cut, and the
+    cut lands on a line boundary so the last row of a markdown table is
+    never left half-written.
+    """
+    encoded = body.encode("utf-8")
+    if len(encoded) <= _MAX_BODY:
+        return body
+    suffix = "\n\n*Report truncated.*\n\n" + FOOTER
+    budget = _MAX_BODY - len(suffix.encode("utf-8"))
+    head = encoded[:budget].decode("utf-8", "ignore")
+    newline = head.rfind("\n")
+    if newline > 0:
+        head = head[:newline]
+    return head + suffix
 
 
 def render_no_changes() -> str:
