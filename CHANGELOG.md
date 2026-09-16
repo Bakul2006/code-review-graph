@@ -43,6 +43,29 @@
 
 ### Fixed
 
+- Go and Ruby imports resolve to files instead of staying bare strings. Go
+  reads the module path from the nearest `go.mod` (nested modules win over
+  their ancestors, local `replace` targets and `vendor/` are honoured) and
+  maps an in-repo import to the non-test `.go` files of the package
+  directory it names; the standard library and undownloaded dependencies
+  stay unresolved. Ruby resolves `require_relative` against the requiring
+  file and `require`, `load`, `autoload` and `require_all` against the
+  repository's load roots (gemspec `require_paths`, `lib`, `test`, `spec`,
+  the Rails `app` roots, and `$LOAD_PATH.unshift` in a root script); gems
+  stay unresolved. On cli/cli, go import edges that name a real file go
+  from 0 of 8687 to 17527 of 22721, and `importers_of` for
+  `pkg/iostreams/iostreams.go` from 0 to 424. On jekyll, ruby edges go
+  from 0 of 227 to 159 of 264.
+- Every specifier in a Go `import ( ... )` block carries its own line.
+  8648 of cli/cli's 8690 import edges were stamped with the line of the
+  `import (` token.
+- Ruby import extraction dispatches on the call's method name instead of
+  testing whether the node text contains "require". 34 of jekyll's 227
+  import edges (15%) were not on a require line at all, with targets such
+  as `Missing --ssl_cert or --ssl_key. Both are required.`; those call
+  subtrees were also being dropped whole, so their calls are now
+  extracted. `autoload`, which is how jekyll declares its entire internal
+  module graph, produced no edge at all.
 - Freshness metadata follows what was stored. A no-op `update` that
   confirms `HEAD` advances the Git anchor, so queries after a commit no
   longer carry a stale-graph caveat, and a file that fails to parse no
