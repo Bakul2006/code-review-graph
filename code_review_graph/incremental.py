@@ -2146,6 +2146,7 @@ class _WatchSupervisor:
         else:
             self._shallow.add(key)
 
+<<<<<<< HEAD
     def request_replan(self) -> None:
         """Reconsider the plan after a directory change seen by watchdog."""
         self._replan_requested = True
@@ -2235,6 +2236,8 @@ class _WatchSupervisor:
             self._shallow.add(key)
         return True
 
+=======
+>>>>>>> origin/watcher/replan
     def sync_watches(
         self, *, ignore_patterns: list[str] | None = None,
     ) -> tuple[list[str], list[str]]:
@@ -2301,9 +2304,14 @@ class _WatchSupervisor:
                         previous_patterns,
                     )
                 )
+<<<<<<< HEAD
                 if self._adopt_directory(candidate_key, required=newly_included):
                     adopted.append(candidate_key)
         self._replan_if_requested()
+=======
+                if self._adopt_directory(candidate, required=newly_included):
+                    adopted.append(candidate)
+>>>>>>> origin/watcher/replan
         return adopted, vanished
 
     def _children_of(self, parent: str) -> list[str]:
