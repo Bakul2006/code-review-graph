@@ -143,7 +143,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 norecursedirs = ["tests/fixtures"]
 markers = [
-    "e2e: end-to-end tests that spawn the MCP server or CLI as a real subprocess",
+    "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
 ]
 
 [dependency-groups]
