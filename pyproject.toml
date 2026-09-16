@@ -157,6 +157,7 @@ norecursedirs = ["tests/fixtures"]
 markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
+    "upgrade: installs released versions from PyPI, builds a graph with each, and upgrades it with the current code (needs uv and network; minutes and hundreds of MB)",
 ]
 
 [dependency-groups]
