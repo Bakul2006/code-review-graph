@@ -400,6 +400,63 @@ def _build_server_entry(
     return entry
 
 
+# Fields an MCP entry written by this project has ever carried. An entry
+# holding anything else (``env``, ``url``, ``disabled``, ``autoApprove``, ...)
+# was shaped by hand and is never rewritten.
+_GENERATED_ENTRY_FIELDS = frozenset({"name", "type", "command", "args", "cwd", "tools"})
+
+# Both spellings this project has ever used on a command line.
+_SERVER_LAUNCH_TOKENS = frozenset({"code-review-graph", "code_review_graph"})
+
+
+def _entry_command_tokens(entry: dict[str, Any]) -> list[str] | None:
+    """Flatten an MCP entry's command and args into one token list."""
+    command = entry.get("command")
+    if isinstance(command, str):
+        tokens = [command]
+    elif isinstance(command, list) and all(isinstance(item, str) for item in command):
+        tokens = list(command)
+    else:
+        return None
+    args = entry.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        return None
+    return tokens + args
+
+
+def _is_generated_server_entry(entry: Any) -> bool:
+    """Return True when ``entry`` is an MCP registration this project wrote.
+
+    Recognition is by shape, not by equality with the entry the running version
+    would write: an older release pinned an absolute interpreter path and a
+    checkout that no longer exists, and exactly that entry has to be replaced
+    rather than kept. Anything carrying a field this project never writes, or a
+    command that does not launch this server, counts as the user's own and is
+    left alone.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if not set(entry) <= _GENERATED_ENTRY_FIELDS:
+        return False
+    tokens = _entry_command_tokens(entry)
+    if not tokens or "serve" not in tokens:
+        return False
+    if not _SERVER_LAUNCH_TOKENS.intersection(tokens):
+        return False
+    # Only the repo pin has ever followed ``serve`` (OpenCode folds it in).
+    trailing = tokens[tokens.index("serve") + 1 :]
+    return not trailing or (len(trailing) == 2 and trailing[0] == "--repo")
+
+
+def _report_user_owned_entry(config_path: Path, label: str = "") -> None:
+    """Say that a hand-written entry under our name was deliberately kept."""
+    prefix = f"  {label}: " if label else "  "
+    print(
+        f"{prefix}{config_path} holds a hand-written 'code-review-graph' entry "
+        f"— leaving it as it is."
+    )
+
+
 def _warn_legacy_opencode_config(repo_root: Path) -> None:
     """Warn without modifying the obsolete Cursor-shaped OpenCode config."""
     legacy = repo_root / ".opencode.json"
@@ -422,6 +479,13 @@ def _warn_legacy_opencode_config(repo_root: Path) -> None:
         )
 
 
+def _load_tomllib() -> Any:
+    """Return the TOML reader for this interpreter (``tomli`` before 3.11)."""
+    import importlib
+
+    return importlib.import_module("tomllib" if sys.version_info >= (3, 11) else "tomli")
+
+
 def _format_toml_value(value: Any) -> str:
     """Format a primitive Python value as TOML."""
     if isinstance(value, str):
@@ -434,24 +498,105 @@ def _format_toml_value(value: Any) -> str:
     raise TypeError(f"Unsupported TOML value: {type(value)!r}")
 
 
+def _toml_header_matches(line: str, table_path: tuple[str, ...]) -> bool:
+    """Return whether ``line`` opens the TOML table named by ``table_path``."""
+    stripped = line.strip()
+    if not stripped.startswith("[") or not stripped.endswith("]"):
+        return False
+    if stripped.startswith("[["):
+        return False  # array of tables: never what this project writes
+    parts = [part.strip().strip('"').strip("'") for part in stripped[1:-1].split(".")]
+    return tuple(parts) == table_path
+
+
+def _toml_table_span(lines: list[str], table_path: tuple[str, ...]) -> tuple[int, int] | None:
+    """Return the ``(start, end)`` line span of a TOML table, or None.
+
+    ``end`` stops just past the table's last non-blank line so blank separators
+    between tables survive a replacement.
+    """
+    start = None
+    for index, line in enumerate(lines):
+        if _toml_header_matches(line, table_path):
+            start = index
+            break
+    if start is None:
+        return None
+    end = start + 1
+    last_content = end
+    while end < len(lines):
+        if lines[end].lstrip().startswith("["):
+            break
+        if lines[end].strip():
+            last_content = end + 1
+        end += 1
+    return start, last_content
+
+
 def _merge_toml_mcp_server(
     config_path: Path,
     server_name: str,
     server_entry: dict[str, Any],
     dry_run: bool = False,
-) -> bool:
-    """Append a Codex MCP server section without clobbering the rest of the file."""
-    section_header = f"[mcp_servers.{server_name}]"
-    existing = ""
-    if config_path.exists():
-        existing = config_path.read_text(encoding="utf-8")
-        if section_header in existing:
-            return False
+) -> bool | None:
+    """Write a Codex MCP server table without clobbering the rest of the file.
 
-    section_lines = [section_header]
+    An entry a previous release wrote is replaced in place rather than treated
+    as up to date, so a stale absolute interpreter path or a dead ``cwd`` does
+    not survive a reinstall. A hand-written entry is never rewritten.
+
+    Returns True when the file was (or would be) modified, False when no edit
+    is needed, and None when the edit was refused to avoid data loss.
+    """
+    table_path = ("mcp_servers", server_name)
+    section_lines = [f"[mcp_servers.{server_name}]"]
     for key, value in server_entry.items():
         section_lines.append(f"{key} = {_format_toml_value(value)}")
     section = "\n".join(section_lines) + "\n"
+
+    existing = ""
+    if config_path.exists():
+        existing = config_path.read_text(encoding="utf-8")
+
+    lines = existing.splitlines(keepends=True)
+    span = _toml_table_span(lines, table_path)
+    if existing:
+        tomllib = _load_tomllib()
+        current: Any = None
+        parsed_ok = False
+        try:
+            parsed = tomllib.loads(existing)
+        except tomllib.TOMLDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            parsed_ok = True
+            table = parsed.get("mcp_servers")
+            if isinstance(table, dict):
+                current = table.get(server_name)
+        if not parsed_ok:
+            # Unparseable TOML: only the header tells us anything, so do the
+            # conservative thing and never edit a table we cannot read.
+            if span is not None:
+                return False
+        elif current is not None:
+            if current == server_entry:
+                return False
+            if not _is_generated_server_entry(current):
+                _report_user_owned_entry(config_path)
+                return False
+            if span is None:
+                print(
+                    f"  {config_path}: the existing [mcp_servers.{server_name}] table "
+                    f"could not be located for replacement — left unchanged."
+                )
+                return None
+            if dry_run:
+                return True
+            start, end = span
+            config_path.write_text(
+                "".join(lines[:start]) + section + "".join(lines[end:]), encoding="utf-8"
+            )
+            return True
 
     if dry_run:
         return True
@@ -507,6 +652,42 @@ def _yaml_block_indent(lines: list[str], start: int, end: int) -> int:
     return 2
 
 
+def _yaml_child_bounds(
+    lines: list[str], start: int, end: int, name: str
+) -> tuple[int, int] | None:
+    """Return the line span of the child mapping ``name`` inside a block.
+
+    Only a child written at the block's own indentation is matched, and the
+    span runs to the last line indented deeper than it, so replacing the span
+    cannot swallow a sibling entry.
+    """
+    indent = _yaml_block_indent(lines, start, end)
+    header = None
+    for index in range(start, min(end, len(lines))):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(line) - len(line.lstrip()) != indent:
+            continue
+        key, sep, _value = stripped.partition(":")
+        if sep and key.strip().strip('"').strip("'") == name:
+            header = index
+            break
+    if header is None:
+        return None
+    cursor = header + 1
+    last_content = cursor
+    while cursor < min(end, len(lines)):
+        line = lines[cursor]
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        if line.strip() and not line.lstrip().startswith("#"):
+            last_content = cursor + 1
+        cursor += 1
+    return header, last_content
+
+
 def _merge_yaml_mcp_server(
     config_path: Path,
     server_key: str,
@@ -529,6 +710,7 @@ def _merge_yaml_mcp_server(
     import yaml  # type: ignore[import-untyped]
 
     raw = ""
+    replacing = False
     if config_path.exists():
         raw = config_path.read_text(encoding="utf-8", errors="replace")
         try:
@@ -555,7 +737,13 @@ def _merge_yaml_mcp_server(
             )
             return None
         if isinstance(existing_servers, dict) and server_name in existing_servers:
-            return False
+            current = existing_servers[server_name]
+            if current == server_entry:
+                return False
+            if not _is_generated_server_entry(current):
+                _report_user_owned_entry(config_path)
+                return False
+            replacing = True
 
     lines = raw.splitlines(keepends=True)
     if lines and not lines[-1].endswith("\n"):
@@ -584,7 +772,24 @@ def _merge_yaml_mcp_server(
     else:
         header, insert_at = bounds
         indent = _yaml_block_indent(lines, header + 1, insert_at)
-        new_lines = lines[:insert_at] + [_indent_block(body, indent)] + lines[insert_at:]
+        child = (
+            _yaml_child_bounds(lines, header + 1, insert_at, server_name)
+            if replacing
+            else None
+        )
+        if replacing and child is None:
+            print(
+                f"  {config_path}: the existing {server_name!r} entry could not be "
+                f"located for replacement — left unchanged."
+            )
+            return None
+        if child is None:
+            new_lines = lines[:insert_at] + [_indent_block(body, indent)] + lines[insert_at:]
+        else:
+            child_start, child_end = child
+            new_lines = (
+                lines[:child_start] + [_indent_block(body, indent)] + lines[child_end:]
+            )
 
     rewritten = "".join(new_lines)
     try:
@@ -595,7 +800,8 @@ def _merge_yaml_mcp_server(
             f"({exc.__class__.__name__}) — left unchanged."
         )
         return None
-    if not isinstance(reparsed, dict) or server_name not in (reparsed.get(server_key) or {}):
+    written = (reparsed.get(server_key) or {}) if isinstance(reparsed, dict) else {}
+    if not isinstance(written, dict) or written.get(server_name) != server_entry:
         print(f"  {config_path}: safe YAML edit did not take effect — left unchanged.")
         return None
 
@@ -827,13 +1033,32 @@ def install_platform_configs(
 
         if plat["format"] == "array":
             arr = existing.get(server_key, [])
-            # Check if already present
-            if any(isinstance(s, dict) and s.get("name") == "code-review-graph" for s in arr):
-                print(f"  {plat['name']}: already configured in {config_path}")
-                _record_configured(key, plat)
-                continue
             arr_entry = {"name": "code-review-graph", **server_entry}
-            arr.append(arr_entry)
+            ours = [
+                index
+                for index, item in enumerate(arr)
+                if isinstance(item, dict) and item.get("name") == "code-review-graph"
+            ]
+            if ours:
+                current = arr[ours[0]]
+                if not _is_generated_server_entry(current):
+                    _report_user_owned_entry(config_path, plat["name"])
+                    _record_configured(key, plat)
+                    continue
+                if len(ours) == 1 and current == arr_entry:
+                    print(f"  {plat['name']}: already configured in {config_path}")
+                    _record_configured(key, plat)
+                    continue
+                # Replace the first registration and drop any duplicates an
+                # older release stacked up beside it.
+                duplicates = set(ours[1:])
+                arr = [
+                    arr_entry if index == ours[0] else item
+                    for index, item in enumerate(arr)
+                    if index not in duplicates
+                ]
+            else:
+                arr = [*arr, arr_entry]
             existing[server_key] = arr
         else:
             # Remove entries written under keys the client never read, then
@@ -850,12 +1075,20 @@ def install_platform_configs(
                         del existing[legacy_key]
                     migrated = True
             servers = existing.get(server_key, {})
-            if "code-review-graph" in servers and not migrated:
+            current = servers.get("code-review-graph")
+            if current is not None and not _is_generated_server_entry(current):
+                # Someone wrote this entry themselves; it is not ours to rewrite.
+                _report_user_owned_entry(config_path, plat["name"])
+                if not migrated:
+                    _record_configured(key, plat)
+                    continue
+            elif current == server_entry and not migrated:
                 print(f"  {plat['name']}: already configured in {config_path}")
                 _record_configured(key, plat)
                 continue
-            servers["code-review-graph"] = server_entry
-            existing[server_key] = servers
+            else:
+                servers["code-review-graph"] = server_entry
+                existing[server_key] = servers
 
         if dry_run:
             print(f"  [dry-run] {plat['name']}: would write {config_path}")
@@ -1121,38 +1354,28 @@ def generate_codex_hooks_config(repo_root: Path) -> dict[str, Any]:
     }
 
 
-def install_git_hook(repo_root: Path) -> Path | None:
-    """Install a git pre-commit hook that prints a risk summary before each commit.
+# --- Git pre-commit hook ---------------------------------------------------
+#
+# The generated block is delimited by explicit begin/end markers, the same way
+# the managed instruction block is, so uninstall can cut out exactly what this
+# project wrote. Nothing may infer the block's extent from its contents: the
+# body nests an ``if``/``elif``/``else`` inside an outer ``if``, so any rule
+# based on shell keywords (for example "stop at the first ``fi``") leaves half
+# a block behind and turns the user's pre-commit hook into a syntax error.
 
-    Called automatically by ``code-review-graph install``.
-    The hooks directory is resolved via ``git rev-parse --git-path hooks`` so
-    the hook lands where git actually runs it — including linked worktrees
-    and submodules (where ``.git`` is a file, not a directory) and repos with
-    ``core.hooksPath`` set (issue #313). ``core.hooksPath`` users with their
-    own hook manager (husky, pre-commit) may prefer integrating the
-    ``code-review-graph`` commands into that manager manually instead.
+_GIT_HOOK_BEGIN_MARKER = "# >>> code-review-graph pre-commit hook >>>"
+_GIT_HOOK_END_MARKER = "# <<< code-review-graph pre-commit hook <<<"
 
-    Creates ``pre-commit`` if it doesn't exist, or appends to an existing
-    one — the hook is appended, not overwritten, preserving any hooks
-    already there. Falls back to the legacy ``.git/hooks`` resolution when
-    git itself is unavailable. Returns None when no hooks directory can be
-    determined. Exact generated legacy blocks are upgraded in place. The
-    installed hook skips automatic checks in linked worktrees, where an
-    implicit update could build a duplicate graph for a different branch;
-    ``CRG_HOOK_WORKTREES=1`` opts a worktree back in. Detection relies only
-    on ``git rev-parse --absolute-git-dir`` (Git 2.13), not on newer options.
-    """
-    legacy_script = """\
-#!/bin/sh
-# Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
-if command -v code-review-graph >/dev/null 2>&1; then
-    code-review-graph update || true
-    code-review-graph detect-changes --brief || true
-fi
-"""
-    script = """\
-#!/bin/sh
-# Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
+# The human-readable line every release of the block has carried. Kept because
+# it is the only thing an unmarked block written by an older release has in
+# common with the current one.
+_GIT_HOOK_NOTE = (
+    "# Installed by code-review-graph. Remove this file to disable pre-commit graph checks."
+)
+
+_GIT_HOOK_SHEBANG = "#!/bin/sh\n"
+
+_GIT_HOOK_BODY = """\
 if command -v code-review-graph >/dev/null 2>&1; then
     crg_hook_git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || crg_hook_git_dir=""
     crg_hook_root=$(git rev-parse --show-toplevel 2>/dev/null) || crg_hook_root=""
@@ -1169,8 +1392,94 @@ if command -v code-review-graph >/dev/null 2>&1; then
     fi
 fi
 """
-    marker = "code-review-graph detect-changes"
 
+_GIT_HOOK_BLOCK = (
+    f"{_GIT_HOOK_BEGIN_MARKER}\n{_GIT_HOOK_NOTE}\n{_GIT_HOOK_BODY}{_GIT_HOOK_END_MARKER}\n"
+)
+
+# Verbatim blocks shipped before the markers existed. Append-only, for the same
+# reason ``_legacy_instructions`` is: an entry dropped here is a block that can
+# no longer be upgraded or removed cleanly. Each is matched by its full text,
+# which is the only boundary an unmarked block has.
+_LEGACY_GIT_HOOK_BLOCKS: tuple[str, ...] = (
+    # The first released hook, before the linked-worktree guard (#313).
+    f"{_GIT_HOOK_NOTE}\n"
+    "if command -v code-review-graph >/dev/null 2>&1; then\n"
+    "    code-review-graph update || true\n"
+    "    code-review-graph detect-changes --brief || true\n"
+    "fi\n",
+    # The worktree-aware hook, shipped with no begin/end markers.
+    f"{_GIT_HOOK_NOTE}\n{_GIT_HOOK_BODY}",
+)
+
+
+def _known_git_hook_blocks() -> tuple[str, ...]:
+    """Every unmarked hook block this project has generated, longest first.
+
+    Longest first matters: a shorter variant contained in a longer one must
+    never win the match and strand the tail.
+    """
+    return tuple(sorted(set(_LEGACY_GIT_HOOK_BLOCKS), key=len, reverse=True))
+
+
+def _git_hook_block_span(text: str, start: int = 0) -> tuple[int, int] | None:
+    """Return ``(begin, end)`` offsets of one marked block, or None.
+
+    ``end`` is just past the block's trailing newline, so slicing the span out
+    leaves no blank line behind.
+    """
+    begin = text.find(_GIT_HOOK_BEGIN_MARKER, start)
+    if begin < 0:
+        return None
+    closing = text.find(_GIT_HOOK_END_MARKER, begin)
+    if closing < 0:
+        # Someone deleted the closing marker; guessing where the block stops is
+        # how user content gets eaten, so refuse.
+        return None
+    end = closing + len(_GIT_HOOK_END_MARKER)
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    return begin, end
+
+
+def _upgrade_git_hook_block(existing: str) -> str | None:
+    """Return ``existing`` with a block we wrote replaced by the current one.
+
+    Returns None when the hook carries our marker but no block this project
+    recognises, meaning it was hand-edited and must be left alone.
+    """
+    span = _git_hook_block_span(existing)
+    if span is not None:
+        begin, end = span
+        return existing[:begin] + _GIT_HOOK_BLOCK + existing[end:]
+    for block in _known_git_hook_blocks():
+        if block in existing:
+            return existing.replace(block, _GIT_HOOK_BLOCK, 1)
+    return None
+
+
+def install_git_hook(repo_root: Path) -> Path | None:
+    """Install a git pre-commit hook that prints a risk summary before each commit.
+
+    Called automatically by ``code-review-graph install``.
+    The hooks directory is resolved via ``git rev-parse --git-path hooks`` so
+    the hook lands where git actually runs it — including linked worktrees
+    and submodules (where ``.git`` is a file, not a directory) and repos with
+    ``core.hooksPath`` set (issue #313). ``core.hooksPath`` users with their
+    own hook manager (husky, pre-commit) may prefer integrating the
+    ``code-review-graph`` commands into that manager manually instead.
+
+    Creates ``pre-commit`` if it doesn't exist, or appends to an existing
+    one — the hook is appended, not overwritten, preserving any hooks
+    already there. Falls back to the legacy ``.git/hooks`` resolution when
+    git itself is unavailable. Returns None when no hooks directory can be
+    determined. A block written by any past release is upgraded in place, and
+    a hand-edited one is left alone. The installed hook skips automatic checks
+    in linked worktrees, where an implicit update could build a duplicate graph
+    for a different branch; ``CRG_HOOK_WORKTREES=1`` opts a worktree back in.
+    Detection relies only on ``git rev-parse --absolute-git-dir`` (Git 2.13),
+    not on newer options.
+    """
     hooks_dir: Path | None = None
     try:
         result = subprocess.run(
@@ -1203,20 +1512,83 @@ fi
 
     if hook_path.exists():
         existing = hook_path.read_text(encoding="utf-8")
-        if marker in existing:
-            # Upgrade only the exact block emitted by older CRG releases;
-            # custom hook logic and surrounding user commands remain intact.
-            if legacy_script not in existing:
+        if _GIT_HOOK_BEGIN_MARKER in existing or _GIT_HOOK_NOTE in existing:
+            # Upgrade only a block this project generated; custom hook logic
+            # and surrounding user commands remain intact.
+            upgraded = _upgrade_git_hook_block(existing)
+            if upgraded is None:
+                logger.warning(
+                    "%s has a hand-edited code-review-graph block; leaving it alone.",
+                    hook_path,
+                )
                 return hook_path
-            hook_path.write_text(existing.replace(legacy_script, script), encoding="utf-8")
+            if upgraded == existing:
+                logger.info("%s already holds the current hook block.", hook_path)
+                return hook_path
+            hook_path.write_text(upgraded, encoding="utf-8")
         else:
-            hook_path.write_text(existing.rstrip("\n") + "\n" + script, encoding="utf-8")
+            hook_path.write_text(
+                existing.rstrip("\n") + "\n" + _GIT_HOOK_BLOCK, encoding="utf-8"
+            )
     else:
-        hook_path.write_text(script, encoding="utf-8")
+        hook_path.write_text(_GIT_HOOK_SHEBANG + _GIT_HOOK_BLOCK, encoding="utf-8")
 
     hook_path.chmod(0o755)
     logger.info("Wrote git pre-commit hook: %s", hook_path)
     return hook_path
+
+
+# Every spelling this project has used inside a hook command: the console
+# script, the module, and the ``crg-`` prefix of the shell scripts it writes.
+_HOOK_COMMAND_MARKERS = ("code-review-graph", "code_review_graph", "crg-")
+
+
+def _is_generated_hook_command(command: Any) -> bool:
+    """Return whether ``command`` runs code-review-graph in some past shape."""
+    return isinstance(command, str) and any(
+        marker in command for marker in _HOOK_COMMAND_MARKERS
+    )
+
+
+def _merge_hook_entries(existing: Any, new_entries: list[Any]) -> list[Any]:
+    """Return ``existing`` with our own hook groups replaced by ``new_entries``.
+
+    Comparing whole entries (or exact command strings) only ever recognises the
+    hook the running version would write, so any change to the command left the
+    previous release's hook in place and appended a second one beside it, and
+    the repository then ran two code-review-graph hooks on one event. Ownership
+    is decided by the command instead, and a group that also holds a hook
+    someone else wrote keeps that hook.
+    """
+    kept: list[Any] = []
+    for group in existing if isinstance(existing, list) else []:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            kept.append(group)
+            continue
+        nested = group["hooks"]
+        survivors = [
+            hook
+            for hook in nested
+            if not (
+                isinstance(hook, dict) and _is_generated_hook_command(hook.get("command"))
+            )
+        ]
+        if not survivors:
+            continue  # the whole group was ours
+        if len(survivors) != len(nested):
+            group = {**group, "hooks": survivors}
+        kept.append(group)
+    return kept + list(new_entries)
+
+
+def _merge_flat_hook_entries(existing: Any, new_entries: list[Any]) -> list[Any]:
+    """The same replacement rule for a flat, one-level hook list (Cursor)."""
+    kept = [
+        hook
+        for hook in (existing if isinstance(existing, list) else [])
+        if not (isinstance(hook, dict) and _is_generated_hook_command(hook.get("command")))
+    ]
+    return kept + list(new_entries)
 
 
 def _merge_hooks_into_settings(
@@ -1245,11 +1617,9 @@ def _merge_hooks_into_settings(
     merged_hooks = dict(existing_hooks)
     for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
         if isinstance(merged_hooks.get(hook_name), list):
-            merged_list = list(merged_hooks[hook_name])
-            for entry in hook_entries:
-                if entry not in merged_list:
-                    merged_list.append(entry)
-            merged_hooks[hook_name] = merged_list
+            merged_hooks[hook_name] = _merge_hook_entries(
+                merged_hooks[hook_name], hook_entries
+            )
         else:
             merged_hooks[hook_name] = hook_entries
 
@@ -1329,23 +1699,9 @@ def install_codex_hooks(repo_root: Path) -> Path:
     merged_hooks = dict(existing_hooks)
     for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
         if isinstance(merged_hooks.get(hook_name), list):
-            merged_list = list(merged_hooks[hook_name])
-            existing_commands = {
-                hook.get("command", "")
-                for entry in merged_list
-                if isinstance(entry, dict)
-                for hook in entry.get("hooks", [])
-                if isinstance(hook, dict)
-            }
-            for entry in hook_entries:
-                entry_commands = [
-                    hook.get("command", "")
-                    for hook in entry.get("hooks", [])
-                    if isinstance(hook, dict)
-                ]
-                if not any(command in existing_commands for command in entry_commands):
-                    merged_list.append(entry)
-            merged_hooks[hook_name] = merged_list
+            merged_hooks[hook_name] = _merge_hook_entries(
+                merged_hooks[hook_name], hook_entries
+            )
         else:
             merged_hooks[hook_name] = hook_entries
 
@@ -1691,41 +2047,25 @@ exit 0
     def _ensure_group(
         event_name: str, matcher: str, hook_command: str, name: str, timeout: int,
     ) -> None:
+        # Replace whatever shape a previous release wrote for this event rather
+        # than appending a second code-review-graph hook beside it.
         arr = hooks_obj.get(event_name, [])
-        if not isinstance(arr, list):
-            arr = []
-
-        # De-duplicate by command (and type) inside nested hooks list.
-        def _group_has_command(group: Any) -> bool:
-            if not isinstance(group, dict):
-                return False
-            nested = group.get("hooks", [])
-            if not isinstance(nested, list):
-                return False
-            for h in nested:
-                if isinstance(h, dict) and h.get("type") == "command" \
-                        and h.get("command") == hook_command:
-                    return True
-            return False
-
-        if any(_group_has_command(g) for g in arr):
-            hooks_obj[event_name] = arr
-            return
-
-        arr.append(
-            {
-                "matcher": matcher,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": hook_command,
-                        "name": name,
-                        "timeout": timeout,
-                    }
-                ],
-            }
+        hooks_obj[event_name] = _merge_hook_entries(
+            arr,
+            [
+                {
+                    "matcher": matcher,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "name": name,
+                            "timeout": timeout,
+                        }
+                    ],
+                }
+            ],
         )
-        hooks_obj[event_name] = arr
 
     _ensure_group(
         event_name="SessionStart",
@@ -2006,15 +2346,11 @@ def install_cursor_hooks() -> Path:
         existing_hooks = {}
 
     for event, entries in new_config["hooks"].items():
-        event_hooks = existing_hooks.get(event, [])
-        if not isinstance(event_hooks, list):
-            event_hooks = []
-        # De-duplicate: skip if a hook with the same command already exists
-        existing_commands = {h.get("command", "") for h in event_hooks if isinstance(h, dict)}
-        for entry in entries:
-            if entry["command"] not in existing_commands:
-                event_hooks.append(entry)
-        existing_hooks[event] = event_hooks
+        # Cursor's schema is one flat list per event. Replace our own hooks
+        # instead of keeping a previous release's command beside the new one.
+        existing_hooks[event] = _merge_flat_hook_entries(
+            existing_hooks.get(event, []), entries
+        )
 
     existing["hooks"] = existing_hooks
 

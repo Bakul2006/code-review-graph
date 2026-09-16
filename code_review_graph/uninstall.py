@@ -28,9 +28,8 @@ _tomllib: Any = importlib.import_module(
 )
 
 _ENTRY_NAME = "code-review-graph"
-_GIT_HOOK_MARKER = (
-    "# Installed by code-review-graph. Remove this file to disable pre-commit graph checks."
-)
+# Sourced from the installer so the two can never drift apart.
+_GIT_HOOK_MARKER = skills._GIT_HOOK_NOTE
 _GITIGNORE_BANNER = "# Added by code-review-graph"
 
 
@@ -938,6 +937,29 @@ def _resolve_git_hook(repo_root: Path) -> Path:
     return repo_root / ".git" / "hooks" / "pre-commit"
 
 
+def _strip_git_hook_blocks(raw: str) -> tuple[str, bool]:
+    """Cut out every pre-commit block this project has ever written.
+
+    Marked blocks are removed between their begin and end markers; blocks from
+    releases that predate the markers are matched by their full recorded text,
+    longest first. Nothing infers a block's extent from the shell inside it:
+    the body nests an ``if``/``elif``/``else`` in an outer ``if``, so a rule
+    such as "stop at the first ``fi``" leaves the outer ``fi`` behind and the
+    hook becomes a syntax error that breaks every later ``git commit``.
+    """
+    text = raw
+    removed = False
+    while (span := skills._git_hook_block_span(text)) is not None:
+        begin, end = span
+        text = text[:begin] + text[end:]
+        removed = True
+    for block in skills._known_git_hook_blocks():
+        while block in text:
+            text = text.replace(block, "", 1)
+            removed = True
+    return text, removed
+
+
 def _remove_git_hook(
     repo_root: Path,
     report: UninstallReport,
@@ -946,23 +968,31 @@ def _remove_git_hook(
 ) -> None:
     path = _resolve_git_hook(repo_root)
     if not path.exists() or not _safe_path(path, repo_root, report):
+        # A symlinked or out-of-boundary hook is reported by ``_safe_path`` and
+        # left exactly as it is; rewriting through a link is not ours to do.
         return
     raw = _read_text(path, report)
-    if raw is None or _GIT_HOOK_MARKER not in raw:
+    if raw is None:
         return
-    lines = raw.splitlines(keepends=True)
-    rewritten: list[str] = []
-    dropping = False
-    for line in lines:
-        if _GIT_HOOK_MARKER in line:
-            dropping = True
-            continue
-        if dropping:
-            if line.strip() == "fi":
-                dropping = False
-            continue
-        rewritten.append(line)
-    new_text = "".join(rewritten).rstrip() + "\n"
+    if _GIT_HOOK_MARKER not in raw and skills._GIT_HOOK_BEGIN_MARKER not in raw:
+        # The hook is entirely the user's own.
+        return
+
+    new_text, removed = _strip_git_hook_blocks(raw)
+    if not removed:
+        report.skipped_paths.append(
+            f"{path} (marked pre-commit block differs from a known installed block; "
+            "left unchanged)"
+        )
+        return
+    if _GIT_HOOK_MARKER in new_text or skills._GIT_HOOK_BEGIN_MARKER in new_text:
+        # One block was generated and another was edited by hand. Take out what
+        # this project owns and name the file so the user can deal with the rest.
+        report.skipped_paths.append(
+            f"{path} (a further marked pre-commit block differs from a known "
+            "installed block; left unchanged)"
+        )
+
     meaningful = [
         line
         for line in new_text.splitlines()
@@ -971,7 +1001,7 @@ def _remove_git_hook(
     if meaningful:
         _write_text(
             path,
-            new_text,
+            new_text.rstrip("\n") + "\n",
             report,
             detail="removed code-review-graph hook block",
             dry_run=dry_run,
