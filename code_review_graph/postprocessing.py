@@ -83,6 +83,9 @@ def _resolve_bare_endpoints(
         result["cpp_scoped_edges_resolved"] = (
             store.resolve_cpp_scoped_call_targets()
         )
+        # Resolvers rewrite bare targets into qualified ones, so the stored
+        # certainty column is only correct once they have all run.
+        store.refresh_target_resolution()
     except sqlite3.OperationalError as e:
         logger.warning("Call-target resolution failed: %s", e)
         warnings.append(

@@ -262,6 +262,61 @@ def _migrate_v10(conn: sqlite3.Connection) -> None:
     logger.info("Migration v10: added indexed nodes.symbol column")
 
 
+# SQL that classifies one CALLS/REFERENCES edge by whether its target names a
+# node the graph actually indexed. Kept here and imported by graph.py so the
+# migration backfill, the post-build refresh and the read-path fallback can
+# never drift apart.
+TARGET_RESOLUTION_KINDS = ("CALLS", "REFERENCES")
+
+_TARGET_RESOLUTION_TEMPLATE = (
+    "CASE WHEN EXISTS (SELECT 1 FROM nodes crg_res_n "
+    "WHERE crg_res_n.qualified_name = {alias}.target_qualified) "
+    "THEN 'direct' ELSE 'unresolved' END"
+)
+
+# Only these two spellings of the edges table may be interpolated, so no
+# caller-supplied string ever reaches the SQL text.
+_ALLOWED_EDGE_ALIASES = frozenset({"edges", "e"})
+
+
+def target_resolution_expr(alias: str = "edges") -> str:
+    """Return the classification expression bound to one ``edges`` alias."""
+    if alias not in _ALLOWED_EDGE_ALIASES:
+        raise ValueError(f"Unsupported edges alias: {alias!r}")
+    return _TARGET_RESOLUTION_TEMPLATE.format(alias=alias)
+
+
+TARGET_RESOLUTION_EXPR = target_resolution_expr()
+
+
+def _migrate_v11(conn: sqlite3.Connection) -> None:
+    """v11: Add the indexed ``edges.target_resolution`` column.
+
+    A CALLS edge either points at an indexed node or carries a bare name that
+    the read path can only match by name, subject to a receiver-evidence
+    check. Both kinds lived in one undifferentiated pile, so an answer could
+    not say how much of itself was certain. Storing the classification makes
+    the split an indexed group-by rather than a scan that re-derives it, and
+    lets impact analysis exclude the guessed hops.
+
+    ``IMPORTS_FROM`` and the other kinds keep NULL: their targets are file
+    paths and module names, for which "unresolved" would be a false claim.
+    """
+    if not _has_column(conn, "edges", "target_resolution"):
+        conn.execute("ALTER TABLE edges ADD COLUMN target_resolution TEXT")
+    placeholders = ", ".join("?" for _ in TARGET_RESOLUTION_KINDS)
+    conn.execute(
+        f"UPDATE edges SET target_resolution = {TARGET_RESOLUTION_EXPR} "  # noqa: S608
+        f"WHERE kind IN ({placeholders})",
+        TARGET_RESOLUTION_KINDS,
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_edges_kind_target_resolution "
+        "ON edges(kind, target_resolution)"
+    )
+    logger.info("Migration v11: added indexed edges.target_resolution column")
+
+
 # ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
@@ -276,6 +331,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_v8,
     9: _migrate_v9,
     10: _migrate_v10,
+    11: _migrate_v11,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())

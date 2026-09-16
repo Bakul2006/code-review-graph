@@ -484,3 +484,77 @@ code_review_graph/communities.py` and that everyone uses the same `CRG_LEIDEN_SE
 **Different `naive_corpus_tokens` from the canonical table**: `git rev-parse HEAD` inside
 `evaluate/test_repos/<name>` must match the `commit:` field of the config. If not, delete
 the clone and let Step 2 re-clone at the pinned SHA.
+
+## The real-repository parser corpus
+
+Every other parser test writes a small fixture that exercises one construct. A regression
+that only shows on real code — a resolver that stops resolving, an ignore rule that swallows
+a source tree, a grammar that raises on a real file — passes all of them. `pytest -m corpus`
+builds the graph over eight projects pinned to exact commits and compares twelve measured
+properties against `tests/corpus_baselines.json`.
+
+```bash
+pytest -m corpus -q                         # run the check
+CRG_CORPUS_CACHE=~/.cache/crg-corpus \
+  pytest -m corpus -q                       # keep the clones between runs
+python -m tests.real_repo_corpus            # list the pins
+python -m tests.real_repo_corpus --record   # re-record after an intentional change
+```
+
+The normal suite skips it: `tests/conftest.py` skips every `corpus`-marked item unless the
+run's `-m` expression names the marker, so neither `pytest tests/` nor CI's `-m "not browser"`
+job pays for it. Clones are shallow single-commit fetches (~115 MB total). A cold run takes
+about 1 minute on a warm network and roughly 40 seconds once the clones are cached; budget a
+few minutes on CI hardware.
+
+`fastapi` and `gin` reuse the pins in `code_review_graph/eval/configs/`, so the project keeps
+one answer to "which commit of fastapi do we measure". `tests/test_real_repo_corpus_guard.py`
+fails if those two ever drift apart.
+
+### Initial baseline
+
+Measured on macOS 15 (Apple silicon), CPython 3.13.
+
+| Repo | Language | Commit | Files | Nodes | Edges | Resolved edges | Resolved imports | Parse errors | Files with no node | Dangling CONTAINS | Build |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fastapi | python | `22381558` | 1179 | 6287 | 32613 | 51.1% | 47.6% | 0 | 51 | 0 | 5.4s |
+| gin | go | `5c00df8a` | 109 | 1591 | 17266 | 51.4% | 0.0% | 0 | 11 | 1 | 2.5s |
+| zod | typescript | `59bbc03e` | 534 | 7082 | 98833 | 52.9% | 43.4% | 0 | 11 | 0 | 13.9s |
+| gson | java | `854c8255` | 272 | 4125 | 47564 | 52.5% | 14.6% | 0 | 8 | 693 | 10.7s |
+| newtonsoft-json | csharp | `09bb545d` | 952 | 9094 | 76052 | 60.1% | 0.0% | 0 | 2 | 486 | 20.6s |
+| ripgrep | rust | `3fce3b5b` | 125 | 3518 | 29256 | 46.1% | 22.4% | 0 | 5 | 17 | 3.5s |
+| sinatra | ruby | `cb22afd7` | 157 | 1224 | 14647 | 19.7% | 0.0% | 0 | 10 | 615 | 2.1s |
+| guzzle | php | `93939470` | 141 | 3221 | 43443 | 57.6% | 45.1% | 0 | 4 | 0 | 6.5s |
+
+Counts are deterministic: two recording runs on the same machine produced identical numbers
+for every column except `Build`.
+
+### How the bands were chosen
+
+A pinned commit parsed by a fixed build has no measurement noise, so the bands do not model
+noise. They model how much intentional change the project may make before someone has to
+re-record. The tolerances live in the `bands` block of `tests/corpus_baselines.json` so a
+widened band shows up in a diff like any other change.
+
+| Property | Band | Why |
+|---|---|---|
+| `files_parsed`, `file_nodes` | -2% / +25% | The inventory of a fixed commit moves only when the ignore rules or the supported-extension list change. -2% is "must not lose files"; +25% leaves room for a newly supported extension. |
+| `total_nodes` | -8% / +40% | -8% is several hundred nodes on every repo here, far outside any legitimate tidy-up. +40% admits a whole new node kind without a forced re-record while still catching runaway duplication. |
+| `total_edges` | -10% / +50% | Wider in both directions because resolvers routinely trade edges for precision. -10% still means one relationship in ten stopped being recorded. |
+| `resolved_edge_share`, `imports_resolved_share` | floor at baseline -5pp | A floor in percentage points, not a ratio, so a repo near 0.20 and one near 0.60 get the same absolute protection. 5pp is roughly a thousand edges on the larger repos. |
+| `parse_errors`, `files_without_nodes`, `dangling_contains_edges` | ceiling at the recorded value | These are all "the build silently lost something". They may fall, never rise. |
+| `control_char_names` | must be 0 | A security invariant, not a trend. |
+| `build_seconds` | `max(3x, +20s)` | Wall clock varies with the machine. 3x catches a quadratic resolver; the +20s term keeps the sub-2-second repos from failing on scheduler noise. |
+| `primary_language_present` | must hold | A dropped extension mapping otherwise looks like a small node-count change. |
+
+### Reading a failure
+
+Each failure names the property, the recorded value, the measured value, the delta and the
+band. Dropping `".go": "go"` from the parser's extension map produces:
+
+```text
+gin (go) @ 5c00df8afadd: 6 of 12 properties moved out of band
+  - files_parsed fell below its band: baseline=109 measured=11 delta=-98 (-89.9%), allowed [106.8, 136.2] (x0.98..x1.25)
+  - total_nodes fell below its band: baseline=1591 measured=0 delta=-1591 (-100.0%), allowed [1463.7, 2227.4] (x0.92..x1.4)
+  - primary_language_present dropped: baseline=1 measured=0 delta=-1. gin is a go project but the graph holds languages []
+```
