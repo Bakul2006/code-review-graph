@@ -93,8 +93,9 @@ class NeighbourhoodSpec:
         depth: Hops to include in the payload.
         render_depth: Hops drawn before the user expands; defaults to
             ``min(DEFAULT_RENDER_DEPTH, depth)``.
-        max_nodes: Hard cap on payload nodes; the outermost hop is trimmed
-            first.
+        max_nodes: Hard cap on payload nodes.  The outermost hop is trimmed
+            first, and the seed set itself is trimmed once the outer hops are
+            gone -- the cap is a cap, not a suggestion.
     """
 
     symbols: tuple[str, ...] = ()
@@ -129,6 +130,13 @@ class NeighbourhoodSpec:
         if self.render_depth is not None and self.render_depth < 0:
             raise ValueError(
                 f"render-depth must be >= 0, got {self.render_depth}"
+            )
+        if self.render_depth is not None and self.render_depth > self.depth:
+            # Drawing hop 3 of a payload that stops at hop 2 asks for nodes
+            # that were never exported.  Silently clamping it hid the typo.
+            raise ValueError(
+                f"render-depth {self.render_depth} exceeds depth "
+                f"{self.depth}; the payload stops at hop {self.depth}"
             )
         if self.max_nodes < 1:
             raise ValueError(f"max-nodes must be >= 1, got {self.max_nodes}")
@@ -400,33 +408,56 @@ def _select_within_budget(
     degrees: dict[str, int],
     parents: dict[str, str],
     max_nodes: int,
+    pinned: Sequence[str] = (),
 ) -> tuple[dict[str, int], bool]:
-    """Pick the payload node set, dropping the outermost hop first.
+    """Pick the payload node set, never returning more than *max_nodes* nodes.
 
     A symbol costs its own slot plus, the first time it appears, a slot for
     the ``File`` that contains it, because the renderer needs that File for
     clustering and collapse.  The budget therefore has to be applied to the
-    *final* set, not to the semantic hop set alone.
+    *final* set, not to the semantic hop set alone.  When a symbol fits but
+    the pair does not, the symbol is kept and its File is given up: the File
+    is a rendering nicety, the symbol is the thing the reviewer asked for.
 
-    Hop 0 (the seeds, and any path the user asked for) is never dropped, even
-    when it alone exceeds the cap: a view that hides its own seed answers
-    nothing.  Beyond hop 0, nodes are taken nearest-first, best-connected
-    first within a hop, ties broken by name so the output is deterministic.
+    *pinned* nodes (the answer to a path query, which is the whole point of
+    that query) are placed first, bare, so no other node's containing File
+    can crowd the answer out of its own view; the caller refuses a budget
+    smaller than the path before it gets here.  Everything else is ranked
+    nearest-hop first, then best-connected first by whole-graph degree, ties
+    broken by name so the output is deterministic.  Hop 0 is ranked first but
+    is **not** exempt: on ``--seed-changed`` the seed set is the large thing,
+    so exempting it made ``--max-nodes`` do nothing exactly when it was
+    needed.  A seed that does not fit is dropped like any other node, and the
+    caller reports how many.
     """
+    selected: dict[str, int] = {}
+    truncated = False
+    for qualified_name in pinned:
+        if len(selected) >= max_nodes:
+            truncated = True
+            break
+        if qualified_name in hops and qualified_name not in selected:
+            selected[qualified_name] = hops[qualified_name]
     ordered = sorted(
         hops.items(),
         key=lambda item: (item[1], -degrees.get(item[0], 0), item[0]),
     )
-    selected: dict[str, int] = {}
-    truncated = False
     for qualified_name, distance in ordered:
-        addition = {qualified_name}
+        already = qualified_name in selected
+        if already and selected[qualified_name] > distance:
+            selected[qualified_name] = distance
+        addition = [] if already else [qualified_name]
         parent = parents.get(qualified_name)
         if parent is not None and parent not in selected:
-            addition.add(parent)
-        if distance > 0 and len(selected) + len(addition) > max_nodes:
-            truncated = True
+            addition.append(parent)
+        if not addition:
             continue
+        if len(selected) + len(addition) > max_nodes:
+            if len(addition) > 1 and len(selected) + 1 <= max_nodes:
+                addition = [qualified_name]
+            else:
+                truncated = True
+                continue
         for member in addition:
             previous = selected.get(member)
             if previous is None or previous > distance:
@@ -482,6 +513,15 @@ def extract(data: dict, spec: NeighbourhoodSpec) -> dict:
     # Preserve first-seen order while de-duplicating.
     seeds = list(dict.fromkeys(seeds))
 
+    # A path query whose own answer does not fit the budget cannot be
+    # satisfied at all: say so rather than shipping half a path.
+    if len(path) > spec.max_nodes:
+        raise ValueError(
+            f"max-nodes {spec.max_nodes} is below the {len(path)} nodes on "
+            f"the path from {_sanitize_name(path[0])} to "
+            f"{_sanitize_name(path[-1])}; raise it to at least {len(path)}"
+        )
+
     adjacency = build_adjacency(edges, exclude=STRUCTURAL_EDGE_KINDS)
     hops = hop_distances(adjacency, seeds, spec.depth)
 
@@ -494,9 +534,16 @@ def extract(data: dict, spec: NeighbourhoodSpec) -> dict:
     # work.  They are rendered, not traversed, so they carry the hop of their
     # closest member.
     parents = _parent_files(edges, set(hops))
-    hops, truncated = _select_within_budget(hops, degrees, parents, spec.max_nodes)
+    hops, truncated = _select_within_budget(
+        hops, degrees, parents, spec.max_nodes, pinned=path
+    )
 
     selected = set(hops)
+    # The cap can eat into the seed set itself. Report that rather than let a
+    # "neighbourhood of the changed files" quietly cover a third of them.
+    seeds_requested = len(seeds)
+    seeds = [seed for seed in seeds if seed in selected]
+    seeds_dropped = seeds_requested - len(seeds)
     # One record per qualified name. The exporter de-duplicates on the raw
     # name but emits the _sanitize_name-truncated one, so two nodes whose
     # paths differ only past 256 characters reach here as a duplicate key --
@@ -538,6 +585,8 @@ def extract(data: dict, spec: NeighbourhoodSpec) -> dict:
         "mode": "neighbourhood",
         "neighbourhood": {
             "seeds": seeds,
+            "seeds_requested": seeds_requested,
+            "seeds_dropped": seeds_dropped,
             "seed_kind": seed_kind,
             "seed_query": [
                 _sanitize_name(q)

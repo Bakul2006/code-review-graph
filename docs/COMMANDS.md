@@ -439,7 +439,7 @@ code-review-graph visualize --seed-changed --seed-changed-base origin/main
 code-review-graph visualize --seed-flow "login request"     # an execution flow
 code-review-graph visualize --path-from login --path-to audit_log
 code-review-graph visualize --seed-symbol login --render-depth 0  # expand on click
-code-review-graph visualize --seed-symbol login --max-nodes 300
+code-review-graph visualize --seed-symbol login --max-nodes 300  # hard cap
 code-review-graph visualize --seed-symbol login --sidecar   # payload in graph.data.js
 
 # Analysis
@@ -530,6 +530,21 @@ Notes:
 - The default output is still a single self-contained `graph.html` you can
   email. `--sidecar` moves the payload into `graph.data.js` next to it, which
   is only worth it for a large neighbourhood.
+- `--max-nodes` (default 1500) is a hard cap on the nodes in the payload, not
+  a hint. The outermost hop goes first; once the outer hops are gone the seed
+  set itself is trimmed, best-connected first by whole-graph degree, ties
+  broken by name so two runs of the same command agree. A `--seed-changed`
+  run over a large review is exactly the case where the seed set is the large
+  thing, so the command prints how many seed nodes it dropped and the page
+  says so too. The nodes on a `--path-from/--path-to` answer are placed
+  first and are never dropped; a `--max-nodes` below the path length is
+  refused rather than half-answered.
+- Flag combinations that cannot mean anything are refused, not ignored:
+  `--seed-changed-base` without `--seed-changed`; `--depth`, `--render-depth`
+  or `--max-nodes` without a seed; any seed or tuning flag with a
+  non-`html` `--format`; `--sidecar` with a non-`html` `--format`;
+  `--mode community` or `--mode file` with a seed (they aggregate, which is
+  the opposite of a neighbourhood); and a `--render-depth` above `--depth`.
 - `install` appends a Git `pre-commit` hook that prints a risk summary before
   each commit. The hook skips linked worktrees unless `CRG_HOOK_WORKTREES=1`
   is set, so a worktree does not build a second graph for another branch.

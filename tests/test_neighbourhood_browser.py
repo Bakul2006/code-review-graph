@@ -54,6 +54,7 @@ RING3 = [f"src/far.py::z{i}" for i in range(1, 21)]
 
 LAYOUT_TIMEOUT_MS = 60_000
 PATH_STROKE = "#f2cc60"
+MANY_SEEDS = ["src/seed.py", "src/ring1.py", "src/ring2.py", "src/far.py"]
 
 
 def _node(kind: str, name: str, file_path: str, line: int) -> NodeInfo:
@@ -112,7 +113,7 @@ class _QuietHandler(SimpleHTTPRequestHandler):
 
 @pytest.fixture(scope="module")
 def neighbourhood_site(tmp_path_factory):
-    """Serve a depth-2 neighbourhood page and a path-query page."""
+    """Serve a depth-2 neighbourhood page, a path page and a many-seed page."""
     root = tmp_path_factory.mktemp("nb-browser")
     store = _build_store(root / "graph.db")
     try:
@@ -128,6 +129,14 @@ def neighbourhood_site(tmp_path_factory):
             path_to=RING2[5],
             depth=0,
         )
+        # What --seed-changed produces on a review that touched every file.
+        (root / "many").mkdir()
+        generate_html(
+            store,
+            root / "many" / "graph.html",
+            seed_files=MANY_SEEDS,
+            depth=1,
+        )
     finally:
         store.close()
 
@@ -137,7 +146,10 @@ def neighbourhood_site(tmp_path_factory):
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        yield {name: f"{base}/{name}/graph.html" for name in ("hood", "path")}
+        yield {
+            name: f"{base}/{name}/graph.html"
+            for name in ("hood", "path", "many")
+        }
     finally:
         server.shutdown()
         server.server_close()
@@ -303,6 +315,52 @@ def test_existing_interaction_surface_still_works(chromium, neighbourhood_site):
         page.locator('#filter-panel input[data-kind="Function"]').uncheck()
         page.wait_for_timeout(200)
         assert "Function: entry" not in _labels(page)
+        assert errors == [], errors
+    finally:
+        page.close()
+
+
+def test_the_bar_truncates_a_many_seed_run(chromium, neighbourhood_site):
+    """A --seed-changed page must not paint every seed path across the graph."""
+    page, errors = _open(chromium, neighbourhood_site["many"])
+    try:
+        bar = page.locator("#nb-bar")
+        assert bar.is_visible()
+        shown = page.locator("#nb-bar .nb-seed").inner_text()
+        assert shown.count(",") == 2, f"three seeds, not {shown}"
+        assert "src/far.py" not in shown, "the fourth is behind the toggle"
+        toggle = page.locator("#nb-seed-toggle")
+        assert toggle.inner_text() == "+1 more"
+        assert page.locator("#nb-seed-list").is_visible() is False
+        assert errors == [], errors
+    finally:
+        page.close()
+
+
+def test_the_full_seed_list_is_one_click_away(chromium, neighbourhood_site):
+    page, errors = _open(chromium, neighbourhood_site["many"])
+    try:
+        toggle = page.locator("#nb-seed-toggle")
+        assert toggle.get_attribute("aria-expanded") == "false"
+        toggle.click()
+        listing = page.locator("#nb-seed-list")
+        assert listing.is_visible()
+        assert listing.locator("li").count() == len(MANY_SEEDS)
+        assert "src/far.py" in listing.inner_text()
+        assert toggle.get_attribute("aria-expanded") == "true"
+        toggle.click()
+        assert listing.is_visible() is False
+        assert errors == [], errors
+    finally:
+        page.close()
+
+
+def test_a_single_seed_needs_no_disclosure(chromium, neighbourhood_site):
+    page, errors = _open(chromium, neighbourhood_site["hood"])
+    try:
+        assert page.locator("#nb-bar").is_visible()
+        assert page.locator("#nb-seed-toggle").count() == 0
+        assert page.locator("#nb-seed-list").count() == 0
         assert errors == [], errors
     finally:
         page.close()

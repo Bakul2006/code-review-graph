@@ -212,8 +212,11 @@ def export_graph_data(
         path_to: End symbol of a shortest-path query.
         depth: Hops of context to include around the seeds.
         render_depth: Hops drawn before the user expands on click.
-        max_nodes: Hard cap on payload nodes; the outermost hop is trimmed
-            first, and the seeds are never trimmed.
+        max_nodes: Hard cap on payload nodes. The outermost hop is trimmed
+            first; once the outer hops are gone the seed set is trimmed too,
+            lowest whole-graph degree first, so the cap always holds. The
+            returned ``"neighbourhood"`` block reports ``seeds_requested``
+            and ``seeds_dropped``.
 
     Raises:
         SeedResolutionError: when a seed matches no node in the graph.
@@ -557,6 +560,7 @@ def generate_html(
     depth: int = DEFAULT_DEPTH,
     render_depth: int | None = None,
     max_nodes: int = DEFAULT_MAX_NODES,
+    report: dict | None = None,
     sidecar: bool = False,
 ) -> Path:
     """Generate a self-contained interactive HTML visualization.
@@ -580,7 +584,11 @@ def generate_html(
         path_to: End symbol of a shortest-path query.
         depth: Hops of context around the seeds.
         render_depth: Hops drawn before the user expands on click.
-        max_nodes: Hard cap on payload nodes.
+        max_nodes: Hard cap on payload nodes, seeds included.
+        report: Optional dict filled in with the neighbourhood summary
+            (``seeds``, ``seeds_requested``, ``seeds_dropped``, ``truncated``,
+            ``max_nodes``, ``node_count``) so a caller can report a trimmed
+            seed set without re-exporting the graph.
         sidecar: Write the payload to a ``<name>.data.js`` file next to the
             page instead of inlining it.  Opt-in: the default is still one
             self-contained file you can email.
@@ -599,6 +607,12 @@ def generate_html(
         render_depth=render_depth,
         max_nodes=max_nodes,
     ).validate()
+    if spec.is_active and mode not in ("auto", "full"):
+        raise ValueError(
+            f"mode={mode!r} aggregates the graph into bubbles, which is the "
+            "opposite of a seeded neighbourhood; use mode='full' (or drop "
+            "the seed to draw the whole repository that way)"
+        )
     if stats.total_nodes > 50000 and not spec.is_active:
         logger.warning(
             "Graph has %d nodes — visualization may be slow. "
@@ -616,18 +630,25 @@ def generate_html(
         render_depth=render_depth,
         max_nodes=max_nodes,
     )
+    if report is not None:
+        block = data.get("neighbourhood", {})
+        report.update({
+            "seeds": len(block.get("seeds", [])),
+            "seeds_requested": block.get("seeds_requested", 0),
+            "seeds_dropped": block.get("seeds_dropped", 0),
+            "truncated": bool(block.get("truncated", False)),
+            "max_nodes": block.get("max_nodes", max_nodes),
+            "node_count": len(data["nodes"]),
+        })
 
     # Determine effective mode
     effective_mode = mode
     if spec.is_active:
         # A neighbourhood never aggregates: the whole point is to keep the
         # individual symbols a reviewer needs, and the payload is already
-        # bounded by *depth* and *max_nodes*.
-        if mode not in ("auto", "full"):
-            logger.info(
-                "seeded neighbourhood ignores mode=%s and renders every node",
-                mode,
-            )
+        # bounded by *depth* and *max_nodes*.  An aggregating mode asks for
+        # the opposite of what the seed asked for, so it is refused rather
+        # than silently overridden.
         effective_mode = "full"
     elif effective_mode == "auto":
         effective_mode = _resolve_auto_mode(
@@ -750,9 +771,24 @@ __SIDECAR_SCRIPT__
     max-width: calc(100% - 32px); flex-wrap: wrap;
   }
   #nb-bar.visible { display: flex; }
-  #nb-bar .nb-seed { color: #e6edf3; font-weight: 600; }
+  #nb-bar .nb-seed {
+    color: #e6edf3; font-weight: 600;
+    max-width: 46vw; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   #nb-bar .nb-meta { color: #9eaab6; }
   #nb-bar .nb-warn { color: #f0883e; }
+  /* The full seed list is an interaction, not the default: a --seed-changed
+     run has hundreds of paths and painting them all buries the graph. */
+  #nb-seed-list {
+    flex-basis: 100%; max-height: 180px; overflow-y: auto; list-style: none;
+    margin: 2px 0 0; padding: 6px 2px 0; border-top: 1px solid #30363d;
+    color: #c9d1d9; font-size: 11px; line-height: 1.7;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #nb-seed-list li {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   #nb-bar button {
     background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
     border-radius: 6px; padding: 3px 9px; cursor: pointer; font-size: 12px;
@@ -1427,14 +1463,29 @@ function applyPathHighlight() {
   nodeGroup.selectAll("g.node-g").select(".node-shape")
     .attr("stroke", nodeStroke).attr("stroke-width", nodeStrokeWidth);
 }
+// The seed list can be one symbol or, on --seed-changed, every path in the
+// diff. Show the same three the console shows, count the rest, and keep the
+// full list one click away instead of painting it across the graph.
+var NB_SEEDS_SHOWN = 3;
+var nbSeedListOpen = false;
+function nbSeedEntries() {
+  if (!neighbourhood) return [];
+  var q = neighbourhood.seed_query || [];
+  return q.length ? q : (neighbourhood.seeds || []);
+}
 function nbRenderBar() {
   var bar = document.getElementById("nb-bar");
   if (!neighbourhood) return;
   var shownCount = nodes.filter(function(n) { return nbShown(n.qualified_name); }).length;
-  var seedLabel = (neighbourhood.seed_query || []).join(", ")
-    || (neighbourhood.seeds || []).slice(0, 2).join(", ")
-    || "neighbourhood";
-  var h = '<span class="nb-seed">' + escH(seedLabel) + '</span>';
+  var entries = nbSeedEntries();
+  var overflow = Math.max(0, entries.length - NB_SEEDS_SHOWN);
+  var seedLabel = entries.slice(0, NB_SEEDS_SHOWN).join(", ") || "neighbourhood";
+  var h = '<span class="nb-seed" title="' + escH(seedLabel) + '">' + escH(seedLabel) + "</span>";
+  if (overflow > 0) {
+    h += '<button id="nb-seed-toggle" type="button" aria-controls="nb-seed-list"'
+      + ' aria-expanded="' + (nbSeedListOpen ? "true" : "false") + '">'
+      + "+" + overflow + " more</button>";
+  }
   h += '<span class="nb-meta">hop ' + nbVisibleDepth + " of " + neighbourhood.depth
     + " \u00b7 " + shownCount + " of " + nodes.length + " loaded"
     + " \u00b7 " + neighbourhood.total_nodes + " in repo</span>";
@@ -1443,9 +1494,23 @@ function nbRenderBar() {
     h += '<span class="nb-meta">path: ' + nbPathList.length + " nodes"
       + (neighbourhood.path_directed ? "" : " (undirected)") + "</span>";
   }
-  if (neighbourhood.truncated) h += '<span class="nb-warn">trimmed to ' + neighbourhood.max_nodes + " nodes</span>";
+  if (neighbourhood.seeds_dropped) {
+    h += '<span class="nb-warn">' + neighbourhood.seeds_dropped + " of "
+      + neighbourhood.seeds_requested + " seeds dropped for --max-nodes "
+      + neighbourhood.max_nodes + "</span>";
+  } else if (neighbourhood.truncated) {
+    h += '<span class="nb-warn">trimmed to ' + neighbourhood.max_nodes + " nodes</span>";
+  }
   h += '<button id="nb-expand" type="button">+1 hop</button>';
   h += '<button id="nb-reset" type="button">Reset</button>';
+  if (overflow > 0) {
+    h += '<ul id="nb-seed-list" aria-label="All neighbourhood seeds"'
+      + (nbSeedListOpen ? "" : " hidden") + ">";
+    for (var si = 0; si < entries.length; si++) {
+      h += "<li>" + escH(entries[si]) + "</li>";
+    }
+    h += "</ul>";
+  }
   bar.textContent = "";
   bar.insertAdjacentHTML("beforeend", h);
   bar.classList.add("visible");
@@ -1458,6 +1523,15 @@ function nbRenderBar() {
     nbRenderBar();
     nbRedraw();
   });
+  var seedToggle = document.getElementById("nb-seed-toggle");
+  if (seedToggle) {
+    seedToggle.addEventListener("click", function() {
+      nbSeedListOpen = !nbSeedListOpen;
+      var list = document.getElementById("nb-seed-list");
+      if (list) list.hidden = !nbSeedListOpen;
+      seedToggle.setAttribute("aria-expanded", nbSeedListOpen ? "true" : "false");
+    });
+  }
 }
 function dragS(ev, d) { if (!ev.active) simulation.alphaTarget(0.1).restart(); d.fx = d.x; d.fy = d.y; }
 function dragD(ev, d) { d.fx = ev.x; d.fy = ev.y; }

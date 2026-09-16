@@ -632,9 +632,8 @@ def test_truncated_payload_never_exceeds_max_nodes(chain_store):
         )
         names = [n["qualified_name"] for n in view["nodes"]]
         assert len(names) == len(set(names)), "duplicate node keys"
-        # Hop 0 is never dropped, so a cap below the seed's own cost is the
-        # one case that may overshoot; every other cap must be respected.
-        assert len(names) <= max(cap, 2)
+        assert len(names) <= cap, f"cap {cap} overshot by {len(names) - cap}"
+        assert len(names) == len(view["neighbourhood"]["hops"])
 
 
 def test_any_non_containment_edge_kind_counts_as_a_hop(chain_store):
@@ -657,3 +656,339 @@ def test_any_non_containment_edge_kind_counts_as_a_hop(chain_store):
     names = {node["qualified_name"] for node in view["nodes"]}
 
     assert "src/z.py::f_z" in names
+
+
+# ---------------------------------------------------------------------------
+# --max-nodes is a cap, seeds included
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def wide_store(tmp_path) -> GraphStore:
+    """40 files, 4 symbols each, every symbol calling the one file below it.
+
+    Seeding every file (what ``--seed-changed`` does on a large review) gives
+    200 seed nodes, so a cap below that has to bite into the seed set itself.
+    The call chain gives each file a different degree, which is what the
+    ranking is supposed to order by.
+    """
+    store = GraphStore(tmp_path / "wide.db")
+    files = [f"src/m{index:02d}.py" for index in range(40)]
+    for file_path in files:
+        store.upsert_node(_file(file_path))
+        for slot in range(4):
+            name = f"fn{slot}"
+            store.upsert_node(_fn(name, file_path))
+            store.upsert_edge(
+                _edge("CONTAINS", file_path, f"{file_path}::{name}", file_path)
+            )
+    for index, file_path in enumerate(files[:-1]):
+        # File 0 calls into everything, so its degree dominates; each later
+        # file calls only its successor.
+        targets = files[1:] if index == 0 else [files[index + 1]]
+        for target in targets:
+            store.upsert_edge(
+                _edge(
+                    "CALLS",
+                    f"{file_path}::fn0",
+                    f"{target}::fn0",
+                    file_path,
+                )
+            )
+    store.commit()
+    return store
+
+
+def _seed_every_file() -> list[str]:
+    return [f"src/m{index:02d}.py" for index in range(40)]
+
+
+def test_max_nodes_caps_a_seed_set_larger_than_the_cap(wide_store):
+    """The regression: a seed set bigger than the cap used to ship in full.
+
+    ``--seed-changed`` is the command the flag exists for, and there the seed
+    set *is* the large thing.
+    """
+    from code_review_graph.visualization import export_graph_data
+
+    view = export_graph_data(
+        wide_store, seed_files=_seed_every_file(), depth=2, max_nodes=50
+    )
+    block = view["neighbourhood"]
+
+    assert block["seeds_requested"] == 200, "40 files x (1 file + 4 symbols)"
+    assert len(view["nodes"]) == 50
+    assert len(view["nodes"]) <= block["max_nodes"]
+    assert block["seeds_dropped"] == 150
+    assert len(block["seeds"]) == 50
+
+
+@pytest.mark.parametrize("cap", [1, 7, 33, 50, 199, 200, 201, 400])
+def test_no_cap_is_ever_exceeded_by_a_large_seed_set(wide_store, cap):
+    from code_review_graph.visualization import export_graph_data
+
+    view = export_graph_data(
+        wide_store, seed_files=_seed_every_file(), depth=2, max_nodes=cap
+    )
+    block = view["neighbourhood"]
+    names = [node["qualified_name"] for node in view["nodes"]]
+
+    assert len(names) <= cap, f"cap {cap} overshot by {len(names) - cap}"
+    assert len(names) == len(set(names))
+    assert block["seeds_dropped"] == 200 - len(block["seeds"])
+    assert set(block["seeds"]) <= set(names), "a kept seed is in the payload"
+
+
+def test_dropped_seeds_are_the_least_connected_ones(wide_store):
+    """Ranking, not arbitrary truncation: the busiest seeds survive."""
+    from code_review_graph.visualization import export_graph_data
+
+    view = export_graph_data(
+        wide_store, seed_files=_seed_every_file(), depth=0, max_nodes=10
+    )
+    kept = set(view["neighbourhood"]["seeds"])
+
+    # m00.py calls all 39 other files, and m00.py::fn0 is the caller, so both
+    # outrank the leaf symbols that carry only a CONTAINS edge.
+    assert "src/m00.py" in kept
+    assert "src/m00.py::fn0" in kept
+    assert "src/m39.py::fn3" not in kept, "a degree-1 leaf is not kept over them"
+
+
+def test_seed_drop_is_deterministic(wide_store):
+    from code_review_graph.visualization import export_graph_data
+
+    first, second = (
+        export_graph_data(
+            wide_store, seed_files=_seed_every_file(), depth=2, max_nodes=37
+        )["neighbourhood"]["seeds"]
+        for _ in range(2)
+    )
+
+    assert first == second
+
+
+def test_an_uncapped_seed_set_drops_nothing(wide_store):
+    from code_review_graph.visualization import export_graph_data
+
+    view = export_graph_data(
+        wide_store, seed_files=_seed_every_file(), depth=2, max_nodes=10_000
+    )
+    block = view["neighbourhood"]
+
+    assert block["seeds_dropped"] == 0
+    assert block["truncated"] is False
+    assert len(block["seeds"]) == block["seeds_requested"] == 200
+
+
+def test_a_symbol_beats_its_containing_file_for_the_last_slot(chain_store):
+    """The File is a rendering nicety; the symbol is the answer."""
+    from code_review_graph.visualization import export_graph_data
+
+    view = export_graph_data(
+        chain_store, seed_symbols=["src/a.py::f_a"], depth=0, max_nodes=1
+    )
+    names = [node["qualified_name"] for node in view["nodes"]]
+
+    assert names == ["src/a.py::f_a"]
+
+
+def test_path_nodes_outrank_other_seeds_under_a_tight_budget(chain_store):
+    from code_review_graph.visualization import export_graph_data
+
+    view = export_graph_data(
+        chain_store,
+        path_from="f_a",
+        path_to="f_e",
+        seed_files=["src/z.py"],
+        depth=0,
+        max_nodes=5,
+    )
+    names = {node["qualified_name"] for node in view["nodes"]}
+
+    assert set(view["neighbourhood"]["path"]) <= names, "the answer survives"
+    assert len(names) == 5
+
+
+def test_max_nodes_below_the_path_length_is_rejected(chain_store):
+    from code_review_graph.visualization import export_graph_data
+
+    with pytest.raises(ValueError) as excinfo:
+        export_graph_data(
+            chain_store, path_from="f_a", path_to="f_e", depth=0, max_nodes=3
+        )
+
+    assert "max-nodes 3" in str(excinfo.value)
+    assert "5" in str(excinfo.value), "says what it would take"
+
+
+def test_generate_html_reports_the_seed_budget(wide_store, tmp_path):
+    from code_review_graph.visualization import generate_html
+
+    report: dict = {}
+    generate_html(
+        wide_store,
+        tmp_path / "graph.html",
+        seed_files=_seed_every_file(),
+        depth=2,
+        max_nodes=50,
+        report=report,
+    )
+
+    assert report["seeds_requested"] == 200
+    assert report["seeds_dropped"] == 150
+    assert report["node_count"] == 50
+    assert report["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# The on-page seed list
+# ---------------------------------------------------------------------------
+
+
+def test_page_does_not_paint_every_seed(wide_store, tmp_path):
+    """A --seed-changed run must not spray 40 paths across the graph."""
+    from code_review_graph.visualization import generate_html
+
+    out = tmp_path / "graph.html"
+    generate_html(wide_store, out, seed_files=_seed_every_file(), depth=1)
+    content = out.read_text(encoding="utf-8")
+
+    assert "NB_SEEDS_SHOWN = 3" in content
+    assert 'id="nb-seed-toggle"' in content
+    assert "more</span>" not in content
+    # The full list exists, starts hidden, and is built by the toggle handler.
+    assert 'id="nb-seed-list"' in content
+    assert 'aria-expanded' in content
+    assert "nbSeedListOpen" in content
+
+
+def test_payload_still_carries_every_seed_for_the_disclosure(wide_store, tmp_path):
+    from code_review_graph.visualization import export_graph_data
+
+    view = export_graph_data(wide_store, seed_files=_seed_every_file(), depth=1)
+
+    assert len(view["neighbourhood"]["seed_query"]) == 40
+
+
+# ---------------------------------------------------------------------------
+# Flag combinations that cannot mean anything
+# ---------------------------------------------------------------------------
+
+
+def test_render_depth_above_depth_is_rejected():
+    from code_review_graph.neighbourhood import NeighbourhoodSpec
+
+    with pytest.raises(ValueError) as excinfo:
+        NeighbourhoodSpec(symbols=("f_a",), depth=2, render_depth=3).validate()
+
+    assert "render-depth 3" in str(excinfo.value)
+    NeighbourhoodSpec(symbols=("f_a",), depth=2, render_depth=2).validate()
+
+
+def test_aggregating_mode_with_a_seed_is_rejected(chain_store, tmp_path):
+    from code_review_graph.visualization import generate_html
+
+    for mode in ("community", "file"):
+        with pytest.raises(ValueError) as excinfo:
+            generate_html(
+                chain_store, tmp_path / "g.html", mode=mode, seed_symbols=["f_a"]
+            )
+        assert mode in str(excinfo.value)
+    generate_html(
+        chain_store, tmp_path / "g.html", mode="full", seed_symbols=["f_a"]
+    )
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (["visualize", "--seed-changed-base", "main"], "--seed-changed"),
+        (["visualize", "--depth", "3"], "seeded view"),
+        (["visualize", "--max-nodes", "50"], "seeded view"),
+        (["visualize", "--render-depth", "0"], "seeded view"),
+        (
+            ["visualize", "--format", "json", "--seed-symbol", "f_a"],
+            "no effect on --format json",
+        ),
+        (["visualize", "--format", "graphml", "--depth", "2"], "no effect"),
+        (["visualize", "--format", "svg", "--sidecar"], "--sidecar"),
+        (
+            ["visualize", "--mode", "community", "--seed-symbol", "f_a"],
+            "opposite of a seeded neighbourhood",
+        ),
+    ],
+)
+def test_meaningless_flag_combinations_are_rejected(argv, message, capsys):
+    from code_review_graph.cli import _check_visualize_flags, build_parser
+
+    args = build_parser().parse_args(argv)
+    fmt = getattr(args, "format", "html") or "html"
+
+    with pytest.raises(SystemExit) as excinfo:
+        _check_visualize_flags(args, fmt)
+
+    assert excinfo.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["visualize"],
+        ["visualize", "--sidecar"],
+        ["visualize", "--format", "json"],
+        ["visualize", "--seed-symbol", "f_a", "--depth", "3"],
+        ["visualize", "--seed-changed", "--seed-changed-base", "main"],
+        ["visualize", "--mode", "full", "--seed-file", "a.py"],
+        ["visualize", "--path-from", "a", "--path-to", "b", "--max-nodes", "9"],
+    ],
+)
+def test_meaningful_flag_combinations_are_accepted(argv):
+    from code_review_graph.cli import _check_visualize_flags, build_parser
+
+    args = build_parser().parse_args(argv)
+    _check_visualize_flags(args, getattr(args, "format", "html") or "html")
+
+
+def test_tuning_flags_default_to_none_so_a_no_op_is_detectable():
+    from code_review_graph.cli import build_parser
+
+    args = build_parser().parse_args(["visualize"])
+
+    assert args.depth is None
+    assert args.render_depth is None
+    assert args.max_nodes is None
+    assert args.seed_changed_base is None
+
+
+def test_the_command_says_how_many_seeds_it_dropped(capsys):
+    from code_review_graph.cli import _print_seed_budget
+
+    _print_seed_budget({
+        "seeds": 50,
+        "seeds_requested": 7614,
+        "seeds_dropped": 7564,
+        "truncated": True,
+        "max_nodes": 50,
+        "node_count": 50,
+    })
+    out = capsys.readouterr().out
+
+    assert "50" in out and "7614" in out and "7564" in out
+    assert "dropped" in out
+
+
+def test_an_untrimmed_run_says_nothing_about_the_budget(capsys):
+    from code_review_graph.cli import _print_seed_budget
+
+    _print_seed_budget({
+        "seeds": 12,
+        "seeds_requested": 12,
+        "seeds_dropped": 0,
+        "truncated": False,
+        "max_nodes": 1500,
+        "node_count": 300,
+    })
+
+    assert capsys.readouterr().out == ""

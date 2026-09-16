@@ -699,13 +699,90 @@ def _warn_failed_files(result: dict) -> None:
 _SUBCOMMANDS: dict[str, argparse.ArgumentParser] = {}
 
 
-def _describe_visualization(args: argparse.Namespace, vis_mode: str) -> str:
+def _is_seeded(args: argparse.Namespace) -> bool:
+    """True when the visualize invocation asks for a neighbourhood view."""
+    return bool(
+        getattr(args, "seed_symbol", None)
+        or getattr(args, "seed_file", None)
+        or getattr(args, "seed_changed", False)
+        or getattr(args, "seed_flow", None)
+        or getattr(args, "path_from", None)
+        or getattr(args, "path_to", None)
+    )
+
+
+def _check_visualize_flags(args: argparse.Namespace, fmt: str) -> None:
+    """Reject visualize flag combinations that cannot mean anything.
+
+    Every one of these used to be a silent no-op, which is the worst
+    outcome: the command succeeds, the flag is ignored, and the user
+    believes it took effect.
+    """
+    error = _SUBCOMMANDS["visualize"].error
+    seeded = _is_seeded(args)
+    tuning = [
+        name for name in ("depth", "render_depth", "max_nodes")
+        if getattr(args, name, None) is not None
+    ]
+    if getattr(args, "seed_changed_base", None) is not None and not getattr(
+        args, "seed_changed", False
+    ):
+        error("--seed-changed-base requires --seed-changed")
+    if fmt != "html":
+        if seeded:
+            error(
+                f"the seed flags build an interactive page and have no "
+                f"effect on --format {fmt}; drop the seed or use "
+                "--format html"
+            )
+        if tuning:
+            flag = "--" + tuning[0].replace("_", "-")
+            error(f"{flag} has no effect on --format {fmt}")
+        if getattr(args, "sidecar", False):
+            error(f"--sidecar has no effect on --format {fmt}")
+    if tuning and not seeded:
+        flag = "--" + tuning[0].replace("_", "-")
+        error(
+            f"{flag} only applies to a seeded view; add --seed-symbol, "
+            "--seed-file, --seed-changed, --seed-flow or "
+            "--path-from/--path-to"
+        )
+    if seeded and (getattr(args, "mode", "auto") or "auto") not in (
+        "auto", "full"
+    ):
+        error(
+            f"--mode {args.mode} aggregates the graph into bubbles, which is "
+            "the opposite of a seeded neighbourhood; use --mode full or drop "
+            "the seed"
+        )
+
+
+def _print_seed_budget(report: dict) -> None:
+    """Say what ``--max-nodes`` cost, so a trimmed view is never silent."""
+    if not report:
+        return
+    dropped = report.get("seeds_dropped", 0)
+    if dropped:
+        kept = report.get("seeds", 0)
+        requested = report.get("seeds_requested", kept + dropped)
+        print(
+            f"  --max-nodes {report.get('max_nodes')} kept the {kept} "
+            f"best-connected of {requested} seed nodes; {dropped} seeds and "
+            "every context hop were dropped"
+        )
+    elif report.get("truncated"):
+        print(
+            f"  --max-nodes {report.get('max_nodes')} trimmed the outer hops; "
+            f"every seed kept, {report.get('node_count')} nodes shipped"
+        )
+
+
+def _describe_visualization(
+    args: argparse.Namespace, vis_mode: str, depth: int
+) -> str:
     """One-line description of what the generated page shows."""
     if getattr(args, "path_from", None):
-        return (
-            f"path {args.path_from} -> {args.path_to}, "
-            f"depth {getattr(args, 'depth', NB_DEFAULT_DEPTH)}"
-        )
+        return f"path {args.path_from} -> {args.path_to}, depth {depth}"
     seeds: list[str] = []
     seeds.extend(getattr(args, "seed_symbol", None) or [])
     seeds.extend(getattr(args, "seed_file", None) or [])
@@ -717,10 +794,7 @@ def _describe_visualization(args: argparse.Namespace, vis_mode: str) -> str:
         shown = ", ".join(seeds[:3])
         if len(seeds) > 3:
             shown += f", +{len(seeds) - 3} more"
-        return (
-            f"neighbourhood of {shown}, "
-            f"depth {getattr(args, 'depth', NB_DEFAULT_DEPTH)}"
-        )
+        return f"neighbourhood of {shown}, depth {depth}"
     return vis_mode
 
 
@@ -1058,7 +1132,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vis_group.add_argument(
         "--seed-changed-base",
-        default="HEAD~1",
+        default=None,
         metavar="REF",
         help="Git ref --seed-changed diffs against (default: HEAD~1)",
     )
@@ -1084,7 +1158,7 @@ def build_parser() -> argparse.ArgumentParser:
     vis_group.add_argument(
         "--depth",
         type=int,
-        default=NB_DEFAULT_DEPTH,
+        default=None,
         metavar="K",
         help=f"Hops of context to include around the seed "
              f"(default: {NB_DEFAULT_DEPTH})",
@@ -1099,9 +1173,11 @@ def build_parser() -> argparse.ArgumentParser:
     vis_group.add_argument(
         "--max-nodes",
         type=int,
-        default=NB_DEFAULT_MAX_NODES,
+        default=None,
         metavar="N",
-        help=f"Cap on payload nodes; the outermost hop is trimmed first "
+        help=f"Hard cap on payload nodes. The outermost hop is trimmed "
+             f"first; once the outer hops are gone the seed set is trimmed "
+             f"too, so the cap always holds "
              f"(default: {NB_DEFAULT_MAX_NODES})",
     )
     vis_group.add_argument(
@@ -1491,6 +1567,7 @@ def build_parser() -> argparse.ArgumentParser:
         "refactor": refactor_cmd,
         "serve": serve_cmd,
         "daemon": daemon_cmd,
+        "visualize": vis_cmd,
     })
     return ap
 
@@ -1517,6 +1594,11 @@ def main() -> None:
         and (not args.old_name or not args.new_name)
     ):
         _SUBCOMMANDS["refactor"].error("rename requires --old-name and --new-name")
+
+    if args.command == "visualize":
+        # Before the graph is opened: a nonsense flag pair is a usage error,
+        # not something the user should have to build a graph to discover.
+        _check_visualize_flags(args, getattr(args, "format", "html") or "html")
 
     if args.command == "enrich":
         from .enrich import run_hook
@@ -2200,21 +2282,27 @@ def main() -> None:
 
                 html_path = data_dir / "graph.html"
                 vis_mode = getattr(args, "mode", "auto") or "auto"
+                depth = getattr(args, "depth", None)
+                depth = NB_DEFAULT_DEPTH if depth is None else depth
+                max_nodes = getattr(args, "max_nodes", None)
+                max_nodes = (
+                    NB_DEFAULT_MAX_NODES if max_nodes is None else max_nodes
+                )
                 seed_files = list(getattr(args, "seed_file", None) or [])
                 if getattr(args, "seed_changed", False):
                     from .incremental import get_changed_files
 
-                    changed = get_changed_files(
-                        repo_root, base=args.seed_changed_base
-                    )
+                    base = args.seed_changed_base or "HEAD~1"
+                    changed = get_changed_files(repo_root, base=base)
                     if not changed:
                         print(
-                            "No changed files against "
-                            f"{args.seed_changed_base}; nothing to seed.",
+                            f"No changed files against {base}; "
+                            "nothing to seed.",
                             file=sys.stderr,
                         )
                         return
                     seed_files.extend(changed)
+                seed_report: dict = {}
                 try:
                     generate_html(
                         store,
@@ -2225,18 +2313,18 @@ def main() -> None:
                         seed_flow=getattr(args, "seed_flow", None),
                         path_from=getattr(args, "path_from", None),
                         path_to=getattr(args, "path_to", None),
-                        depth=getattr(args, "depth", NB_DEFAULT_DEPTH),
+                        depth=depth,
                         render_depth=getattr(args, "render_depth", None),
-                        max_nodes=getattr(
-                            args, "max_nodes", NB_DEFAULT_MAX_NODES
-                        ),
+                        max_nodes=max_nodes,
+                        report=seed_report,
                         sidecar=getattr(args, "sidecar", False),
                     )
                 except (SeedResolutionError, ValueError) as exc:
                     print(f"visualize: {exc}", file=sys.stderr)
                     sys.exit(2)
-                label = _describe_visualization(args, vis_mode)
+                label = _describe_visualization(args, vis_mode, depth)
                 print(f"Visualization ({label}): {html_path}")
+                _print_seed_budget(seed_report)
                 if getattr(args, "sidecar", False):
                     print(f"Payload sidecar: {html_path.parent / 'graph.data.js'}")
                 if getattr(args, "serve", False):
