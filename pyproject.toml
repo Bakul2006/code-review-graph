@@ -160,6 +160,7 @@ markers = [
     "platform_lifecycle: drives install/reinstall/uninstall for every supported platform",
     "packaging: builds the distribution artefacts and smoke-tests them from a clean install",
     "determinism: rebuilds one corpus many ways and compares every table (minutes)",
+    "upgrade: installs released versions from PyPI, builds a graph with each, and upgrades it with the current code (needs uv and network; minutes and hundreds of MB)",
 ]
 
 [dependency-groups]
