@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ..changes import analyze_changes, parse_diff_ranges, parse_git_diff_ranges  # noqa: F401
+from ..changes import (  # noqa: F401
+    analyze_changes,
+    compute_risk_score,
+    parse_diff_ranges,
+    parse_git_diff_ranges,
+)
 from ..context_savings import attach_context_savings, estimate_file_tokens
 from ..flows import get_affected_flows as _get_affected_flows
-from ..graph import edge_to_dict, node_to_dict
+from ..graph import GraphNode, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import (
     get_changed_files,
@@ -40,6 +46,30 @@ _MAX_REVIEW_SOURCE_LINES = 800
 _MAX_LINES_PER_FILE = 500
 _MAX_CHANGED_FUNCTIONS = 100
 _MAX_DETECT_SOURCE_LINES = 600
+
+# The source budget above used to be spent first come first served over the
+# changed-file list, which is the order Git happened to emit. One
+# alphabetically early 500-line file could take 500 of the 800 lines while the
+# riskiest changed function in the pull request got nothing. The budget is now
+# allocated once from the list ranked by ``changes.compute_risk_score``:
+#   * every served file gets ``_MIN_SOURCE_LINES_PER_FILE`` first, so nothing
+#     silently drops to zero while the budget lasts,
+#   * no file may take more than ``_MAX_SOURCE_SHARE_PER_FILE`` of the total,
+#     so one huge file cannot starve the rest,
+#   * what a file does not use (it was shorter than its share) is handed to
+#     the next file in the ranking rather than wasted.
+_MIN_SOURCE_LINES_PER_FILE = 20
+_MAX_SOURCE_SHARE_PER_FILE = 0.4
+
+# Ranking costs ~6 SQLite queries per node scored, and a whole-repo diff can
+# seed thousands of changed nodes. Scoring is therefore round-robin across
+# files (every file is scored once before any file is scored twice) under
+# both a per-file and a global node budget. Files the budget never reaches
+# keep their original position, so the ranking degrades to today's behaviour
+# instead of failing.
+_MAX_RISK_NODES_PER_FILE = 8
+_MAX_RISK_SCORED_NODES = 400
+_RISK_SCORED_KINDS = ("Function", "Test", "Class")
 
 # ``get_affected_flows`` in standard mode carries a full ``steps`` list per
 # flow (~980 tokens each), so 50 flows is still ~49k tokens — #849 was only
@@ -95,6 +125,116 @@ def _bound_flow_steps(
     return bounded, truncated
 
 
+def _risk_by_file(
+    store: Any,
+    root: Path,
+    rel_files: list[str],
+    changed_nodes: list[GraphNode],
+) -> dict[str, float]:
+    """Score each changed file by the riskiest changed node it contains.
+
+    Uses ``changes.compute_risk_score`` -- the same score ``detect_changes``
+    reports -- so the review context and the risk report agree on what
+    matters. Scoring is bounded (see ``_MAX_RISK_SCORED_NODES``); unscored
+    files keep a score of 0.0 and therefore their original order.
+    """
+    risks: dict[str, float] = {rel: 0.0 for rel in rel_files}
+    if not rel_files or not changed_nodes:
+        return risks
+
+    by_path: dict[str, list[GraphNode]] = {}
+    for node in changed_nodes:
+        if node.kind not in _RISK_SCORED_KINDS or not node.file_path:
+            continue
+        if isinstance(node.extra, dict) and node.extra.get("verilog_kind"):
+            continue
+        bucket = by_path.setdefault(node.file_path, [])
+        if len(bucket) < _MAX_RISK_NODES_PER_FILE:
+            bucket.append(node)
+
+    candidates: dict[str, list[GraphNode]] = {}
+    for rel in rel_files:
+        joined = root / rel
+        candidates[rel] = (
+            by_path.get(normalize_file_path(joined))
+            or by_path.get(str(joined))
+            or by_path.get(normalize_file_path(rel))
+            or []
+        )
+
+    remaining = _MAX_RISK_SCORED_NODES
+    try:
+        for depth in range(_MAX_RISK_NODES_PER_FILE):
+            if remaining <= 0:
+                break
+            progressed = False
+            for rel in rel_files:
+                if remaining <= 0:
+                    break
+                nodes = candidates[rel]
+                if depth >= len(nodes):
+                    continue
+                score = compute_risk_score(store, nodes[depth])
+                remaining -= 1
+                progressed = True
+                if score > risks[rel]:
+                    risks[rel] = score
+            if not progressed:
+                break
+    except (sqlite3.Error, ValueError, AttributeError):
+        # Ranking is an optimisation, never a reason to fail the review
+        # context. A partially scored ranking is still better than none.
+        logger.warning("Risk ranking failed; falling back to diff order",
+                       exc_info=True)
+    return risks
+
+
+def _allocate_source_lines(
+    ranked_files: list[str], total_budget: int, per_file_limit: int,
+) -> dict[str, int]:
+    """Split *total_budget* source lines across *ranked_files*, riskiest first.
+
+    The split is computed once from the full ranked list rather than greedily
+    as the caller walks it, so a file at the top of the ranking cannot be
+    starved by whatever the diff happened to list before it.
+
+    Returns ``{file: lines}`` for the files that get a share; files beyond
+    what the budget can floor are absent (the caller reports that as
+    ``source_truncated``).
+    """
+    if not ranked_files or total_budget <= 0 or per_file_limit <= 0:
+        return {}
+
+    floor = max(1, min(_MIN_SOURCE_LINES_PER_FILE, per_file_limit))
+    served = min(len(ranked_files), max(1, total_budget // floor))
+    share_cap = max(floor, int(total_budget * _MAX_SOURCE_SHARE_PER_FILE))
+    cap = min(per_file_limit, share_cap)
+
+    alloc: dict[str, int] = {}
+    remaining = total_budget
+    for rel in ranked_files[:served]:
+        grant = min(floor, remaining)
+        alloc[rel] = grant
+        remaining -= grant
+    for rel in ranked_files[:served]:
+        if remaining <= 0:
+            break
+        extra = min(cap - alloc[rel], remaining)
+        if extra > 0:
+            alloc[rel] += extra
+            remaining -= extra
+    return alloc
+
+
+def _source_share_cap(total_budget: int, per_file_limit: int) -> int:
+    """The most lines any single file may hold, allocation plus reclaim."""
+    floor = max(1, min(_MIN_SOURCE_LINES_PER_FILE, per_file_limit))
+    return min(
+        per_file_limit,
+        max(floor, int(total_budget * _MAX_SOURCE_SHARE_PER_FILE)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool 4: get_review_context
 # ---------------------------------------------------------------------------
@@ -136,7 +276,10 @@ def get_review_context(
 
     Returns:
         Structured review context with subgraph, source snippets, and
-        review guidance, plus a ``truncated`` flag.
+        review guidance, plus a ``truncated`` flag. ``changed_files`` is
+        ordered by the risk score ``detect_changes`` reports (highest
+        first, reported per file in ``file_risk``), and both the file cap
+        and the shared source-line budget are spent in that order.
     """
     _validate_positive_int(max_results, "max_results")
     _validate_positive_int(max_files, "max_files")
@@ -215,8 +358,20 @@ def get_review_context(
 
         # Build review context. Every list below scales with the change set,
         # so each is bounded and reports its untruncated total.
+        #
+        # Rank first, bound second: when ``max_files`` cuts the list it must
+        # keep the riskiest files, not the ones Git listed first.
+        file_risk = _risk_by_file(
+            store, root, changed_files, impact["changed_nodes"],
+        )
+        ranked_files = [
+            rel for _, rel in sorted(
+                ((-file_risk.get(rel, 0.0), i), rel)
+                for i, rel in enumerate(changed_files)
+            )
+        ]
         shown_files, files_total, files_cut = _bounded(
-            changed_files, max_files, _MAX_REVIEW_FILES,
+            ranked_files, max_files, _MAX_REVIEW_FILES,
         )
         impacted_files, impacted_total, impacted_cut = _bounded(
             impact["impacted_files"], max_files, _MAX_REVIEW_FILES,
@@ -237,6 +392,9 @@ def get_review_context(
         context: dict[str, Any] = {
             "changed_files": shown_files,
             "changed_files_total": files_total,
+            "file_risk": {
+                rel: round(file_risk.get(rel, 0.0), 4) for rel in shown_files
+            },
             "impacted_files": impacted_files,
             "impacted_files_total": impacted_total,
             "graph": {
@@ -253,42 +411,61 @@ def get_review_context(
         # Add source snippets for the bounded file list, spending a shared
         # line budget. Snippets were 109k of a 134k-token worst case: without
         # a total budget, ``max_lines_per_file`` alone lets N files each
-        # contribute a whole file.
+        # contribute a whole file. The budget is allocated once over the
+        # risk-ranked list so the riskiest changed file is served first.
         if include_source:
             snippets = {}
             per_file = min(max_lines_per_file, _MAX_LINES_PER_FILE)
-            budget = _MAX_REVIEW_SOURCE_LINES
+            allocation = _allocate_source_lines(
+                shown_files, _MAX_REVIEW_SOURCE_LINES, per_file,
+            )
+            share_cap = _source_share_cap(_MAX_REVIEW_SOURCE_LINES, per_file)
+            source_truncated = False
+            # Lines a file did not need (it was shorter than its share) are
+            # handed down the ranking instead of being wasted.
+            slack = 0
             for rel_path in shown_files:
-                if budget <= 0:
-                    context["source_truncated"] = True
-                    context["truncated"] = True
-                    break
+                allowed = allocation.get(rel_path, 0)
+                if slack > 0 and allowed > 0:
+                    reclaimed = min(slack, share_cap - allowed)
+                    allowed += reclaimed
+                    slack -= reclaimed
+                if allowed <= 0:
+                    source_truncated = True
+                    continue
                 full_path = root / rel_path
-                if full_path.is_file():
-                    try:
-                        lines = full_path.read_text(encoding="utf-8",
-                            errors="replace"
-                        ).splitlines()
-                        allowed = min(per_file, budget)
-                        if len(lines) > allowed:
-                            # Include only the relevant functions/classes
-                            relevant_lines = _extract_relevant_lines(
-                                lines,
-                                impact["changed_nodes"],
-                                str(full_path),
-                                allowed,
-                            )
-                            snippets[rel_path] = relevant_lines
-                            budget -= allowed
-                        else:
-                            snippets[rel_path] = "\n".join(
-                                f"{i+1}: {line}"
-                                for i, line in enumerate(lines)
-                            )
-                            budget -= len(lines)
-                    except (OSError, UnicodeDecodeError):
-                        snippets[rel_path] = "(could not read file)"
+                if not full_path.is_file():
+                    slack += allowed
+                    continue
+                try:
+                    lines = full_path.read_text(encoding="utf-8",
+                        errors="replace"
+                    ).splitlines()
+                except (OSError, UnicodeDecodeError):
+                    snippets[rel_path] = "(could not read file)"
+                    slack += allowed
+                    continue
+                if len(lines) > allowed:
+                    # Include only the relevant functions/classes
+                    relevant_lines, spent = _extract_relevant_lines(
+                        lines,
+                        impact["changed_nodes"],
+                        str(full_path),
+                        allowed,
+                    )
+                    snippets[rel_path] = relevant_lines
+                    source_truncated = True
+                else:
+                    snippets[rel_path] = "\n".join(
+                        f"{i+1}: {line}"
+                        for i, line in enumerate(lines)
+                    )
+                    spent = len(lines)
+                slack += max(0, allowed - spent)
             context["source_snippets"] = snippets
+            if source_truncated:
+                context["source_truncated"] = True
+                context["truncated"] = True
 
         # Generate review guidance
         guidance = _generate_review_guidance(impact, changed_files)
@@ -320,12 +497,16 @@ def get_review_context(
 
 def _extract_relevant_lines(
     lines: list[str], nodes: list, file_path: str, max_lines: int = 200,
-) -> str:
+) -> tuple[str, int]:
     """Extract only the lines relevant to changed nodes.
 
     Bounded by *max_lines*: a file where every function changed merges into
     one range covering the whole file, which would defeat the caller's
     ``max_lines_per_file`` budget entirely.
+
+    Returns ``(snippet, emitted)`` where *emitted* counts real source lines
+    and excludes the ``...`` range separators, so the caller can account for
+    the shared budget exactly and hand any unspent share to the next file.
     """
     ranges = []
     for n in nodes:
@@ -336,8 +517,10 @@ def _extract_relevant_lines(
 
     if not ranges:
         # Show first N lines as fallback
-        return "\n".join(
-            f"{i+1}: {line}" for i, line in enumerate(lines[:min(50, max_lines)])
+        head = lines[:min(50, max_lines)]
+        return (
+            "\n".join(f"{i+1}: {line}" for i, line in enumerate(head)),
+            len(head),
         )
 
     # Merge overlapping ranges
@@ -361,7 +544,7 @@ def _extract_relevant_lines(
             parts.append(f"{i+1}: {lines[i]}")
             emitted += 1
 
-    return "\n".join(parts)
+    return "\n".join(parts), emitted
 
 
 def _generate_review_guidance(
@@ -613,6 +796,11 @@ def detect_changes_func(
             changed_ranges=abs_ranges if abs_ranges else None,
             repo_root=str(root),
             base=base,
+            # Agent-driven reviews used to score the change-frequency term at
+            # zero because only the CLI passed this. The underlying git log is
+            # memoised per commit, capped, and fails soft, so a cold first run
+            # costs one bounded walk and every later call is free.
+            include_churn=True,
         )
 
         # Optionally include source snippets for changed functions, spending a

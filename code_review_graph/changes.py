@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +187,55 @@ _CHURN_SATURATION = 10.0
 _CHURN_WEIGHT = 0.15
 _NUMSTAT_COUNT = re.compile(r"^(?:\d+|-)$")
 
+# ``git log --since --numstat`` now runs inside MCP tool calls, where an
+# agent is blocked on the result, so it gets its own budget rather than the
+# 30-second diff timeout: the history walk is capped at a commit count, and a
+# slow repository degrades to the pre-churn behaviour (an empty mapping, and
+# therefore a zero change-frequency term) instead of hanging the call.
+_CHURN_TIMEOUT = float(os.environ.get("CRG_CHURN_TIMEOUT", "5"))
+_CHURN_MAX_COMMITS = int(os.environ.get("CRG_CHURN_MAX_COMMITS", "2000"))
+
+# Churn counts commits, so the answer only changes when HEAD does: the cache
+# is keyed by (repo, commit, window). Failures are cached too -- a repository
+# slow enough to time out once would otherwise pay the timeout again on every
+# subsequent tool call in the session.
+_CHURN_CACHE_MAX_ENTRIES = 32
+_CHURN_CACHE_LOCK = threading.Lock()
+_CHURN_CACHE: dict[tuple[str, str, int], dict[str, int]] = {}
+
+
+def clear_churn_cache() -> None:
+    """Drop every memoised churn result (tests, and long-lived servers)."""
+    with _CHURN_CACHE_LOCK:
+        _CHURN_CACHE.clear()
+
+
+def _churn_cache_key(repo_root: str, window_days: int) -> tuple[str, str, int] | None:
+    """Identify the commit churn was computed at, or None when unknown.
+
+    An unknown commit (no Git, a repository without commits, a slow
+    ``rev-parse``) means the result is simply not cached; it never blocks the
+    churn lookup itself.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=repo_root,
+            timeout=_CHURN_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    head = result.stdout.strip()
+    return (repo_root, head, window_days) if head else None
+
 
 def _parse_numstat(log_text: str) -> dict[str, int]:
     """Parse NUL-terminated ``git log --numstat -z`` records.
@@ -218,9 +268,16 @@ def compute_file_churn(
 ) -> dict[str, int]:
     """Count commits touching each file over a trailing window.
 
-    Returns an empty mapping when the window is invalid or Git cannot be
-    queried. Renames are deliberately not followed: churn belongs to the path
-    that existed in each commit.
+    Memoised per ``(repo, HEAD commit, window)``: the answer cannot change
+    until a new commit lands, and the walk is too expensive to repeat inside
+    every tool call. The history walk is capped at ``_CHURN_MAX_COMMITS`` and
+    given ``_CHURN_TIMEOUT`` seconds.
+
+    Returns an empty mapping when the window is invalid or Git is slow,
+    missing, or fails, which leaves the change-frequency risk term at zero --
+    exactly the behaviour callers had before churn was enabled for them.
+    Renames are deliberately not followed: churn belongs to the path that
+    existed in each commit.
     """
     if window_days is None:
         raw_window = os.environ.get("CRG_CHURN_WINDOW_DAYS", "90")
@@ -235,6 +292,13 @@ def compute_file_churn(
     if window_days <= 0:
         return {}
 
+    cache_key = _churn_cache_key(repo_root, window_days)
+    if cache_key is not None:
+        with _CHURN_CACHE_LOCK:
+            cached = _CHURN_CACHE.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
     try:
         result = subprocess.run(
             [
@@ -243,6 +307,7 @@ def compute_file_churn(
                 "core.quotepath=off",
                 "log",
                 f"--since={window_days}.days.ago",
+                f"--max-count={_CHURN_MAX_COMMITS}",
                 "--numstat",
                 "--no-renames",
                 "--format=",
@@ -255,7 +320,7 @@ def compute_file_churn(
             encoding="utf-8",
             errors="replace",
             cwd=repo_root,
-            timeout=_GIT_TIMEOUT,
+            timeout=_CHURN_TIMEOUT,
         )
         if result.returncode != 0:
             logger.warning(
@@ -263,12 +328,19 @@ def compute_file_churn(
                 result.returncode,
                 result.stderr[:200],
             )
-            return {}
+            counts: dict[str, int] = {}
+        else:
+            counts = _parse_numstat(result.stdout)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("git log error: %s", exc)
-        return {}
+        counts = {}
 
-    return _parse_numstat(result.stdout)
+    if cache_key is not None:
+        with _CHURN_CACHE_LOCK:
+            if len(_CHURN_CACHE) >= _CHURN_CACHE_MAX_ENTRIES:
+                _CHURN_CACHE.clear()
+            _CHURN_CACHE[cache_key] = dict(counts)
+    return counts
 
 
 # ---------------------------------------------------------------------------

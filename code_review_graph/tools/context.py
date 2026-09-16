@@ -112,6 +112,11 @@ def get_minimal_context(
                     abs_files = [normalize_file_path(root / f) for f in files]
                     analysis = analyze_changes(
                         store, abs_files, repo_root=str(root), base=base,
+                        # Same reason as detect_changes: without this the
+                        # change-frequency term is pinned at zero for every
+                        # agent-driven review. The git log behind it is
+                        # memoised per commit, bounded, and fails soft.
+                        include_churn=True,
                     )
                     risk_score = analysis.get("risk_score", 0.0)
                     risk = (
