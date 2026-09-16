@@ -40,3 +40,26 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
     # unset, a miss would be silently destructive; set, it cannot be.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("hermes-home")))
     return home
+
+
+# Opt-in markers: suites slow or invasive enough that the ordinary run must not
+# pay for them. A suite listed here is collected but skipped unless the run's
+# ``-m`` expression names its marker, so ``pytest tests/`` stays fast while
+# ``pytest -m <marker>`` still finds the tests. Add a marker name to the set
+# (and to the ``markers`` list in pyproject.toml) to gate another suite.
+_OPT_IN_MARKERS = frozenset({"platform_lifecycle"})
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip opt-in suites unless the run explicitly selects their marker."""
+    expression = config.getoption("-m", default="") or ""
+    gated = {name for name in _OPT_IN_MARKERS if name not in expression}
+    if not gated:
+        return
+    for item in items:
+        for name in gated:
+            if item.get_closest_marker(name) is not None:
+                item.add_marker(
+                    pytest.mark.skip(reason=f"opt-in suite; run with -m {name}")
+                )
+                break
