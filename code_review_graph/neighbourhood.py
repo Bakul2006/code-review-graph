@@ -10,9 +10,13 @@ payload entirely.
 
 Hop semantics
 -------------
-A hop is a *semantic* edge: ``CALLS``, ``IMPORTS_FROM``, ``INHERITS``,
-``IMPLEMENTS``, ``TESTED_BY``, ``DEPENDS_ON``.  ``CONTAINS`` is structural and
-is deliberately *not* a hop — otherwise the file of any seed would be one hop
+A hop is any edge that is not containment: ``CALLS``, ``IMPORTS_FROM``,
+``INHERITS``, ``IMPLEMENTS``, ``TESTED_BY``, ``DEPENDS_ON``, ``REFERENCES``,
+and whatever a language pack adds next.  The rule is an exclusion rather than
+an allow-list on purpose: an allow-list silently drops a whole relationship
+class the day a parser starts emitting it, and the neighbourhood then quietly
+omits nodes a reviewer needed.  ``CONTAINS`` is structural and is deliberately
+*not* a hop — otherwise the file of any seed would be one hop
 away and every sibling symbol in that file two hops away, so a depth-2
 neighbourhood of one function would swallow its whole module.  Containing
 ``File`` nodes are still attached to the payload (at the hop of their closest
@@ -48,8 +52,8 @@ __all__ = [
     "DEFAULT_DEPTH",
     "DEFAULT_MAX_NODES",
     "DEFAULT_RENDER_DEPTH",
-    "HOP_EDGE_KINDS",
     "PATH_EDGE_KINDS",
+    "STRUCTURAL_EDGE_KINDS",
     "NeighbourhoodSpec",
     "SeedResolutionError",
     "extract",
@@ -59,16 +63,6 @@ __all__ = [
 
 # Structural containment: rendered, never traversed for hop counting.
 STRUCTURAL_EDGE_KINDS: tuple[str, ...] = ("CONTAINS",)
-
-# Edge kinds that count as one hop when growing a neighbourhood.
-HOP_EDGE_KINDS: tuple[str, ...] = (
-    "CALLS",
-    "IMPORTS_FROM",
-    "INHERITS",
-    "IMPLEMENTS",
-    "TESTED_BY",
-    "DEPENDS_ON",
-)
 
 # Edge kinds the path-between-two-symbols query walks.
 PATH_EDGE_KINDS: tuple[str, ...] = ("CALLS", "IMPORTS_FROM", "INHERITS")
@@ -174,13 +168,18 @@ def build_adjacency(
     edges: Iterable[dict],
     kinds: Sequence[str] | None = None,
     *,
+    exclude: Sequence[str] = (),
     directed: bool = False,
 ) -> dict[str, set[str]]:
-    """Adjacency map over *edges*, optionally restricted to *kinds*."""
+    """Adjacency map over *edges*, restricted to *kinds* and minus *exclude*."""
     allowed = set(kinds) if kinds is not None else None
+    denied = set(exclude)
     adjacency: dict[str, set[str]] = {}
     for edge in edges:
-        if allowed is not None and edge.get("kind") not in allowed:
+        kind = edge.get("kind")
+        if allowed is not None and kind not in allowed:
+            continue
+        if kind in denied:
             continue
         source = edge.get("source")
         target = edge.get("target")
@@ -483,7 +482,7 @@ def extract(data: dict, spec: NeighbourhoodSpec) -> dict:
     # Preserve first-seen order while de-duplicating.
     seeds = list(dict.fromkeys(seeds))
 
-    adjacency = build_adjacency(edges, HOP_EDGE_KINDS)
+    adjacency = build_adjacency(edges, exclude=STRUCTURAL_EDGE_KINDS)
     hops = hop_distances(adjacency, seeds, spec.depth)
 
     degrees: dict[str, int] = {}
@@ -498,7 +497,18 @@ def extract(data: dict, spec: NeighbourhoodSpec) -> dict:
     hops, truncated = _select_within_budget(hops, degrees, parents, spec.max_nodes)
 
     selected = set(hops)
-    out_nodes = [n for n in nodes if n["qualified_name"] in selected]
+    # One record per qualified name. The exporter de-duplicates on the raw
+    # name but emits the _sanitize_name-truncated one, so two nodes whose
+    # paths differ only past 256 characters reach here as a duplicate key --
+    # which would then be double-counted against max_nodes and bound twice by
+    # D3. Keep the first.
+    out_nodes = []
+    emitted: set[str] = set()
+    for node in nodes:
+        qualified_name = node["qualified_name"]
+        if qualified_name in selected and qualified_name not in emitted:
+            emitted.add(qualified_name)
+            out_nodes.append(node)
     out_edges = [
         e for e in edges
         if e["source"] in selected and e["target"] in selected
@@ -541,7 +551,7 @@ def extract(data: dict, spec: NeighbourhoodSpec) -> dict:
             "path_directed": path_directed,
             "path_edge_kinds": list(PATH_EDGE_KINDS),
             "path_error": path_error,
-            "hop_edge_kinds": list(HOP_EDGE_KINDS),
+            "structural_edge_kinds": list(STRUCTURAL_EDGE_KINDS),
             "truncated": truncated,
             "max_nodes": spec.max_nodes,
             "total_nodes": len(nodes),

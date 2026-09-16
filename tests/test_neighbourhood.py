@@ -591,3 +591,69 @@ def test_negative_depth_is_rejected():
 
     with pytest.raises(ValueError):
         NeighbourhoodSpec(symbols=("f_a",), depth=-1).validate()
+
+
+def test_payload_carries_one_record_per_qualified_name(chain_store):
+    """A duplicate key would be double-counted and bound twice by D3.
+
+    ``export_graph_data`` de-duplicates on the raw qualified name but emits
+    the ``_sanitize_name``-truncated one, so two real nodes whose paths differ
+    only past 256 characters arrive here sharing a key.
+    """
+    from code_review_graph.neighbourhood import NeighbourhoodSpec, extract
+
+    duplicate = {
+        "id": 99,
+        "kind": "Function",
+        "name": "f_a",
+        "qualified_name": "src/a.py::f_a",
+        "file_path": "src/a.py",
+    }
+    data = {
+        "nodes": [duplicate, dict(duplicate, id=100)],
+        "edges": [],
+        "stats": {},
+        "flows": [],
+        "communities": [],
+    }
+
+    view = extract(data, NeighbourhoodSpec(symbols=("src/a.py::f_a",), depth=1))
+
+    assert len(view["nodes"]) == 1
+    assert len(view["nodes"]) == len(view["neighbourhood"]["hops"])
+
+
+def test_truncated_payload_never_exceeds_max_nodes(chain_store):
+    from code_review_graph.visualization import export_graph_data
+
+    for cap in (1, 2, 3, 5, 8):
+        view = export_graph_data(
+            chain_store, seed_symbols=["src/a.py::f_a"], depth=4, max_nodes=cap
+        )
+        names = [n["qualified_name"] for n in view["nodes"]]
+        assert len(names) == len(set(names)), "duplicate node keys"
+        # Hop 0 is never dropped, so a cap below the seed's own cost is the
+        # one case that may overshoot; every other cap must be respected.
+        assert len(names) <= max(cap, 2)
+
+
+def test_any_non_containment_edge_kind_counts_as_a_hop(chain_store):
+    """The hop rule is an exclusion, not an allow-list.
+
+    REFERENCES is the second-most-common non-containment edge kind in a real
+    graph after CALLS and TESTED_BY. An allow-list that forgot it would drop
+    a fifth of the reachable nodes without any test noticing.
+    """
+    from code_review_graph.visualization import export_graph_data
+
+    chain_store.upsert_edge(
+        _edge("REFERENCES", "src/a.py::f_a", "src/z.py::f_z", "src/a.py")
+    )
+    chain_store.commit()
+
+    view = export_graph_data(
+        chain_store, seed_symbols=["src/a.py::f_a"], depth=1
+    )
+    names = {node["qualified_name"] for node in view["nodes"]}
+
+    assert "src/z.py::f_z" in names
