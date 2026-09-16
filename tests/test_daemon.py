@@ -611,6 +611,98 @@ class TestWatchDaemon:
             daemon.stop()
 
     @patch("code_review_graph.daemon.subprocess.Popen")
+    def test_start_watcher_assignment_failure_terminates_alive_process(self, mock_popen, daemon_env):
+        """A live watcher is terminated when Windows Job assignment fails."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = None
+        mock_popen.return_value = mock_proc
+
+        daemon = daemon_env["daemon"]
+        daemon._windows_job = MagicMock()
+        daemon._windows_job.assign.side_effect = OSError("job assignment failed")
+
+        daemon._start_watcher(daemon_env["config"].repos[0])
+
+        mock_proc.terminate.assert_called_once_with()
+        mock_proc.wait.assert_called_once_with(timeout=5)
+        assert "alpha" not in daemon._children
+
+    @patch("code_review_graph.daemon.subprocess.Popen")
+    def test_start_watcher_assignment_failure_kills_after_terminate_timeout(
+        self, mock_popen, daemon_env
+    ):
+        """A watcher is killed when graceful cleanup times out."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = None
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="watcher", timeout=5),
+            None,
+        ]
+        mock_popen.return_value = mock_proc
+
+        daemon = daemon_env["daemon"]
+        daemon._windows_job = MagicMock()
+        daemon._windows_job.assign.side_effect = OSError("job assignment failed")
+
+        daemon._start_watcher(daemon_env["config"].repos[0])
+
+        mock_proc.terminate.assert_called_once_with()
+        mock_proc.kill.assert_called_once_with()
+        assert mock_proc.wait.call_count == 2
+        assert all(call.kwargs == {"timeout": 5} for call in mock_proc.wait.call_args_list)
+        assert "alpha" not in daemon._children
+
+    @patch("code_review_graph.daemon.subprocess.Popen")
+    def test_start_watcher_assignment_failure_does_not_terminate_dead_process(
+        self, mock_popen, daemon_env
+    ):
+        """A watcher that already exited is not terminated after assignment failure."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = 1
+        mock_popen.return_value = mock_proc
+
+        daemon = daemon_env["daemon"]
+        daemon._windows_job = MagicMock()
+        daemon._windows_job.assign.side_effect = OSError("job assignment failed")
+
+        daemon._start_watcher(daemon_env["config"].repos[0])
+
+        mock_proc.terminate.assert_not_called()
+        assert "alpha" not in daemon._children
+
+    @patch("code_review_graph.daemon.subprocess.Popen")
+    def test_start_watcher_assignment_failure_handles_kill_wait_timeout(
+        self, mock_popen, daemon_env, caplog
+    ):
+        """A second cleanup timeout after kill does not escape watcher startup."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = None
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="watcher", timeout=5),
+            subprocess.TimeoutExpired(cmd="watcher", timeout=5),
+        ]
+        mock_popen.return_value = mock_proc
+
+        daemon = daemon_env["daemon"]
+        daemon._windows_job = MagicMock()
+        daemon._windows_job.assign.side_effect = OSError("job assignment failed")
+        log_fd = MagicMock()
+
+        with patch("builtins.open", return_value=log_fd):
+            daemon._start_watcher(daemon_env["config"].repos[0])
+
+        mock_proc.terminate.assert_called_once_with()
+        mock_proc.kill.assert_called_once_with()
+        assert mock_proc.wait.call_count == 2
+        assert "alpha" not in daemon._children
+        log_fd.close.assert_called_once_with()
+        assert "remained alive after SIGKILL" in caplog.text
+
+    @patch("code_review_graph.daemon.subprocess.Popen")
     @patch("code_review_graph.registry.Registry")
     def test_start_registers_repos(self, mock_registry_cls, mock_popen, daemon_env):
         """start() calls Registry.register for each repo."""
@@ -889,6 +981,18 @@ class TestWatchDaemon:
         mock_beta.terminate.assert_called_once()
         assert len(daemon._children) == 0
         assert len(daemon._current_repos) == 0
+
+    def test_stop_closes_windows_job_when_child_termination_fails(self, daemon_env):
+        """Job Object cleanup runs even when child termination raises."""
+        daemon = daemon_env["daemon"]
+        daemon._windows_job = MagicMock()
+        daemon._terminate_child = MagicMock(side_effect=RuntimeError("cleanup failure"))
+        daemon._children = {"alpha": MagicMock()}
+
+        with pytest.raises(RuntimeError, match="cleanup failure"):
+            daemon.stop()
+
+        daemon._windows_job.close.assert_called_once_with()
 
     @patch("code_review_graph.daemon.subprocess.Popen")
     @patch("code_review_graph.registry.Registry")

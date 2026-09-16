@@ -1335,7 +1335,12 @@ class WatchDaemon:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait(timeout=5)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(
+                            "Watcher '%s' remained alive after SIGKILL", repo.alias
+                        )
             log_fd.close()
             logger.exception("Failed to start watcher for '%s'", repo.alias)
             return
