@@ -163,6 +163,7 @@ markers = [
     "upgrade: installs released versions from PyPI, builds a graph with each, and upgrades it with the current code (needs uv and network; minutes and hundreds of MB)",
     "surface: drives every registered MCP tool and prompt through a real client over stdio",
     "corpus: builds the graph over pinned real repositories and compares recorded baselines",
+    "exports: slow conformance checks for every artefact the tool writes (visualize --format html/json/graphml/cypher/obsidian/svg, and wiki)",
 ]
 
 [dependency-groups]
