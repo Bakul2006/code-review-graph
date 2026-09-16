@@ -321,10 +321,12 @@ class TestRustParsing:
         funcs = {n.name for n in self.nodes if n.kind == "Function"}
         assert "create_user" in funcs
         assert "new" in funcs
-        # `create_user` carries no `#[test]` — must stay Function.
+        # `create_user` carries no `#[test]` — must stay Function. The
+        # fixture lives under tests/, so every node in it is test code and
+        # `kind` is what records the attribute detector's answer.
         for n in self.nodes:
             if n.name == "create_user":
-                assert not n.is_test
+                assert n.kind == "Function"
 
 
 class TestJavaParsing:
@@ -1517,7 +1519,9 @@ class TestPHPTestAnnotations:
         nodes, _ = self._parse(tmp_path)
         m = next(n for n in nodes if n.name == "testDatabaseAvailable")
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_docblock_annotation_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
@@ -1556,7 +1560,9 @@ class TestPHPTestAnnotations:
             n for n in nodes if n.name == "unrelated_qualified_attribute"
         )
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_unrelated_aliased_attribute_is_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
@@ -1564,19 +1570,25 @@ class TestPHPTestAnnotations:
             n for n in nodes if n.name == "unrelated_aliased_attribute"
         )
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_similar_docblock_tag_is_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
         m = next(n for n in nodes if n.name == "documented_helper")
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_plain_method_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
         m = next(n for n in nodes if n.name == "helperNotATest")
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
 
 class TestPHPImportResolution:

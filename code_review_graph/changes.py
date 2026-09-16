@@ -16,7 +16,7 @@ from typing import Any
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .flows import get_affected_flows
 from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
-from .parser import normalize_file_path
+from .parser import is_test_file, normalize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -493,7 +493,13 @@ def analyze_changes(
     # Detect test gaps: changed functions without TESTED_BY edges.
     test_gaps: list[dict[str, Any]] = []
     for node in changed_funcs:
-        if node.is_test:
+        # A symbol that lives in a test file is test code and can never be a
+        # gap in production test coverage. The path is checked as well as the
+        # stored flag so a graph built before the parser marked non-function
+        # test nodes still gives the right answer: those rows carry
+        # ``is_test = 0`` and used to be reported back to the author as their
+        # own tests needing tests (issue #1014).
+        if node.is_test or is_test_file(node.file_path):
             continue
         if node.name in _TEST_GAP_EXEMPT_NAMES:
             continue

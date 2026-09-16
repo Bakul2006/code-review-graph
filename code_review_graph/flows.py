@@ -16,6 +16,7 @@ from typing import Optional
 
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .graph import FlowAdjacency, GraphNode, GraphStore, _sanitize_name
+from .parser import is_test_file as _is_test_file
 from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
@@ -150,16 +151,6 @@ def _matches_entry_name(node: GraphNode) -> bool:
         if pat.search(node.name):
             return True
     return False
-
-
-_TEST_FILE_RE = re.compile(
-    r"([\\/]__tests__[\\/]|\.spec\.[jt]sx?$|\.test\.[jt]sx?$|[\\/]test_[^/\\]*\.py$)",
-)
-
-
-def _is_test_file(file_path: str) -> bool:
-    """Return True if *file_path* looks like a test file."""
-    return bool(_TEST_FILE_RE.search(file_path))
 
 
 def detect_entry_points(

@@ -19,6 +19,7 @@ from typing import Any, Optional, Union
 
 from .flows import _has_framework_decorator, _matches_entry_name
 from .graph import GraphStore, _sanitize_name
+from .parser import is_test_file as _is_test_file
 
 logger = logging.getLogger(__name__)
 
@@ -201,19 +202,6 @@ def _is_entry_point(node: Any) -> bool:
     return False
 
 
-# Matches identifiers inside type annotations (e.g. "GoalCreate" in
-# "body: GoalCreate", "Optional[UserResponse]", "list[Item]").
-_TEST_FILE_RE = re.compile(
-    r"([\\/]__tests__[\\/]|\.spec\.[jt]sx?$|\.test\.[jt]sx?$|[\\/]test_[^/\\]*\.py$"
-    r"|[\\/]e2e[_-]?tests?[\\/]|[\\/]test[_-]utils?[\\/])",
-)
-
-
-def _is_test_file(file_path: str) -> bool:
-    """Return True if *file_path* looks like a test file."""
-    return bool(_TEST_FILE_RE.search(file_path))
-
-
 _MIN_PKG_SEGMENT_LEN = 4  # ignore short dirs like "src", "lib", "app"
 
 
@@ -227,6 +215,8 @@ def _path_segments(file_path: str) -> tuple[str, ...]:
     )
 
 
+# Matches identifiers inside type annotations (e.g. "GoalCreate" in
+# "body: GoalCreate", "Optional[UserResponse]", "list[Item]").
 _TYPE_IDENT_RE = re.compile(r"[A-Z][A-Za-z0-9_]*")
 
 

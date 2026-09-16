@@ -1331,23 +1331,48 @@ _TEST_PATTERNS = [
     re.compile(r"_spec$"),
 ]
 
+# Path separator or start of string.  Directory and stem patterns anchor on
+# it so "src/latest/" is not read as a "test/" directory and "contests/" is
+# not read as "tests/".  Both separators are accepted: the graph stores POSIX
+# paths, but callers pass native ones.
+_SEP = r"(?:^|[\\/])"
+
+# The single definition of "this file holds test code", shared by the parser,
+# flow detection, dead-code detection and the untested-code report.
 _TEST_FILE_PATTERNS = [
-    re.compile(r"test_.*\.py$"),
-    re.compile(r".*_test\.py$"),
-    re.compile(r".*\.test\.[jt]sx?$"),
-    re.compile(r".*\.spec\.[jt]sx?$"),
-    re.compile(r".*_test\.go$"),
-    re.compile(r"tests?/"),
-    re.compile(r"[\\/]__tests__[\\/]"),
-    re.compile(r".*_test\.dart$"),
-    re.compile(r"test[_-].*\.[rR]$"),
-    re.compile(r"tests/testthat/"),
-    re.compile(r".*Test\.kt$"),
-    re.compile(r".*Test\.java$"),
-    re.compile(r".*_test\.resi?$"),
-    re.compile(r".*\.test\.resi?$"),
-    re.compile(r"test/runtests\.jl$"),
-    re.compile(r"test/.*\.jl$"),
+    # Directory conventions.  ``tests?/`` covers Python ``tests/``, Go and
+    # Rust ``tests/`` and Java/Kotlin ``src/test/``; ``specs?/`` covers Ruby
+    # RSpec.
+    re.compile(_SEP + r"tests?[\\/]"),
+    re.compile(_SEP + r"specs?[\\/]"),
+    re.compile(_SEP + r"__tests__[\\/]"),
+    re.compile(_SEP + r"e2e[_-]?tests?[\\/]"),
+    re.compile(_SEP + r"test[_-]utils?[\\/]"),
+    re.compile(_SEP + r"testthat[\\/]"),
+    # Python: pytest/unittest stems plus conftest, which holds fixtures.
+    re.compile(_SEP + r"test_[^\\/]*\.py$"),
+    re.compile(r"_test\.py$"),
+    re.compile(_SEP + r"conftest\.py$"),
+    # JavaScript / TypeScript.
+    re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$"),
+    # Go.
+    re.compile(r"_test\.go$"),
+    # Ruby.
+    re.compile(r"_(?:test|spec)\.rb$"),
+    # Java / Kotlin / Scala / Groovy.
+    re.compile(r"Tests?\.(?:java|kt|kts|scala|groovy)$"),
+    # C#.
+    re.compile(r"Tests?\.cs$"),
+    # PHP (PHPUnit).
+    re.compile(r"Test\.php$"),
+    # Dart.
+    re.compile(r"_test\.dart$"),
+    # R.
+    re.compile(_SEP + r"test[_-][^\\/]*\.[rR]$"),
+    # ReScript.
+    re.compile(r"[_.]test\.resi?$"),
+    # Julia.
+    re.compile(_SEP + r"runtests\.jl$"),
 ]
 
 _TEST_RUNNER_NAMES = frozenset({
@@ -1951,8 +1976,19 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
     return modules
 
 
-def _is_test_file(path: str) -> bool:
+def is_test_file(path: str) -> bool:
+    """Return whether *path* holds test code.
+
+    Everything in a test file is test code: the test functions, the classes
+    that group them, the fixtures and the private helpers they call.  Callers
+    outside the parser use this to keep test-file symbols out of reports about
+    production code.
+    """
     return any(p.search(path) for p in _TEST_FILE_PATTERNS)
+
+
+# Historical private spelling, kept because other modules import it.
+_is_test_file = is_test_file
 
 
 def _is_test_function(
@@ -2746,6 +2782,24 @@ class CodeParser:
         *source* so the stored file hash always describes the bytes that were
         actually parsed (issue #746).
         """
+        nodes, edges = self._extract_bytes(path, source)
+        # Every node from a test file is test code, whatever its kind: the
+        # test classes, the fixtures and the private helpers as much as the
+        # test functions.  Marking them here rather than at each of the ~40
+        # NodeInfo construction sites is what keeps Class nodes from being
+        # reported as untested production code (issue #1014).  It runs after
+        # extraction so TESTED_BY generation, which keys off the test
+        # functions alone, is unaffected.
+        fallback_path = normalize_file_path(path)
+        for node in nodes:
+            if not node.is_test and is_test_file(node.file_path or fallback_path):
+                node.is_test = True
+        return nodes, edges
+
+    def _extract_bytes(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Language dispatch for :meth:`parse_bytes`."""
         language = self.detect_language(path, source)
         if not language:
             return [], []

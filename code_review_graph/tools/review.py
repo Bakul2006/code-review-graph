@@ -16,7 +16,7 @@ from ..incremental import (
     get_staged_and_unstaged,
     resolve_review_base,
 )
-from ..parser import normalize_file_path
+from ..parser import is_test_file, normalize_file_path
 from ._common import (
     _bounded,
     _get_store,
@@ -175,10 +175,15 @@ def get_review_context(
                 n.name for n in impact["changed_nodes"][:5]
             ]
 
-            # Count test gaps among changed functions.
+            # Count test gaps among changed functions. The file path is
+            # checked as well as the stored flag so a graph built before
+            # the parser marked every test-file node (#1014) does not count
+            # test helpers as untested production code.
             changed_funcs = [
                 n for n in impact["changed_nodes"]
-                if n.kind == "Function" and not n.is_test
+                if n.kind == "Function"
+                and not n.is_test
+                and not is_test_file(n.file_path)
             ]
             test_edges = [
                 e for e in impact["edges"] if e.kind == "TESTED_BY"
@@ -379,7 +384,9 @@ def _generate_review_guidance(
 
     untested = [
         f for f in changed_funcs
-        if f.qualified_name not in tested_funcs and not f.is_test
+        if f.qualified_name not in tested_funcs
+        and not f.is_test
+        and not is_test_file(f.file_path)
     ]
     if untested:
         guidance_parts.append(
