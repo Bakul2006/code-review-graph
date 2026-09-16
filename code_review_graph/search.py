@@ -535,7 +535,6 @@ _MIN_PREFIX_ALNUM = 3
 _MAX_FTS_TERMS = 12
 
 
-
 def _quote_term(text: str) -> str:
     """Return *text* as a single FTS5 string, with inner quotes doubled.
 
