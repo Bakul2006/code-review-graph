@@ -2743,6 +2743,25 @@ class TestElixirParsing:
             for edge in edges
         )
 
+    @pytest.mark.parametrize(
+        "name, declaration",
+        [
+            ("compound", b"  def compound(a, b) when a and b, do: a\n"),
+            ("stacked", b"  def stacked(x) when g1 when g2, do: x\n"),
+            ("private_guarded", b"  defp private_guarded(x) when is_integer(x), do: x\n"),
+            ("macro_guarded", b"  defmacro macro_guarded(x) when is_atom(x), do: x\n"),
+            ("zero_guarded", b"  def zero_guarded when is_boolean(true), do: :zero\n"),
+        ],
+    )
+    def test_guarded_function_forms_are_parsed(self, tmp_path, name, declaration):
+        path = tmp_path / f"{name}.ex"
+        source = b"defmodule T do\n" + declaration + b"end\n"
+
+        nodes, _ = self.parser.parse_bytes(path, source)
+
+        functions = [node for node in nodes if node.kind == "Function"]
+        assert [node.name for node in functions] == [name]
+
     def test_multi_clause_functions_keep_the_full_graph_range(self, tmp_path):
         path = tmp_path / "clauses.ex"
         source = (
@@ -2761,12 +2780,16 @@ class TestElixirParsing:
         ]
         assert [(node.line_start, node.line_end) for node in clauses] == [(4, 4), (5, 5)]
 
-        with GraphStore(tmp_path / "clauses.db") as store:
-            store.store_file_nodes_edges(path, nodes, edges)
-            multi = store.get_node(f"{path.as_posix()}::T.multi")
+        for writer_name, writer in (
+            ("nodes_edges", lambda store: store.store_file_nodes_edges(path, nodes, edges)),
+            ("batch", lambda store: store.store_file_batch([(str(path), nodes, edges, "")])),
+        ):
+            with GraphStore(tmp_path / f"clauses-{writer_name}.db") as store:
+                writer(store)
+                multi = store.get_node(f"{path.as_posix()}::T.multi")
 
-        assert multi is not None
-        assert (multi.line_start, multi.line_end) == (4, 5)
+            assert multi is not None
+            assert (multi.line_start, multi.line_end) == (4, 5)
 
 
 class TestGDScriptParsing:
