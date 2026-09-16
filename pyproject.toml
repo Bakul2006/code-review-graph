@@ -155,7 +155,7 @@ norecursedirs = ["tests/fixtures"]
 # Chromium build (`python -m playwright install chromium`). CI runs them in
 # the separate "viz-browser" job; the coverage job excludes them.
 markers = [
-    "e2e: end-to-end tests that spawn the MCP server or CLI as a real subprocess",
+    "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
 ]
 
