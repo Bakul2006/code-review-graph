@@ -40,3 +40,25 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
     # unset, a miss would be silently destructive; set, it cannot be.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("hermes-home")))
     return home
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip the pinned real-repository corpus unless the run asks for it.
+
+    The corpus check clones eight projects and builds a graph over each: minutes
+    of work and a network dependency. Marking it is not enough on its own —
+    ``pytest tests/`` and CI's ``-m "not browser"`` job would still collect and
+    run it — so every ``corpus``-marked item is skipped unless the ``-m``
+    expression names the marker. ``pytest -m corpus`` runs it; nothing else
+    does.
+    """
+    from tests.real_repo_corpus import corpus_selected
+
+    if corpus_selected(config.getoption("-m", default="")):
+        return
+    skip_corpus = pytest.mark.skip(
+        reason="pinned real-repository corpus: run it with `pytest -m corpus`"
+    )
+    for item in items:
+        if "corpus" in item.keywords:
+            item.add_marker(skip_corpus)

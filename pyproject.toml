@@ -157,6 +157,10 @@ norecursedirs = ["tests/fixtures"]
 markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
+    # Opt-in only: tests/conftest.py skips corpus-marked items unless the run's
+    # -m expression names the marker, so `pytest tests/` and the coverage job
+    # never pay for eight clones and eight full builds.
+    "corpus: builds the graph over pinned real repositories and compares recorded baselines",
 ]
 
 [dependency-groups]
