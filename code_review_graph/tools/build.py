@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 from ..incremental import (
@@ -12,6 +13,7 @@ from ..incremental import (
     incremental_update,
     resolve_incremental_base,
 )
+from ..parser import normalize_file_path
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
@@ -47,12 +49,32 @@ def _run_embedding_refresh(
         )
 
 
+def _fts_file_hint(
+    repo_root: str | None,
+    changed_files: list[str] | None,
+) -> list[str] | None:
+    """Spell *changed_files* the way ``nodes.file_path`` stores them.
+
+    Change discovery reports repository-relative paths while the graph keys
+    nodes by their normalised absolute path. A hint that matches nothing is
+    harmless (the delta still repairs every added and removed row) but it
+    buys nothing either, so resolve it whenever the root is known.
+    """
+    if not changed_files:
+        return None
+    if repo_root is None:
+        return [normalize_file_path(path) for path in changed_files]
+    root = Path(repo_root)
+    return [normalize_file_path(root / path) for path in changed_files]
+
+
 def _run_postprocess(
     store: Any,
     build_result: dict[str, Any],
     postprocess: str,
     full_rebuild: bool = False,
     changed_files: list[str] | None = None,
+    repo_root: str | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> list[str]:
@@ -144,11 +166,21 @@ def _run_postprocess(
 
     stage_started = time.perf_counter()
     try:
-        from code_review_graph.search import rebuild_fts_index
+        from code_review_graph.search import rebuild_fts_index, update_fts_index
 
-        fts_count = rebuild_fts_index(store)
-        build_result["fts_indexed"] = fts_count
-        build_result["fts_rebuilt"] = True
+        if full_rebuild:
+            build_result["fts_indexed"] = rebuild_fts_index(store)
+            build_result["fts_rebuilt"] = True
+        else:
+            # An update knows which files it re-parsed, so the index only has
+            # to rewrite those rows instead of being dropped and repopulated.
+            mode: list[str] = []
+            build_result["fts_indexed"] = update_fts_index(
+                store,
+                _fts_file_hint(repo_root, changed_files),
+                _out_mode=mode,
+            )
+            build_result["fts_rebuilt"] = mode == ["rebuild"]
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("FTS index rebuild failed: %s", e)
         warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")
@@ -606,6 +638,7 @@ def build_or_update_graph(
             postprocess,
             full_rebuild=full_rebuild,
             changed_files=changed,
+            repo_root=str(root),
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
         )

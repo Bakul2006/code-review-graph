@@ -41,7 +41,7 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 
 _KNOWN_TABLES = frozenset({
     "nodes", "edges", "metadata", "communities", "flows", "flow_memberships", "nodes_fts",
-    "community_summaries", "flow_snapshots", "risk_index",
+    "community_summaries", "flow_snapshots", "risk_index", "nodes_fts_state",
 })
 
 
@@ -316,6 +316,31 @@ def _migrate_v11(conn: sqlite3.Connection) -> None:
     )
     logger.info("Migration v11: added indexed edges.target_resolution column")
 
+def _migrate_v12(conn: sqlite3.Connection) -> None:
+    """v12: Add ``nodes_fts_state``, the mirror of what ``nodes_fts`` holds.
+
+    ``nodes_fts`` is an external content table, so deleting one of its
+    entries requires the column values that were indexed, and those are
+    gone once the node row is deleted.  Mirroring the indexed text here lets
+    an incremental update rewrite just the rows that changed instead of
+    dropping and repopulating the whole index.  The table starts empty; the
+    first index sync after the migration fills it with a full rebuild.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS nodes_fts_state ("
+        "  node_id INTEGER PRIMARY KEY,"
+        "  name TEXT,"
+        "  qualified_name TEXT,"
+        "  file_path TEXT,"
+        "  signature TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_fts_state_file "
+        "ON nodes_fts_state(file_path)"
+    )
+    logger.info("Migration v12: added nodes_fts_state index mirror")
+
 
 # ---------------------------------------------------------------------------
 # Migration registry
@@ -332,6 +357,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     9: _migrate_v9,
     10: _migrate_v10,
     11: _migrate_v11,
+    12: _migrate_v12,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())

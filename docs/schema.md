@@ -247,7 +247,24 @@ CREATE TABLE risk_index (
     last_computed TEXT DEFAULT '',
     FOREIGN KEY (node_id) REFERENCES nodes(id)
 );
+
+-- v11
+CREATE TABLE nodes_fts_state (
+    node_id INTEGER PRIMARY KEY,
+    name TEXT,
+    qualified_name TEXT,
+    file_path TEXT,
+    signature TEXT
+);
+CREATE INDEX idx_nodes_fts_state_file ON nodes_fts_state(file_path);
 ```
+
+`nodes_fts` is an external content table: it holds the inverted index but reads column
+values from `nodes`. Removing one of its entries therefore needs the values that were
+indexed, and those are gone once the node row is deleted. `nodes_fts_state` mirrors what
+the index currently holds so `search.update_fts_index` can rewrite just the rows an
+update touched instead of dropping and repopulating the whole index. It starts empty
+after the migration; the first index sync fills it with one full rebuild.
 
 ### Embeddings
 
@@ -315,3 +332,4 @@ Each migration runs in its own transaction and updates `schema_version` on succe
 | 9 | `edges.confidence`, `edges.confidence_tier` |
 | 10 | `nodes.symbol`, back-filled from `qualified_name`, and `idx_nodes_symbol` |
 | 11 | `edges.target_resolution`, back-filled for `CALLS`/`REFERENCES`, and `idx_edges_kind_target_resolution` |
+| 12 | `nodes_fts_state`, the mirror of the FTS index, and `idx_nodes_fts_state_file` |
