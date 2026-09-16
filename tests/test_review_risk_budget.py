@@ -5,13 +5,20 @@ the changed-file list, which is the order Git happened to emit. One
 alphabetically early 500-line file could take 500 of the 800 lines while the
 riskiest changed function in the pull request got nothing at all.
 
+Ranking the files fixed who got served but not what they got: the snippet
+builder had no idea where in a file the change was, so a per-file line quota
+bought the top of a merged window. The budget is therefore spent on whole
+changed regions instead.
+
 These tests pin the replacement contract:
 
 * the file list is ranked by the same risk score ``changes.py`` computes,
-* every served file gets a floor so nothing silently drops to zero,
+* a served file gets whole regions, never a fragment of one,
+* regions come from the diff hunks when Git can supply them,
+* a one-region file costs one region and a many-region file gets many turns,
 * no single file may take more than its capped share,
-* the allocation is computed once from the full ranked list,
-* ``truncated`` / ``source_truncated`` still describe what really happened,
+* ``truncated`` / ``source_truncated`` / ``source_regions`` describe what
+  really happened,
 * the 800-line total is never exceeded.
 """
 
@@ -19,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +54,16 @@ def _emitted_lines(snippet: str) -> int:
 
 def _total_emitted(snippets: dict[str, str]) -> int:
     return sum(_emitted_lines(s) for s in snippets.values())
+
+
+def _line_numbers(snippet: str) -> set[int]:
+    """The 1-based source line numbers a snippet actually shows."""
+    return {
+        int(line.split(":", 1)[0])
+        for line in snippet.splitlines()
+        if _NUMBERED_LINE.match(line)
+    }
+
 
 
 def _padded_module(prefix: str) -> str:
@@ -160,17 +178,23 @@ class TestRiskOrderedAllocation:
         )
         assert emitted == whole
 
-    def test_every_served_file_gets_at_least_the_floor(self, risky_repo):
-        snippets = _context(risky_repo)["source_snippets"]
-        for name, text in snippets.items():
-            emitted = _emitted_lines(text)
-            source_lines = len(
-                (Path(risky_repo["root"]) / name)
-                .read_text(encoding="utf-8").splitlines()
+    def test_no_served_file_is_empty(self, risky_repo):
+        context = _context(risky_repo)
+        for name, text in context["source_snippets"].items():
+            assert _line_numbers(text), f"{name} was served an empty snippet"
+
+    def test_incomplete_files_are_reported_not_hidden(self, risky_repo):
+        context = _context(risky_repo)
+        regions = context["source_regions"]
+        assert regions["shown"] < regions["total"]
+        assert regions["incomplete"], (
+            "a budget that could not show every region must name the files"
+        )
+        for name, (shown, total) in regions["incomplete"].items():
+            assert shown < total
+            assert f"{total - shown} more changed region(s) not shown" in (
+                context["source_snippets"][name]
             )
-            assert emitted >= min(
-                review_mod._MIN_SOURCE_LINES_PER_FILE, source_lines,
-            ), f"{name} fell below the per-file floor"
 
     def test_total_budget_is_never_exceeded(self, risky_repo):
         context = _context(risky_repo, max_lines_per_file=10_000)
@@ -210,39 +234,286 @@ class TestRiskOrderedAllocation:
         assert emitted == whole
 
 
-class TestAllocationUnit:
-    """The allocator is a pure function: one pass over the ranked list."""
+class _Node:
+    """The only two attributes the region builder reads off a graph node."""
 
-    def test_allocates_once_in_rank_order(self):
-        ranked = ["hot.py", "warm.py", "cold.py"]
-        alloc = review_mod._allocate_source_lines(ranked, 800, 500)
-        assert alloc["hot.py"] >= alloc["warm.py"] >= alloc["cold.py"]
-        assert sum(alloc.values()) <= 800
+    def __init__(self, line_start: int, line_end: int) -> None:
+        self.line_start = line_start
+        self.line_end = line_end
 
-    def test_every_file_gets_a_floor_while_the_budget_lasts(self):
-        ranked = [f"f{i}.py" for i in range(10)]
-        alloc = review_mod._allocate_source_lines(ranked, 800, 500)
-        assert set(alloc) == set(ranked)
-        assert min(alloc.values()) >= review_mod._MIN_SOURCE_LINES_PER_FILE
 
-    def test_single_file_share_is_capped(self):
-        alloc = review_mod._allocate_source_lines(["only.py", "other.py"], 800, 500)
-        cap = int(800 * review_mod._MAX_SOURCE_SHARE_PER_FILE)
-        assert alloc["only.py"] <= cap
-        assert alloc["other.py"] >= review_mod._MIN_SOURCE_LINES_PER_FILE
+class TestRegionBuilder:
+    """Where the budget is spent: the diff hunks, not the whole file."""
 
-    def test_more_files_than_floors_serves_the_top_of_the_ranking(self):
-        ranked = [f"f{i}.py" for i in range(200)]
-        alloc = review_mod._allocate_source_lines(ranked, 800, 500)
-        served = [f for f in ranked if alloc.get(f, 0) > 0]
-        assert len(served) == 800 // review_mod._MIN_SOURCE_LINES_PER_FILE
-        assert served == ranked[:len(served)]
-        assert sum(alloc.values()) <= 800
+    def test_hunks_far_apart_stay_separate_regions(self):
+        regions = review_mod._file_regions(
+            line_count=400, hunks=[(10, 12), (200, 202)], nodes=[],
+            region_cap=120,
+        )
+        assert len(regions) == 2
+        assert regions[0][1] < regions[1][0]
+
+    def test_a_hunk_is_widened_to_a_small_enclosing_definition(self):
+        node = _Node(20, 50)  # 31 lines, worth reading whole
+        regions = review_mod._file_regions(
+            line_count=400, hunks=[(30, 31)], nodes=[node], region_cap=120,
+        )
+        assert len(regions) == 1
+        start, end = regions[0]
+        assert start + 1 <= node.line_start
+        assert end >= node.line_end
+
+    def test_a_hunk_in_a_huge_definition_keeps_its_own_window(self):
+        """A 400-line function is not worth half the shared budget."""
+        node = _Node(1, 400)
+        regions = review_mod._file_regions(
+            line_count=400, hunks=[(200, 201)], nodes=[node], region_cap=120,
+        )
+        assert len(regions) == 1
+        start, end = regions[0]
+        assert end - start <= 2 * review_mod._REGION_CONTEXT + 6
+        assert end - start < node.line_end - node.line_start
+
+    def test_merging_never_exceeds_the_region_cap(self):
+        """The old builder merged every span into one file-wide window."""
+        hunks = [(i, i + 1) for i in range(1, 400, 4)]
+        regions = review_mod._file_regions(
+            line_count=500, hunks=hunks, nodes=[], region_cap=60,
+        )
+        assert len(regions) > 1
+        assert all(end - start <= 60 for start, end in regions)
+
+    def test_a_small_file_is_still_shown_whole(self):
+        regions = review_mod._file_regions(
+            line_count=40, hunks=[(5, 6)], nodes=[], region_cap=120,
+        )
+        assert regions == [(0, 40)]
+
+    def test_a_file_the_graph_and_git_both_miss_falls_back_to_its_head(self):
+        regions = review_mod._file_regions(
+            line_count=900, hunks=[], nodes=[], region_cap=120,
+        )
+        assert regions == [(0, review_mod._FALLBACK_HEAD_LINES)]
+
+
+class TestRegionAllocation:
+    """The allocator is a pure function over the ranked region lists."""
+
+    @staticmethod
+    def _regions(count: int, size: int = 10, gap: int = 100):
+        return [(i * gap, i * gap + size) for i in range(count)]
+
+    def test_regions_are_granted_whole(self):
+        granted, _ = review_mod._allocate_regions(
+            ["a.py"], {"a.py": self._regions(3, size=30)}, 800, 500,
+        )
+        assert all(end - start == 30 for start, end in granted["a.py"])
+
+    def test_a_one_region_file_costs_one_region(self):
+        granted, omitted = review_mod._allocate_regions(
+            ["small.py", "big.py"],
+            {"small.py": self._regions(1), "big.py": self._regions(20)},
+            800, 500,
+        )
+        assert len(granted["small.py"]) == 1
+        assert omitted.get("small.py") is None
+        assert len(granted["big.py"]) == 20, (
+            "a many-region file must get many turns, not one share"
+        )
+
+    def test_round_robin_serves_every_file_before_any_file_twice(self):
+        files = [f"f{i}.py" for i in range(8)]
+        regions = {f: self._regions(6, size=30) for f in files}
+        granted, _ = review_mod._allocate_regions(files, regions, 240, 500)
+        assert sorted(len(v) for v in granted.values()) == [1] * 8
+
+    def test_the_riskiest_files_win_when_the_budget_runs_dry(self):
+        files = ["hot.py", "warm.py", "cold.py"]
+        regions = {f: self._regions(1, size=40) for f in files}
+        granted, omitted = review_mod._allocate_regions(
+            files, regions, 100, 500,
+        )
+        assert set(granted) == {"hot.py", "warm.py"}
+        assert omitted == {"cold.py": 1}
+
+    def test_no_file_exceeds_its_share_of_the_budget(self):
+        files = ["a.py", "b.py", "c.py"]
+        regions = {f: self._regions(40, size=20) for f in files}
+        granted, _ = review_mod._allocate_regions(files, regions, 800, 500)
+        cap = review_mod._source_share_cap(800, 500)
+        for name, got in granted.items():
+            held = sum(end - start for start, end in got)
+            assert held <= cap, f"{name} starved the rest of the ranking"
 
     def test_per_file_limit_is_respected(self):
-        alloc = review_mod._allocate_source_lines(["a.py", "b.py"], 800, 25)
-        assert max(alloc.values()) <= 25
+        granted, _ = review_mod._allocate_regions(
+            ["a.py", "b.py"],
+            {"a.py": self._regions(10), "b.py": self._regions(10)},
+            800, 25,
+        )
+        for got in granted.values():
+            assert sum(end - start for start, end in got) <= 25
+
+    def test_the_total_budget_is_never_exceeded(self):
+        files = [f"f{i}.py" for i in range(30)]
+        regions = {f: self._regions(30, size=17) for f in files}
+        granted, _ = review_mod._allocate_regions(files, regions, 800, 500)
+        total = sum(
+            end - start for got in granted.values() for start, end in got
+        )
+        assert total <= 800
+
+    def test_a_region_larger_than_the_cap_is_truncated_not_dropped(self):
+        granted, _ = review_mod._allocate_regions(
+            ["a.py"], {"a.py": [(0, 5_000)]}, 800, 500,
+        )
+        (start, end), = granted["a.py"]
+        assert end - start == min(
+            review_mod._MAX_REGION_LINES,
+            review_mod._source_share_cap(800, 500),
+        )
 
     def test_empty_inputs_allocate_nothing(self):
-        assert review_mod._allocate_source_lines([], 800, 500) == {}
-        assert review_mod._allocate_source_lines(["a.py"], 0, 500) == {}
+        assert review_mod._allocate_regions([], {}, 800, 500) == ({}, {})
+        granted, omitted = review_mod._allocate_regions(
+            ["a.py"], {"a.py": self._regions(2)}, 0, 500,
+        )
+        assert granted == {}
+        assert omitted == {"a.py": 2}
+
+
+# ---------------------------------------------------------------------------
+# What the reviewer actually receives, measured against the real diff hunks.
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.email=test@example.com",
+            "-c", "user.name=Test",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        capture_output=True, check=True, cwd=repo,
+        stdin=subprocess.DEVNULL, text=True, timeout=30,
+    )
+
+
+def _spread_module(bodies: int, filler: int) -> list[str]:
+    """A module whose functions sit far enough apart not to merge."""
+    lines = ['"""Spread module."""', ""]
+    for fn in range(bodies):
+        lines.append(f"def spread_step_{fn}(value):")
+        lines.append(f'    """Step {fn}."""')
+        lines.append(f"    value = value + {fn}")
+        lines.append("    return value")
+        lines.append("")
+        lines.extend(f"# filler {fn}.{i}" for i in range(filler))
+        lines.append("")
+    return lines
+
+
+@pytest.fixture(scope="module")
+def hunky_repo(tmp_path_factory) -> dict[str, Any]:
+    """A committed repo with six well-separated changes in one file."""
+    root = tmp_path_factory.mktemp("hunky-repo")
+    (root / ".code-review-graph").mkdir(parents=True, exist_ok=True)
+    _git(root, "init", "-q")
+
+    lines = _spread_module(bodies=6, filler=30)
+    (root / "spread.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (root / "other.py").write_text(
+        "\n".join(_spread_module(bodies=2, filler=30)) + "\n", encoding="utf-8",
+    )
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "base")
+
+    # One changed line inside each of the six functions: six hunks, spread
+    # across ~230 lines, which is exactly the shape the old single merged
+    # window could not serve.
+    edited = [
+        line.replace("    return value", "    return value + 1")
+        for line in lines
+    ]
+    (root / "spread.py").write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    os.environ["CRG_SERIAL_PARSE"] = "1"
+    with GraphStore(root / ".code-review-graph" / "graph.db") as store:
+        full_build(root, store)
+
+    hunks = len(re.findall(
+        r"^@@ ",
+        subprocess.run(
+            ["git", "diff", "--unified=0", "HEAD", "--", "spread.py"],
+            capture_output=True, check=True, cwd=root, text=True,
+        ).stdout,
+        re.MULTILINE,
+    ))
+    return {"root": str(root), "hunks": hunks}
+
+
+class TestHunkCoverage:
+    """File count is not the metric: complete changed regions are."""
+
+    def test_the_fixture_really_has_several_spread_hunks(self, hunky_repo):
+        assert hunky_repo["hunks"] == 6
+
+    def test_every_hunk_is_shown_when_the_budget_allows(self, hunky_repo):
+        result = get_review_context(
+            repo_root=hunky_repo["root"], base="HEAD", include_source=True,
+        )
+        assert result["status"] == "ok"
+        context = result["context"]
+        numbers = _line_numbers(context["source_snippets"]["spread.py"])
+        source = (
+            Path(hunky_repo["root"]) / "spread.py"
+        ).read_text(encoding="utf-8").splitlines()
+        changed = {
+            i + 1 for i, line in enumerate(source)
+            if line.strip() == "return value + 1"
+        }
+        assert len(changed) == hunky_repo["hunks"]
+        assert changed <= numbers, (
+            "the budget was spent somewhere other than the changed lines"
+        )
+        assert context["source_regions"]["shown"] == (
+            context["source_regions"]["total"]
+        )
+
+    def test_a_tight_budget_still_shows_whole_regions_and_says_what_is_missing(
+        self, hunky_repo,
+    ):
+        result = get_review_context(
+            repo_root=hunky_repo["root"], base="HEAD", include_source=True,
+            max_lines_per_file=12,
+        )
+        context = result["context"]
+        snippet = context["source_snippets"]["spread.py"]
+        numbers = _line_numbers(snippet)
+        source = (
+            Path(hunky_repo["root"]) / "spread.py"
+        ).read_text(encoding="utf-8").splitlines()
+        changed = {
+            i + 1 for i, line in enumerate(source)
+            if line.strip() == "return value + 1"
+        }
+        shown_changes = changed & numbers
+        assert shown_changes, "a tight budget must still buy a whole region"
+        assert len(shown_changes) < len(changed), "expected a tight budget"
+        # Whole regions: each shown change carries its definition around it.
+        for line_no in shown_changes:
+            assert line_no - 2 in numbers and line_no - 1 in numbers
+        assert "more changed region(s) not shown" in snippet
+        assert context["source_truncated"] is True
+
+    def test_a_clipped_region_is_declared_as_a_cut(self, hunky_repo):
+        """A region too big for its cap is served clipped, and says so."""
+        result = get_review_context(
+            repo_root=hunky_repo["root"], base="HEAD", include_source=True,
+            max_lines_per_file=5,
+        )
+        context = result["context"]
+        assert _emitted_lines(context["source_snippets"]["spread.py"]) == 5
+        assert context["source_truncated"] is True

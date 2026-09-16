@@ -100,6 +100,7 @@ def get_minimal_context(
         risk_score = 0.0
         top_affected: list[str] = []
         test_gap_count = 0
+        churn_status = "off"
         if changed_files or _has_git_changes(root, base):
             try:
                 from ..changes import analyze_changes
@@ -119,6 +120,7 @@ def get_minimal_context(
                         include_churn=True,
                     )
                     risk_score = analysis.get("risk_score", 0.0)
+                    churn_status = analysis.get("churn_status", "off")
                     risk = (
                         "high" if risk_score > 0.7
                         else "medium" if risk_score > 0.4
@@ -182,6 +184,14 @@ def get_minimal_context(
             summary_parts.append(f"Risk: {risk} ({risk_score:.2f}).")
         if test_gap_count:
             summary_parts.append(f"{test_gap_count} test gaps.")
+        if churn_status == "unavailable":
+            # The score above is missing a term worth up to 0.15. Saying so
+            # costs a handful of tokens; not saying so makes a degraded run
+            # indistinguishable from a healthy one.
+            summary_parts.append(
+                "Degraded: change-frequency risk unavailable (git history "
+                "too slow); risk excludes churn."
+            )
 
         return compact_response(
             summary=" ".join(summary_parts),

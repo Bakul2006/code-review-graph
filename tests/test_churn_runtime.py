@@ -20,7 +20,11 @@ from unittest.mock import patch
 import pytest
 
 from code_review_graph import changes as changes_mod
-from code_review_graph.changes import clear_churn_cache, compute_file_churn
+from code_review_graph.changes import (
+    clear_churn_cache,
+    compute_file_churn,
+    compute_file_churn_with_status,
+)
 from code_review_graph.graph import GraphStore, NodeInfo
 from code_review_graph.tools.context import get_minimal_context
 from code_review_graph.tools.review import detect_changes_func
@@ -121,6 +125,134 @@ class TestChurnCache:
         ) as run:
             assert compute_file_churn(str(repo)) == {}
         assert [c for c in run.call_args_list if "log" in c.args[0]] == []
+
+    def test_a_slow_repository_pays_the_timeout_once_not_once_per_call(
+        self, tmp_path,
+    ):
+        """The case the cache was claimed to cover, and did not.
+
+        Caching failures by HEAD commit only helps when ``git rev-parse``
+        still answers. On a repository slow enough to trip the churn timeout
+        the rev-parse that produces the key times out too, so nothing was
+        ever cached and every call paid two timeouts.
+        """
+        repo = _repo_with_commits(tmp_path / "repo")
+        calls: list[list[str]] = []
+
+        def everything_is_slow(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            raise subprocess.TimeoutExpired(cmd, 5)
+
+        with patch(
+            "code_review_graph.changes.subprocess.run",
+            side_effect=everything_is_slow,
+        ):
+            for _ in range(5):
+                assert compute_file_churn(str(repo)) == {}
+
+        assert len(calls) == 1, (
+            f"five calls span {len(calls)} git subprocesses; a slow "
+            "repository must stop paying after the first"
+        )
+        assert [c for c in calls if "log" in c] == []
+
+    def test_the_failure_cache_is_cleared_with_the_result_cache(self, tmp_path):
+        repo = _repo_with_commits(tmp_path / "repo")
+        with patch(
+            "code_review_graph.changes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["git"], 5),
+        ):
+            assert compute_file_churn(str(repo)) == {}
+
+        clear_churn_cache()
+        assert compute_file_churn(str(repo)) == {"app.py": 2}
+
+    def test_a_repository_without_commits_is_not_retried(self, tmp_path):
+        repo = tmp_path / "empty"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+
+        assert compute_file_churn(str(repo)) == {}
+        with patch(
+            "code_review_graph.changes.subprocess.run",
+            wraps=subprocess.run,
+        ) as run:
+            assert compute_file_churn(str(repo)) == {}
+        assert run.call_args_list == []
+
+
+class TestChurnDegradationIsVisible:
+    """A degraded risk score has to say so, not just log it."""
+
+    def test_status_distinguishes_ok_from_unavailable_from_off(self, tmp_path):
+        repo = _repo_with_commits(tmp_path / "repo")
+        counts, status = compute_file_churn_with_status(str(repo))
+        assert (counts, status) == ({"app.py": 2}, "ok")
+
+        assert compute_file_churn_with_status(str(repo), window_days=0) == (
+            {}, "off",
+        )
+
+        clear_churn_cache()
+        with patch(
+            "code_review_graph.changes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["git"], 5),
+        ):
+            assert compute_file_churn_with_status(str(repo)) == (
+                {}, "unavailable",
+            )
+
+    def test_detect_changes_reports_a_healthy_churn_lookup(self, tmp_path):
+        repo = _repo_with_commits(tmp_path / "repo")
+        _seeded_graph(repo)
+        result = detect_changes_func(
+            repo_root=str(repo), changed_files=["app.py"],
+        )
+        assert result["status"] == "ok"
+        assert result["churn_status"] == "ok"
+        assert "Degraded" not in result["summary"]
+
+    def test_detect_changes_says_when_the_churn_term_is_missing(self, tmp_path):
+        repo = _repo_with_commits(tmp_path / "repo")
+        _seeded_graph(repo)
+        with patch(
+            "code_review_graph.changes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["git"], 5),
+        ):
+            result = detect_changes_func(
+                repo_root=str(repo), changed_files=["app.py"],
+            )
+        assert result["status"] == "ok"
+        assert result["churn_status"] == "unavailable"
+        assert "change-frequency risk unavailable" in result["summary"]
+
+    def test_minimal_detail_still_carries_the_degradation(self, tmp_path):
+        repo = _repo_with_commits(tmp_path / "repo")
+        _seeded_graph(repo)
+        with patch(
+            "code_review_graph.changes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["git"], 5),
+        ):
+            result = detect_changes_func(
+                repo_root=str(repo), changed_files=["app.py"],
+                detail_level="minimal",
+            )
+        assert result["churn_status"] == "unavailable"
+
+    def test_minimal_context_says_when_risk_excludes_churn(self, tmp_path):
+        repo = _repo_with_commits(tmp_path / "repo")
+        _seeded_graph(repo)
+        with patch(
+            "code_review_graph.changes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["git"], 5),
+        ):
+            result = get_minimal_context(
+                task="review the pull request",
+                changed_files=["app.py"],
+                repo_root=str(repo),
+            )
+        assert result["status"] == "ok"
+        assert "risk excludes churn" in result["summary"]
 
 
 class TestChurnDegradesGracefully:
