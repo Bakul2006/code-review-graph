@@ -75,7 +75,7 @@ class TestIfNotExistsEndToEnd:
         self.parser = CodeParser()
 
     def _imports(self, sql: bytes) -> list:
-        _, edges = self.parser.parse_bytes(Path("pr838_schema.sql"), sql)
+        _, edges = self.parser.parse_bytes(Path("if_not_exists_schema.sql"), sql)
         return [e for e in edges if e.kind == "IMPORTS_FROM"]
 
     def test_many_idempotent_creates_all_recorded_with_lines(self):

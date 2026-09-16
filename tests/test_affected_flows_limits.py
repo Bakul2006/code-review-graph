@@ -4,11 +4,13 @@ Covers boundaries and scale beyond the PR's own tests: exact-boundary
 truncation, the default max_flows=50 cap on a 60-flow graph, negative and
 huge max_flows values, minimal projection combined with truncation,
 criticality ordering after projection, unknown detail_level fallback, and
-unicode changed-file paths.
+unicode changed-file paths. The empty-result `truncated` flag comes from
+PR #866.
 """
 
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from code_review_graph.graph import EdgeInfo, GraphStore, NodeInfo
 from code_review_graph.tools.review import get_affected_flows_func
@@ -214,3 +216,15 @@ class TestMinimalProjection(_FlowFixture):
         assert result["status"] == "ok"
         assert result["total"] == 0
         assert result["truncated"] is False
+
+
+def test_affected_flows_empty_result_includes_truncated(monkeypatch, tmp_path):
+    store = MagicMock()
+    monkeypatch.setattr(
+        "code_review_graph.tools.review._get_store",
+        lambda _root: (store, tmp_path),
+    )
+
+    result = get_affected_flows_func(changed_files=[], repo_root=str(tmp_path))
+
+    assert result["truncated"] is False

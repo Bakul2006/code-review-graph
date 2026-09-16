@@ -1,4 +1,4 @@
-"""Edge-case tests for the UTF-8 stdio reconfiguration done at CLI startup.
+"""Edge-case tests for the UTF-8 stdio reconfiguration done at CLI startup (PR #826).
 
 Covers stream shapes the happy-path regression test does not: absent
 streams (pythonw), streams without ``encoding`` or ``reconfigure``,

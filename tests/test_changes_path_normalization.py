@@ -1,4 +1,5 @@
-"""Edge-case tests for the changed_files absolute-path remap in analyze_changes (#848).
+"""Edge-case tests for the changed_files absolute-path remap in analyze_changes
+(issue #848, PR #852).
 
 Stresses the remap beyond the PR's regression test: absolute passthrough
 (the MCP path), mixed relative/absolute input, backslash separators,
