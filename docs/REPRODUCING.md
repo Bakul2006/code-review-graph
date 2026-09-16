@@ -94,8 +94,8 @@ uv run code-review-graph eval --embed \
 
 `--embed` is required for `agent_baseline` and `multi_hop_retrieval`; without it their
 natural-language questions hit FTS5 only and return nothing. `code-review-graph eval --help`
-lists the remaining benchmarks (`flow_completeness`, `search_quality`, `build_performance`)
-and flags.
+lists the remaining benchmarks (`flow_completeness`, `search_quality`, `build_performance`,
+`incremental_fidelity`) and flags.
 
 A thrown tool call is not a measurement. The row stays in the CSV with `status=error` and is
 excluded from every aggregate. Regression tests for this are in `tests/test_eval.py`.
@@ -358,6 +358,83 @@ per question. Rows where either side is zero get `status=no_graph_results` or
 `status=no_baseline_match` and are excluded from `agent_baseline.aggregate()`. No canonical
 capture exists yet; numbers will be added above once measured.
 
+## Incremental fidelity (`code_review_graph/eval/benchmarks/incremental_fidelity.py`)
+
+A persistent graph rots invisibly. Nothing errors, caller lists quietly get shorter, and a
+reviewer gets a confidently incomplete answer. A clean rebuild of the same tree is a free
+and perfect oracle for that drift, so this benchmark uses it.
+
+For each of seven edit kinds the benchmark copies the repository's tracked files into a
+throwaway git tree, builds a clean graph, applies the edit, commits it, runs
+`incremental_update` plus the post-processing `build_or_update_graph` runs, builds a second
+clean graph from the same edited tree, and compares the two databases table by table.
+
+```bash
+uv run code-review-graph eval --repo code-review-graph --benchmark incremental_fidelity
+```
+
+Row ids are autoincrement and differ between two builds of the same tree, so every
+projection is keyed on something stable (a qualified name, a community name, a flow's path
+resolved to qualified names) and excludes ids and wall-clock columns. `nodes_fts` is
+compared through `fts5vocab`, which reads the FTS index itself rather than the `nodes`
+content table behind it.
+
+### Results on this repository
+
+323 files, 6,509 nodes, 57,042 edges, 186 flows. Differing rows per table, incremental
+update against clean rebuild:
+
+| Edit | Status | Total | nodes | node_community | edges | communities | flows | flow_memberships | nodes_fts | community_summaries | flow_snapshots | risk_index | metadata | Seconds |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| trailing_comment | known_failure | 7,237 | 0 | 412 | 6 | 0 | 58 | 6,702 | 0 | 1 | 58 | 0 | 0 | 11.0 |
+| rename_function | known_failure | 7,233 | 0 | 412 | 6 | 0 | 58 | 6,698 | 0 | 1 | 58 | 0 | 0 | 9.4 |
+| delete_file | known_failure | 10,506 | 0 | 0 | 3,377 | 2 | 72 | 6,979 | 0 | 2 | 72 | 2 | 0 | 9.8 |
+| add_file | known_failure | 3 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 6.7 |
+| move_function | known_failure | 8,391 | 0 | 519 | 6 | 1 | 93 | 7,678 | 0 | 1 | 93 | 0 | 0 | 12.5 |
+| change_import | known_failure | 7,237 | 0 | 412 | 6 | 0 | 58 | 6,702 | 0 | 1 | 58 | 0 | 0 | 10.5 |
+| revert | known_failure | 7,237 | 0 | 412 | 6 | 0 | 58 | 6,702 | 0 | 1 | 58 | 0 | 0 | 9.8 |
+
+Benchmark wall time 79.1 s (8 clean builds plus 8 incremental updates).
+
+`nodes` and `nodes_fts` match everywhere: node rows and the search index are faithful. Every
+other divergence traces to one of three defects, none of which is fixed here.
+
+**1. `flow_memberships` is orphaned by every re-parse.** `flow_memberships.node_id` is a
+bare integer with no foreign key and no cascade, and `GraphStore._replace_file_data` deletes
+and re-inserts a re-parsed file's nodes with fresh ids. After appending one comment to
+`code_review_graph/parser.py`, 1,595 of the incremental graph's 4,494 membership rows point
+at node ids that no longer exist; the rebuild has 0. Because `incremental_trace_flows` finds
+affected flows by joining `flow_memberships` to `nodes`, the dangling rows are invisible to
+the repair path as well, so a full rebuild is the only way back.
+
+**2. Community assignment is never restored, and the repair path cannot fire.** The same
+edit leaves 718 nodes with `community_id IS NULL` against the rebuild's 306.
+`incremental_detect_communities` and `incremental_trace_flows` both match `nodes.file_path`
+(absolute) against `incremental_update`'s `changed_files` (repo-relative), so both always
+count zero affected rows and skip. `community_summaries` inherits the error: after the same
+edit its `key_symbols` for `code-review-graph-name` read
+`["main", "GraphStore", "close", "upsert_node", "commit"]` against the rebuild's
+`["CodeParser", "main", "GraphStore", "close", "NodeInfo"]`.
+
+**3. Deleting a file silently shortens other files' caller lists.** Deleting
+`code_review_graph/graph.py` leaves the incremental graph with 52,913 edges against the
+rebuild's 56,272, and 3,377 edge rows differ. `code_review_graph/analysis.py::find_bridge_nodes`
+has no outgoing `CALLS` edge at all at lines 73 and 100 in the incremental graph; the
+rebuild has two (`_build_networkx_graph` and `_sanitize_name`). Those edges had been
+resolved into `graph.py`, were removed with it, and `analysis.py` was never re-parsed to
+restore them as bare calls. Two edges still target `graph.py::` names that have no node.
+`risk_index` inherits it: `parser.py::EdgeInfo` reports `caller_count` 268 against the
+rebuild's 267.
+
+The six `edges` rows that differ on every edit are a separate, smaller issue: the
+`ambiguous_targets` list inside an edge's `extra` JSON is ordered by node id, so re-parsing a
+file reorders it. Same set, different order, so the graph is not byte-reproducible.
+
+Every edit kind is listed in `incremental_fidelity.KNOWN_FAILURES`, which keeps the run from
+reporting them as unexpected. `tests/test_incremental_fidelity.py` guards against a kind that
+currently passes starting to diverge, and carries two `xfail` tests that document defects 1
+and 2 at the level of the defect.
+
 ## Weekly CI run (report-only)
 
 `.github/workflows/eval.yml` runs every Monday at 06:23 UTC, and on `workflow_dispatch`,
@@ -373,6 +450,7 @@ job-summary table. Regressions do not fail the default branch.
 | `code_review_graph/eval/benchmarks/agent_baseline.py` | grep, top 3 files for the question's identifiers | 5 search hits + 5 neighbour edges per hit | Is the graph cheaper than a grep-and-read agent? |
 | `code_review_graph/eval/token_benchmark.py` | none; absolute cost | sum of the tool responses in simulated review, architecture and debug workflows | What does a complete agent workflow cost? |
 | `code_review_graph/token_benchmark.py` (standalone) | all source files in the repo | 5 search hits + 5 neighbour edges per hit | Is the graph cheaper than reading the whole repo? |
+| `code_review_graph/eval/benchmarks/incremental_fidelity.py` | a clean rebuild of the same tree | the same graph after `incremental_update` | Does an incremental update equal a rebuild? |
 
 `token_efficiency` can be below 1.0x for small commits. The standalone numbers are always
 large because the baseline is the whole repo, which is why the README leads with the median
