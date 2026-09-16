@@ -19,10 +19,11 @@ from code_review_graph.changes import analyze_changes
 from code_review_graph.graph import GraphStore
 from code_review_graph.parser import CodeParser, NodeInfo, is_test_file
 
-
 # ---------------------------------------------------------------------------
 # is_test_file: per-language conventions
 # ---------------------------------------------------------------------------
+
+ROOT = "/repo"
 
 TEST_PATHS = [
     # Python
@@ -49,11 +50,14 @@ TEST_PATHS = [
     "/repo/src/main/kotlin/com/acme/ThingTest.kt",
     # Ruby
     "/repo/spec/models/user_spec.rb",
+    "/repo/spec/spec_helper.rb",
     "/repo/lib/user_spec.rb",
     "/repo/lib/user_test.rb",
     # C#
     "/repo/src/OrderTests.cs",
     "/repo/src/OrderTest.cs",
+    # PHP
+    "/repo/src/OrderServiceTest.php",
 ]
 
 PRODUCTION_PATHS = [
@@ -68,19 +72,172 @@ PRODUCTION_PATHS = [
     # boundaries rather than matching anywhere in the string.
     "/repo/contests/runner.py",
     "/repo/src/greatest.py",
+    # An A/B testing feature is not a test suite: the "Test" suffix has to
+    # sit on a class-name boundary.
+    "/repo/src/ABTest.php",
+    "/repo/src/ABTest.cs",
+    "/repo/src/ABTest.java",
+    # "specs/" holds design documents and generated API specs as often as it
+    # holds RSpec files. Only a Ruby source file under it is evidence.
+    "/repo/specs/openapi.yaml",
+    "/repo/specs/billing-design.md",
+    "/repo/spec/openapi.json",
+    # A shared library published from test-utils/ is production code. Only
+    # dead-code detection opts into that directory.
+    "/repo/test-utils/index.ts",
+    "/repo/packages/test_utils/render.ts",
 ]
 
 
 @pytest.mark.parametrize("path", TEST_PATHS)
 def test_is_test_file_recognises_test_conventions(path):
-    assert is_test_file(path) is True
-    assert is_test_file(path.replace("/", "\\")) is True
+    assert is_test_file(path, ROOT) is True
+    assert is_test_file(path.replace("/", "\\"), ROOT) is True
 
 
 @pytest.mark.parametrize("path", PRODUCTION_PATHS)
 def test_is_test_file_rejects_production_paths(path):
-    assert is_test_file(path) is False
-    assert is_test_file(path.replace("/", "\\")) is False
+    assert is_test_file(path, ROOT) is False
+    assert is_test_file(path.replace("/", "\\"), ROOT) is False
+
+
+@pytest.mark.parametrize("path", TEST_PATHS + PRODUCTION_PATHS)
+def test_repo_relative_paths_need_no_root(path):
+    """The same answers hold when the caller already has a project path."""
+    relative = path[len(ROOT) + 1:]
+    assert is_test_file(relative) is is_test_file(path, ROOT)
+
+
+# ---------------------------------------------------------------------------
+# The repository root decides, never the directories above the checkout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("workspace", ["test", "tests", "spec", "specs"])
+@pytest.mark.parametrize("path", PRODUCTION_PATHS + [
+    "/code_review_graph/parser.py",
+    "/src/index.ts",
+])
+def test_checkout_under_a_test_named_directory_stays_production(workspace, path):
+    """A repository cloned into a directory named "test" is not test code.
+
+    This is the failure the whole feature turns on: ``file_path`` values in
+    the graph are absolute, so matching ``tests/`` against them also matches
+    a CI workspace or job directory above the checkout. Every production
+    symbol in the repository would be suppressed and the untested-code report
+    would go silent (#1023).
+    """
+    relative = path.lstrip("/")
+    if relative.startswith("repo/"):
+        relative = relative[len("repo/"):]
+    root = f"/ci/{workspace}/checkout"
+    assert is_test_file(f"{root}/{relative}", root) is False
+
+
+@pytest.mark.parametrize("workspace", ["test", "tests", "spec", "specs"])
+def test_checkout_under_a_test_named_directory_still_finds_its_own_tests(workspace):
+    root = f"/ci/{workspace}/checkout"
+    assert is_test_file(f"{root}/tests/helpers.py", root) is True
+    assert is_test_file(f"{root}/src/__tests__/button.ts", root) is True
+
+
+def test_absolute_path_without_a_root_keeps_filename_rules_only():
+    """With no root, directory conventions are dropped rather than guessed.
+
+    Dropping them under-reports test files; guessing them would hide
+    production gaps for an entire repository, so the safe direction is the
+    only one taken.
+    """
+    assert is_test_file("/unknown/checkout/tests/test_x.py") is True
+    assert is_test_file("/unknown/checkout/tests/helpers.py") is False
+
+
+def test_path_outside_the_repository_root_keeps_filename_rules_only():
+    assert is_test_file("/elsewhere/tests/helpers.py", "/repo") is False
+    assert is_test_file("/elsewhere/tests/test_x.py", "/repo") is True
+
+
+def test_root_spelling_differences_are_tolerated():
+    """A root given through a symlink or in another case still matches."""
+    assert is_test_file("/repo/tests/helpers.py", "/repo/") is True
+    assert is_test_file("/Repo/tests/helpers.py", "/repo") is True
+
+
+# ---------------------------------------------------------------------------
+# test-utils/: opt-in, because a shared library is published from there
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", [
+    "/repo/test-utils/render.ts",
+    "/repo/test_utils/render.ts",
+    "/repo/packages/core/test-util/render.ts",
+])
+def test_test_helper_dirs_are_opt_in(path):
+    assert is_test_file(path, ROOT) is False
+    assert is_test_file(path, ROOT, include_helper_dirs=True) is True
+
+
+# ---------------------------------------------------------------------------
+# A shipped test/ package is production code (the django/test/client.py shape)
+# ---------------------------------------------------------------------------
+
+
+def _make_tree(base: Path, files: list[str]) -> None:
+    for rel in files:
+        target = base / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+
+
+def test_shipped_test_subpackage_is_production_code():
+    """``django/test/client.py`` is imported by users as ``django.test``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_tree(root, [
+            "django/__init__.py",
+            "django/test/__init__.py",
+            "django/test/client.py",
+        ])
+        assert is_test_file(str(root / "django/test/client.py"), str(root)) is False
+
+
+def test_shipped_test_subpackage_still_yields_to_a_test_filename():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_tree(root, [
+            "django/__init__.py",
+            "django/test/__init__.py",
+            "django/test/test_client.py",
+        ])
+        assert is_test_file(str(root / "django/test/test_client.py"), str(root)) is True
+
+
+def test_top_level_test_package_is_still_test_code():
+    """A top-level ``test/`` package is an application's own test suite."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_tree(root, ["test/__init__.py", "test/helpers.py"])
+        assert is_test_file(str(root / "test/helpers.py"), str(root)) is True
+
+
+def test_test_directory_without_an_init_is_test_code():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_tree(root, ["pkg/__init__.py", "pkg/test/helpers.py"])
+        assert is_test_file(str(root / "pkg/test/helpers.py"), str(root)) is True
+
+
+def test_plural_tests_package_is_never_treated_as_shipped():
+    """``tests/`` with an ``__init__.py`` is the unittest convention."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_tree(root, [
+            "pkg/__init__.py",
+            "pkg/tests/__init__.py",
+            "pkg/tests/helpers.py",
+        ])
+        assert is_test_file(str(root / "pkg/tests/helpers.py"), str(root)) is True
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +273,7 @@ def parsed_python_test_file():
         path = Path(tmp) / "tests" / "test_upgrade_path.py"
         path.parent.mkdir(parents=True)
         path.write_text(_PY_TEST_SOURCE, encoding="utf-8")
-        nodes, _edges = CodeParser().parse_file(path)
+        nodes, _edges = CodeParser(Path(tmp)).parse_file(path)
         yield {n.name: n for n in nodes}
 
 
@@ -314,3 +471,172 @@ def test_review_guidance_ignores_test_file_helpers():
     assert "_check" not in guidance
     assert "analyze_changes" in guidance
     assert "1 changed function(s) lack test coverage" in guidance
+
+
+def test_review_guidance_under_a_test_named_checkout_still_warns():
+    """The coverage warning must survive a checkout under a "test" directory."""
+    from code_review_graph.tools.review import _generate_review_guidance
+
+    root = "/ci/test/checkout"
+    impact = {
+        "changed_nodes": [
+            _graph_node(1, "Function", "_check",
+                        f"{root}/tests/test_upgrade_path.py::_check",
+                        f"{root}/tests/test_upgrade_path.py"),
+            _graph_node(2, "Function", "analyze_changes",
+                        f"{root}/code_review_graph/changes.py::analyze_changes",
+                        f"{root}/code_review_graph/changes.py"),
+        ],
+        "edges": [],
+        "impacted_nodes": [],
+        "impacted_files": [],
+    }
+    guidance = _generate_review_guidance(
+        impact, [f"{root}/code_review_graph/changes.py"], root,
+    )
+    assert "_check" not in guidance
+    assert "1 changed function(s) lack test coverage: analyze_changes" in guidance
+
+
+# ---------------------------------------------------------------------------
+# Every consumer reads the root, not the absolute path
+# ---------------------------------------------------------------------------
+
+
+class TestCheckoutUnderATestDirectory:
+    """The end-to-end shape of #1023, through each consumer of the graph.
+
+    A repository whose absolute path happens to contain a directory named
+    "test" must produce exactly the same report as the same tree checked out
+    anywhere else.
+    """
+
+    def setup_method(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "test" / "checkout"
+        (self.root / ".code-review-graph").mkdir(parents=True)
+        self.store = GraphStore(self.root / ".code-review-graph" / "graph.db")
+        self.store.set_metadata("repo_root", str(self.root))
+
+    def teardown_method(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _add(self, kind, name, rel_path, is_test=False, line_start=1, line_end=10):
+        self.store.upsert_node(
+            NodeInfo(
+                kind=kind,
+                name=name,
+                file_path=str(self.root / rel_path),
+                line_start=line_start,
+                line_end=line_end,
+                language="python",
+                is_test=is_test,
+            ),
+            file_hash="h",
+        )
+        self.store.commit()
+
+    def test_store_reports_the_recorded_repo_root(self):
+        assert self.store.get_repo_root() == str(self.root)
+
+    def test_store_falls_back_to_the_default_database_location(self):
+        """A graph built before builds recorded the root still answers."""
+        self.store._conn.execute("DELETE FROM metadata WHERE key = 'repo_root'")
+        self.store._conn.commit()
+        assert self.store.get_repo_root() == str(self.root)
+
+    def test_production_gaps_survive(self):
+        self._add("Function", "analyze_changes", "code_review_graph/changes.py")
+        self._add("Function", "_check", "tests/test_upgrade_path.py")
+        result = analyze_changes(
+            self.store,
+            changed_files=["code_review_graph/changes.py",
+                           "tests/test_upgrade_path.py"],
+            repo_root=str(self.root),
+        )
+        assert {g["name"] for g in result["test_gaps"]} == {"analyze_changes"}
+
+    def test_production_gaps_survive_without_an_explicit_repo_root(self):
+        """MCP callers pass absolute paths and no root; the graph knows it."""
+        self._add("Function", "analyze_changes", "code_review_graph/changes.py")
+        result = analyze_changes(
+            self.store,
+            changed_files=[str(self.root / "code_review_graph/changes.py")],
+        )
+        assert {g["name"] for g in result["test_gaps"]} == {"analyze_changes"}
+
+    def test_entry_points_survive(self):
+        from code_review_graph.flows import detect_entry_points
+
+        self._add("Function", "main", "code_review_graph/cli.py")
+        self._add("Function", "helper", "tests/support.py")
+        names = {n.name for n in detect_entry_points(self.store)}
+        assert names == {"main"}
+
+    def test_dead_code_candidates_survive(self):
+        from code_review_graph.refactor import find_dead_code
+
+        self._add("Function", "orphaned_helper", "code_review_graph/util.py")
+        self._add("Function", "test_only_helper", "tests/support.py")
+        names = {d["name"] for d in find_dead_code(self.store)}
+        assert names == {"orphaned_helper"}
+
+    def test_dead_code_ignores_directories_above_the_checkout(self):
+        """The package-alias heuristic must not read the workspace name.
+
+        ``find_dead_code`` accepts a bare-name caller when a directory of the
+        callee's path appears in the caller's import specifier. Read from the
+        absolute path, the workspace directory ("test" here) joins that set
+        and matches any import mentioning it, so the candidate disappears in
+        one checkout and not in another.
+        """
+        from code_review_graph.graph import EdgeInfo
+        from code_review_graph.refactor import find_dead_code
+
+        self._add("Function", "orphaned_helper", "packages/core/util.ts")
+        # A second definition, so the bare-name CALLS edge below is ambiguous
+        # and has to be resolved through the import graph.
+        self._add("Function", "orphaned_helper", "packages/data/util.ts")
+        self._add("Function", "caller", "packages/app/main.ts")
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=str(self.root / "packages/app/main.ts"),
+                target="@acme/latest-test-kit",
+                file_path=str(self.root / "packages/app/main.ts"),
+                line=1,
+            ),
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=str(self.root / "packages/app/main.ts") + "::caller",
+                target="orphaned_helper",
+                file_path=str(self.root / "packages/app/main.ts"),
+                line=2,
+            ),
+        )
+        self.store.commit()
+        dead_paths = {
+            d["relative_path"] for d in find_dead_code(self.store, root=str(self.root))
+            if d["name"] == "orphaned_helper"
+        }
+        assert "packages/core/util.ts" in dead_paths
+
+
+def test_shipped_test_subpackage_needs_a_filesystem_path():
+    """A relative path with no root cannot be probed, so it stays test code.
+
+    Probing it against the working directory would make the answer depend on
+    where the process was started.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_tree(root, [
+            "django/__init__.py",
+            "django/test/__init__.py",
+            "django/test/client.py",
+        ])
+        assert is_test_file("django/test/client.py") is True
+        assert is_test_file("django/test/client.py", str(root)) is False

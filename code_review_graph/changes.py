@@ -491,6 +491,14 @@ def analyze_changes(
     affected = get_affected_flows(store, changed_files)
 
     # Detect test gaps: changed functions without TESTED_BY edges.
+    #
+    # Stored file paths are absolute, so test-ness is judged against the path
+    # relative to the repository root: reading ``tests/`` out of an absolute
+    # path would also match a directory above the checkout, and a repository
+    # cloned into a CI workspace named "test" would report no gaps at all
+    # (issue #1023). ``repo_root`` is the caller's; the graph's own recorded
+    # root covers callers that pass none.
+    gap_root = repo_root or store.get_repo_root()
     test_gaps: list[dict[str, Any]] = []
     for node in changed_funcs:
         # A symbol that lives in a test file is test code and can never be a
@@ -499,7 +507,7 @@ def analyze_changes(
         # test nodes still gives the right answer: those rows carry
         # ``is_test = 0`` and used to be reported back to the author as their
         # own tests needing tests (issue #1014).
-        if node.is_test or is_test_file(node.file_path):
+        if node.is_test or is_test_file(node.file_path, gap_root):
             continue
         if node.name in _TEST_GAP_EXEMPT_NAMES:
             continue

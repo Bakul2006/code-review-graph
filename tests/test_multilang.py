@@ -4198,10 +4198,16 @@ class TestHCLParsing:
         )
 
     def test_path_module_produces_no_edge(self):
-        """path.module must not produce a REFERENCES edge."""
+        """path.module must not produce a REFERENCES edge.
+
+        Only the symbol half of the target is inspected: the file half is an
+        absolute path, so a checkout under any directory whose name contains
+        "path" would otherwise fail this test.
+        """
         path_edges = [
             e for e in self.edges
-            if e.kind == "REFERENCES" and "path" in e.target
+            if e.kind == "REFERENCES"
+            and "path" in e.target.rsplit("::", 1)[-1]
         ]
         assert path_edges == [], (
             f"Spurious 'path' REFERENCES edges: {[e.target for e in path_edges]}"
