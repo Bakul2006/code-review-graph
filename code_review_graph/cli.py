@@ -1160,7 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated benchmarks to run (token_efficiency, impact_accuracy, "
         "agent_baseline, flow_completeness, search_quality, build_performance, "
-        "multi_hop_retrieval)",
+        "multi_hop_retrieval, incremental_fidelity)",
     )
     eval_cmd.add_argument("--repo", default=None, help="Comma-separated repo config names")
     eval_cmd.add_argument("--all", action="store_true", dest="run_all", help="Run all benchmarks")
@@ -2183,10 +2183,16 @@ def main() -> None:
                 export_obsidian_vault(store, out)
                 print(f"Obsidian vault exported: {out}")
             elif fmt == "svg":
-                from .exports import export_svg
+                from .exports import MissingOptionalDependencyError, export_svg
 
                 out = data_dir / "graph.svg"
-                export_svg(store, out)
+                try:
+                    export_svg(store, out)
+                except MissingOptionalDependencyError as exc:
+                    # A missing optional dependency is a user-fixable setup
+                    # problem, not a crash: one line, no traceback, exit 1.
+                    print(f"Error: {exc}", file=sys.stderr)
+                    sys.exit(1)
                 print(f"SVG exported: {out}")
             else:
                 from .neighbourhood import SeedResolutionError
