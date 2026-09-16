@@ -2053,10 +2053,16 @@ def main() -> None:
                 export_obsidian_vault(store, out)
                 print(f"Obsidian vault exported: {out}")
             elif fmt == "svg":
-                from .exports import export_svg
+                from .exports import MissingOptionalDependencyError, export_svg
 
                 out = data_dir / "graph.svg"
-                export_svg(store, out)
+                try:
+                    export_svg(store, out)
+                except MissingOptionalDependencyError as exc:
+                    # A missing optional dependency is a user-fixable setup
+                    # problem, not a crash: one line, no traceback, exit 1.
+                    print(f"Error: {exc}", file=sys.stderr)
+                    sys.exit(1)
                 print(f"SVG exported: {out}")
             else:
                 from .visualization import generate_html
