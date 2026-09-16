@@ -40,3 +40,23 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
     # unset, a miss would be silently destructive; set, it cannot be.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("hermes-home")))
     return home
+
+
+def pytest_collection_modifyitems(config, items):
+    """Keep the determinism gate out of an ordinary test run.
+
+    ``tests/test_determinism.py`` builds one corpus roughly nine times in
+    separate subprocesses; it is minutes of work and is meant to be run on
+    demand, not on every pull request. Selecting the marker explicitly
+    (``pytest -m determinism``) runs it; anything else skips it, visibly,
+    rather than silently dropping it from collection.
+    """
+    selected = config.getoption("-m", default="") or ""
+    if "determinism" in selected:
+        return
+    skip_slow = pytest.mark.skip(
+        reason="slow determinism gate; run it with `pytest -m determinism`"
+    )
+    for item in items:
+        if "determinism" in item.keywords:
+            item.add_marker(skip_slow)

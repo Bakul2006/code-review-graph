@@ -157,6 +157,10 @@ norecursedirs = ["tests/fixtures"]
 markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
+    # Deliberately slow and opt-in: tests/conftest.py skips anything marked
+    # "determinism" unless the marker is selected explicitly. Run it with
+    # `pytest -m determinism`; it rebuilds one corpus roughly nine times.
+    "determinism: rebuilds one corpus many ways and compares every table (minutes)",
 ]
 
 [dependency-groups]
