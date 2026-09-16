@@ -11,7 +11,7 @@ import logging
 import re
 import sqlite3
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from .graph import GraphStore, _sanitize_name, identifier_words
 from .migrations import (
@@ -517,6 +517,24 @@ _HAS_ALNUM_RE = re.compile(r"[0-9A-Za-z]")
 # nearly every document in the index, so short tokens stay exact.
 _MIN_PREFIX_ALNUM = 3
 
+# Most terms one MATCH expression may carry.
+#
+# FTS5 reads one doclist per term and adds one BM25 contribution per term
+# per matching row, and the OR widening grows the matching set with the term
+# count as well, so an uncapped question asked in prose gets superlinearly
+# slower. Measured on a 120k-node graph the widened expression took 13 ms at
+# 5 terms, 30 ms at 10, 99 ms at 25 and 173 ms at 50; on this repository's
+# own graph, 0.6 / 1.5 / 5.1 / 9.9 ms.
+#
+# Twelve because no query in any shipped benchmark config reaches it -- the
+# longest of the 47 is eleven terms -- so the cap cannot change a measured
+# result, it only bounds the tail. On a set of 18 deliberately long
+# questions (14 to 22 terms each) it measured no worse than no cap at all:
+# MRR 0.44 against 0.40, the same 14 of 18 found, and the 50-word query time
+# flat from the cap onwards instead of still climbing.
+_MAX_FTS_TERMS = 12
+
+
 
 def _quote_term(text: str) -> str:
     """Return *text* as a single FTS5 string, with inner quotes doubled.
@@ -531,6 +549,92 @@ def _quote_term(text: str) -> str:
 
 def _alnum_count(text: str) -> int:
     return sum(1 for ch in text if ch.isalnum())
+
+
+class _QueryTerm(NamedTuple):
+    """One term of a MATCH expression, with what is needed to rank it."""
+
+    key: str      # lowercased source text, for deduplication and rarity
+    expression: str  # the term exactly as it appears in the MATCH expression
+    is_phrase: bool  # the user typed it inside double quotes
+
+
+def _split_query_terms(query: str) -> list[_QueryTerm]:
+    """Split *query* into the distinct terms a MATCH expression may carry.
+
+    Explicit phrases come first, then the loose tokens, each in the order
+    typed. Terms that repeat are dropped after their first occurrence:
+    ``bm25()`` already weights a term by its frequency in the *document*, so
+    repeating it in the query buys no ranking signal and costs one more
+    doclist read per matching row. Comparison is case-insensitive because
+    the index is.
+    """
+    phrases: list[str] = []
+    loose: list[str] = []
+    cursor = 0
+    for match in _EXPLICIT_PHRASE_RE.finditer(query):
+        loose.extend(query[cursor:match.start()].split())
+        phrases.append(match.group(1))
+        cursor = match.end()
+    loose.extend(query[cursor:].split())
+
+    terms: list[_QueryTerm] = []
+    seen: set[str] = set()
+
+    def _add(text: str, expression: str, is_phrase: bool) -> None:
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        terms.append(_QueryTerm(key, expression, is_phrase))
+
+    for phrase in phrases:
+        if _HAS_ALNUM_RE.search(phrase):
+            _add(phrase, _quote_term(phrase), True)
+    for token in loose:
+        if not _HAS_ALNUM_RE.search(token):
+            continue
+        prefix = "*" if _alnum_count(token) >= _MIN_PREFIX_ALNUM else ""
+        _add(token, _quote_term(token) + prefix, False)
+    return terms
+
+
+def _rarity_key(term: _QueryTerm, position: int) -> tuple[int, int, int]:
+    """Sort key putting the term most worth keeping first.
+
+    A phrase the user quoted is always kept: it is both the most selective
+    kind of term and an explicit request. Loose tokens are ordered by length,
+    descending. Across natural language the commonest words are the shortest
+    ones, so the long token is the rarer one and the one that carries what
+    the question is about; the short ones are the scaffolding ("how does the
+    ... so that it can ...") that a prose question is mostly made of.
+
+    Rarity measured against the index itself was tried instead and measured
+    worse -- see the module docstring of ``tests/test_search_quality.py``.
+    An index over a repository holds every node's file path and qualified
+    name, so this project's own words ("graph", "search", "parser") are the
+    commonest terms in it while "today" and "whether" are rare. Index rarity
+    therefore drops exactly the words that name the answer.
+
+    Position breaks ties, so the choice never depends on set ordering.
+    """
+    if term.is_phrase:
+        return (0, 0, position)
+    return (1, -len(term.key), position)
+
+
+def _cap_terms(terms: list[_QueryTerm]) -> list[_QueryTerm]:
+    """Reduce *terms* to at most :data:`_MAX_FTS_TERMS`, keeping the rarest.
+
+    Truncating to the first N would keep "how does the" and throw away the
+    words that say what is being asked about, so the terms are ranked by
+    :func:`_rarity_key` and the survivors are put back in the order they
+    were typed.
+    """
+    if len(terms) <= _MAX_FTS_TERMS:
+        return terms
+    ranked = sorted(range(len(terms)), key=lambda i: _rarity_key(terms[i], i))
+    return [terms[i] for i in sorted(ranked[:_MAX_FTS_TERMS])]
 
 
 def build_fts_queries(query: str) -> list[str]:
@@ -552,6 +656,13 @@ def build_fts_queries(query: str) -> list[str]:
     prefix, and suppresses the ``OR`` widening: the quotes are a request for
     exactness and are honoured.
 
+    Repeated terms are dropped and the count is capped at
+    :data:`_MAX_FTS_TERMS`, because the cost of an expression grows with the
+    number of terms in it and a question asked in prose -- exactly what
+    token-based matching invites -- would otherwise grow one term per word.
+    When the cap bites, the terms kept are the rarest ones rather than the
+    first ones typed: see :func:`_rarity_key`.
+
     Degenerate inputs collapse to an empty list, which the caller treats as
     "FTS has nothing to say" and falls through to the LIKE keyword path:
     an empty query, whitespace, and text with no alphanumeric character at
@@ -563,34 +674,17 @@ def build_fts_queries(query: str) -> list[str]:
     if not query or not query.strip():
         return []
 
-    phrases: list[str] = []
-    loose: list[str] = []
-    cursor = 0
-    for match in _EXPLICIT_PHRASE_RE.finditer(query):
-        loose.extend(query[cursor:match.start()].split())
-        phrases.append(match.group(1))
-        cursor = match.end()
-    loose.extend(query[cursor:].split())
-
-    terms: list[str] = []
-    for phrase in phrases:
-        if _HAS_ALNUM_RE.search(phrase):
-            terms.append(_quote_term(phrase))
-    for token in loose:
-        if not _HAS_ALNUM_RE.search(token):
-            continue
-        prefix = "*" if _alnum_count(token) >= _MIN_PREFIX_ALNUM else ""
-        terms.append(_quote_term(token) + prefix)
-
+    terms = _cap_terms(_split_query_terms(query))
     if not terms:
         return []
-    if len(terms) == 1:
-        return [terms[0]]
+    expressions = [term.expression for term in terms]
+    if len(expressions) == 1:
+        return [expressions[0]]
 
-    conjunction = " AND ".join(terms)
-    if phrases:
+    conjunction = " AND ".join(expressions)
+    if any(term.is_phrase for term in terms):
         return [conjunction]
-    return [conjunction, " OR ".join(terms)]
+    return [conjunction, " OR ".join(expressions)]
 
 
 def _covered_word_count(query_words: set[str], symbol_words: set[str]) -> int:

@@ -10,6 +10,23 @@ Two defects are covered here.
 2. ``nodes.extra['docstring']`` was extracted by the parser and fed to the
    embedding text builder but never reached the FTS index, so ~38% of the
    graph's prose was invisible to keyword search.
+
+3. Building the expression from tokens invites questions asked in prose, and
+   the first version of it neither deduplicated nor capped the terms, so the
+   expression grew one term per word. FTS5 reads one doclist per term and
+   scores every term against every matching row, and the OR widening grows
+   the matching set with the term count too, so the cost climbed
+   superlinearly: on a 120k-node graph the widened expression took 13 ms at
+   5 terms and 173 ms at 50.
+
+   On the cap's selection rule: index-measured rarity was tried and measured
+   worse than token length. An FTS index over a repository holds every
+   node's file path and qualified name, so the project's own vocabulary
+   ("graph", "search", "parser") is what the index carries most often, while
+   "today" and "whether" are genuinely rare in it. Ranking by index document
+   frequency therefore keeps the prose scaffolding and drops the words that
+   name the answer: on 18 long questions about this repository it scored MRR
+   0.27 against 0.44 for token length, at the same cap.
 """
 
 from __future__ import annotations
@@ -23,7 +40,12 @@ import pytest
 from code_review_graph.graph import GraphStore
 from code_review_graph.migrations import LATEST_VERSION, get_schema_version
 from code_review_graph.parser import NodeInfo
-from code_review_graph.search import build_fts_queries, hybrid_search, rebuild_fts_index
+from code_review_graph.search import (
+    _MAX_FTS_TERMS,
+    build_fts_queries,
+    hybrid_search,
+    rebuild_fts_index,
+)
 
 # ---------------------------------------------------------------------------
 # build_fts_queries: pure query construction
@@ -98,6 +120,72 @@ class TestBuildFtsQueries:
     def test_snake_case_identifier_stays_a_single_precise_term(self):
         """``_sanitize_name`` must not widen into ``sanitize OR name``."""
         assert build_fts_queries("_sanitize_name") == ['"_sanitize_name"*']
+
+
+class TestTermGrowthIsBounded:
+    """The expression must not grow one term per word of the question."""
+
+    def test_a_repeated_word_contributes_one_term(self):
+        assert build_fts_queries("cache the cache") == [
+            '"cache"* AND "the"*',
+            '"cache"* OR "the"*',
+        ]
+
+    def test_deduplication_ignores_case(self):
+        """The index is case-insensitive, so two spellings are one term."""
+        assert build_fts_queries("Parser parser PARSER") == ['"Parser"*']
+
+    def test_deduplication_keeps_the_first_spelling_typed(self):
+        assert build_fts_queries("PARSER parser") == ['"PARSER"*']
+
+    def test_term_count_is_capped(self):
+        query = " ".join(f"token{i:02d}" for i in range(40))
+        expression = build_fts_queries(query)[0]
+        assert expression.count(" AND ") + 1 == _MAX_FTS_TERMS
+
+    def test_an_or_widening_is_capped_too(self):
+        query = " ".join(f"token{i:02d}" for i in range(40))
+        widened = build_fts_queries(query)[1]
+        assert widened.count(" OR ") + 1 == _MAX_FTS_TERMS
+
+    def test_a_query_at_the_cap_is_untouched(self):
+        tokens = [f"token{i:02d}" for i in range(_MAX_FTS_TERMS)]
+        expression = build_fts_queries(" ".join(tokens))[0]
+        assert expression == " AND ".join(f'"{t}"*' for t in tokens)
+
+    def test_the_cap_keeps_the_rarest_terms_not_the_first_ones(self):
+        """The words that say what is being asked about have to survive.
+
+        Truncating to the first N would keep "how does the" and throw away
+        "authentication". The kept terms are ranked by length, which across
+        natural language tracks rarity.
+        """
+        question = (
+            "how does the code that is run when a user of this app is asked "
+            "to prove who they are reach the authentication middleware"
+        )
+        expression = build_fts_queries(question)[0]
+        assert '"authentication"*' in expression
+        assert '"middleware"*' in expression
+        assert '"how"*' not in expression
+        assert '"the"*' not in expression
+
+    def test_capped_terms_stay_in_the_order_they_were_typed(self):
+        question = (
+            "aa bbbb cc dddd ee ffff gg hhhh ii jjjj kk llll mm nnnn oo pppp"
+        )
+        expression = build_fts_queries(question)[0]
+        kept = [part.strip('"*') for part in expression.split(" AND ")]
+        assert kept == sorted(kept, key=question.split().index)
+
+    def test_a_quoted_phrase_survives_the_cap(self):
+        """Quotes are an explicit request; the cap must not discard one."""
+        question = '"impact radius" ' + " ".join(
+            f"token{i:02d}" for i in range(40)
+        )
+        expression = build_fts_queries(question)[0]
+        assert expression.startswith('"impact radius" AND ')
+        assert expression.count(" AND ") + 1 == _MAX_FTS_TERMS
 
 
 # ---------------------------------------------------------------------------
