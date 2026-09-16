@@ -43,6 +43,7 @@ import fnmatch
 import json
 import logging
 import os
+import sqlite3
 from functools import partial
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
@@ -691,8 +692,53 @@ def _warn_failed_files(result: dict) -> None:
     )
 
 
+# SQLite's answer to a writer that waited out ``busy_timeout`` is
+# ``OperationalError: database is locked``. Nothing between there and the
+# process boundary used to catch it, so a user whose watcher happened to be
+# mid-update saw twenty lines of internal traceback.
+_LOCK_ERRORS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+)
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        needle in str(exc).lower() for needle in _LOCK_ERRORS
+    )
+
+
 def main() -> None:
-    """Main CLI entry point."""
+    """Main CLI entry point.
+
+    A contended graph is reported, not raised.  The choice is deliberate:
+    ``build`` and ``update`` are run from pre-commit hooks and editor hooks
+    where blocking indefinitely would look like a hang, and retrying past
+    SQLite's five-second wait would only lengthen a hang whose real cause is
+    another process that has not finished.  Failing immediately is also the
+    recoverable outcome — the VCS anchor is written only by a build that ran
+    to completion, so nothing marks the half-written graph as current and the
+    next run rebuilds it.
+    """
+    try:
+        _dispatch()
+    except sqlite3.OperationalError as exc:
+        if not _is_lock_error(exc):
+            raise
+        print(
+            f"Error: another process is updating this graph ({exc}).\n"
+            "Nothing was written, and no freshness anchor was recorded, so the "
+            "graph is unchanged.\n"
+            "Wait for the other process (a watcher, a daemon, or another "
+            "code-review-graph run) to finish and try again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+
+
+def _dispatch() -> None:
+    """Parse arguments and run the requested subcommand."""
     _configure_utf8_stdio()
     ap = argparse.ArgumentParser(
         prog="code-review-graph",
@@ -1912,7 +1958,10 @@ def main() -> None:
                         print(panel)
 
         elif args.command == "status":
+            from .tools.build import build_was_interrupted
+
             stats = store.get_stats()
+            interrupted = build_was_interrupted(store)
             stored_branch = store.get_metadata("git_branch")
             stored_sha = store.get_metadata("git_head_sha")
             from .incremental import _git_branch_info, detect_vcs
@@ -1939,6 +1988,7 @@ def main() -> None:
                     "current_sha": current_sha,
                     "svn_branch": stored_svn_branch,
                     "svn_revision": stored_rev,
+                    "build_incomplete": interrupted,
                 }))
             elif not args.quiet:
                 print(f"Nodes: {stats.total_nodes}")
@@ -1946,6 +1996,14 @@ def main() -> None:
                 print(f"Files: {stats.files_count}")
                 print(f"Languages: {', '.join(stats.languages)}")
                 print(f"Last updated: {stats.last_updated or 'never'}")
+                if interrupted:
+                    # The nodes can all be present and the graph still be a
+                    # half-built one: search and flows are derived afterwards.
+                    print(
+                        "Build state: INCOMPLETE - the last build stopped before "
+                        "post-processing finished, so search and flows may be "
+                        "missing. Run 'code-review-graph update' to repair it."
+                    )
                 if stored_branch:
                     print(f"Built on branch: {stored_branch}")
                 if stored_sha:

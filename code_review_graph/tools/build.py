@@ -16,6 +16,27 @@ from ._common import _get_store
 
 logger = logging.getLogger(__name__)
 
+# Written before anything is stored and cleared only once post-processing has
+# finished.  Freshness metadata alone cannot express "half built": ``full_build``
+# records ``last_updated`` and the VCS anchor as soon as the last file is
+# stored, so a process killed between that point and post-processing left a
+# graph with every node in place, a current anchor, an empty FTS index and no
+# flows — and the next ``update`` read the anchor, reported "no changes" and
+# repaired nothing.  This marker is the evidence that the previous run did not
+# finish; :func:`build_or_update_graph` promotes the next run to a full rebuild
+# when it finds one.
+BUILD_STATE_KEY = "build_state"
+BUILD_IN_PROGRESS = "in-progress"
+BUILD_COMPLETE = "complete"
+
+
+def build_was_interrupted(store: Any) -> bool:
+    """True when the previous build died before it finished post-processing."""
+    try:
+        return str(store.get_metadata(BUILD_STATE_KEY) or "") == BUILD_IN_PROGRESS
+    except sqlite3.Error:  # pragma: no cover - defensive
+        return False
+
 
 def _run_embedding_refresh(
     store: Any,
@@ -45,6 +66,18 @@ def _run_embedding_refresh(
         warnings.append(
             f"Embedding refresh failed: {type(exc).__name__}: {exc}",
         )
+
+
+def _note_contention(build_result: dict[str, Any], exc: BaseException) -> None:
+    """Flag a post-processing stage that was lost to write-lock contention.
+
+    Contention is transient: another process held the SQLite write lock, and
+    the next run can redo the stage.  A missing optional dependency is not,
+    which is why only ``sqlite3.OperationalError`` sets the flag — otherwise
+    one absent extra would pin the repository into permanent full rebuilds.
+    """
+    if isinstance(exc, sqlite3.OperationalError):
+        build_result["postprocess_contended"] = True
 
 
 def _run_postprocess(
@@ -91,6 +124,7 @@ def _run_postprocess(
         )
     except sqlite3.OperationalError as e:
         logger.warning("Call-target resolution failed: %s", e)
+        _note_contention(build_result, e)
         warnings.append(
             f"Call-target resolution failed: {type(e).__name__}: {e}"
         )
@@ -124,6 +158,7 @@ def _run_postprocess(
         build_result["signatures_updated"] = True
     except (sqlite3.OperationalError, TypeError, KeyError) as e:
         logger.warning("Signature computation failed: %s", e)
+        _note_contention(build_result, e)
         warnings.append(f"Signature computation failed: {type(e).__name__}: {e}")
     timing["signatures_s"] = max(
         0.0,
@@ -139,6 +174,7 @@ def _run_postprocess(
         build_result["fts_rebuilt"] = True
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("FTS index rebuild failed: %s", e)
+        _note_contention(build_result, e)
         warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")
     timing["fts_s"] = max(
         0.0,
@@ -174,6 +210,7 @@ def _run_postprocess(
         build_result["flows_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Flow detection failed: %s", e)
+        _note_contention(build_result, e)
         warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
     timing["flows_s"] = max(
         0.0,
@@ -201,6 +238,7 @@ def _run_postprocess(
         build_result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Community detection failed: %s", e)
+        _note_contention(build_result, e)
         warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
     timing["communities_s"] = max(
         0.0,
@@ -214,6 +252,7 @@ def _run_postprocess(
         build_result["summaries_computed"] = True
     except (sqlite3.OperationalError, Exception) as e:
         logger.warning("Summary computation failed: %s", e)
+        _note_contention(build_result, e)
         warnings.append(f"Summary computation failed: {type(e).__name__}: {e}")
     timing["summaries_s"] = max(
         0.0,
@@ -508,6 +547,17 @@ def build_or_update_graph(
         if not full_rebuild and not store.has_nodes():
             full_rebuild = True
 
+        # A previous run that died between storing the last file and finishing
+        # post-processing left a current anchor over a half-derived graph.
+        # Trusting the anchor there is exactly what made that damage permanent,
+        # so repair it with a full rebuild instead of believing it.
+        interrupted = build_was_interrupted(store)
+        if interrupted and not full_rebuild:
+            logger.warning(
+                "Previous build did not finish post-processing; rebuilding to repair it"
+            )
+            full_rebuild = True
+
         # An automatic (base is None) incremental update resolves its diff base
         # to the last-synced commit. When no usable anchor exists, fall back to
         # a full rebuild rather than a wrong HEAD~1 diff that could report the
@@ -517,6 +567,9 @@ def build_or_update_graph(
             base_resolved = resolve_incremental_base(root, store)
             if base_resolved is None:
                 full_rebuild = True
+
+        previous_state = store.get_metadata(BUILD_STATE_KEY)
+        store.set_metadata(BUILD_STATE_KEY, BUILD_IN_PROGRESS)
 
         if full_rebuild:
             result = full_build(root, store, recurse_submodules)
@@ -541,6 +594,10 @@ def build_or_update_graph(
             except RuntimeError as exc:
                 # Change discovery or root validation failed before anything was
                 # stored; report it the way every other failure is reported.
+                # Nothing was written, so the previous completeness verdict
+                # still holds — do not leave the graph flagged as half built.
+                if previous_state is not None:
+                    store.set_metadata(BUILD_STATE_KEY, previous_state)
                 return {
                     "status": "error",
                     "build_type": "incremental",
@@ -558,6 +615,10 @@ def build_or_update_graph(
                     if result.get("freshness_advanced")
                     else "No graph changes detected. Freshness metadata was not advanced."
                 )
+                # Nothing changed, so there is nothing half built to repair;
+                # leaving the marker set would make every later update a full
+                # rebuild.
+                store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
                 return {
                     **result,
                     "status": "ok",
@@ -599,6 +660,13 @@ def build_or_update_graph(
         )
         if warnings:
             build_result["warnings"] = warnings
+        # Last thing written, after post-processing: only now is the graph
+        # genuinely what its freshness metadata claims.  A stage that lost the
+        # write lock keeps the marker set so the next run redoes it, rather
+        # than leaving an empty FTS index behind a "complete" verdict.
+        if not build_result.get("postprocess_contended"):
+            store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
+        build_result["repaired_interrupted_build"] = interrupted
         return build_result
     finally:
         store.close()
@@ -730,6 +798,10 @@ def run_postprocess(
             "last_postprocessed_at",
             time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
+        # An explicit postprocess run is how a half-built graph is repaired by
+        # hand, so it clears the interrupted-build marker too.
+        if not warnings:
+            store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
         result["summary"] = "Post-processing complete."
         if warnings:
             result["warnings"] = warnings
