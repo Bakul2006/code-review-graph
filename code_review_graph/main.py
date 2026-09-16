@@ -21,6 +21,7 @@ from fastmcp import FastMCP
 
 from . import __version__
 from . import incremental as _incremental
+from .constants import env_int
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
 from .prompts import (
@@ -722,7 +723,7 @@ async def detect_changes_tool(
         ), root)
 
     coro = asyncio.to_thread(_run)
-    tool_timeout = int(os.environ.get("CRG_TOOL_TIMEOUT", "0"))
+    tool_timeout = env_int("CRG_TOOL_TIMEOUT", 0)
     if tool_timeout > 0:
         try:
             return await asyncio.wait_for(coro, timeout=tool_timeout)
@@ -1146,7 +1147,6 @@ def _apply_tool_filter(tools: str | None = None) -> None:
         CRG_TOOLS=query_graph_tool,semantic_search_nodes_tool
     """
     import asyncio
-    import os
 
     raw = tools or os.environ.get("CRG_TOOLS")
     if not raw:

@@ -33,7 +33,7 @@ else:
     except ImportError:
         tomllib = None  # type: ignore[assignment]
 
-from .constants import crg_home
+from .constants import crg_home, env_float
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +103,9 @@ _HEALTH_CHECK_INTERVAL = 30
 # Restarting a watcher costs a full initial update, so a repo that cannot stay
 # up must not be restarted every health check forever.  The delay doubles per
 # consecutive failure and resets once a watcher has stayed up this long.
-_RESTART_BACKOFF_BASE = float(os.environ.get("CRG_RESTART_BACKOFF", "30"))
-_RESTART_BACKOFF_MAX = float(os.environ.get("CRG_RESTART_BACKOFF_MAX", "900"))
-_RESTART_HEALTHY_SECONDS = float(os.environ.get("CRG_RESTART_HEALTHY_AFTER", "600"))
+_RESTART_BACKOFF_BASE = env_float("CRG_RESTART_BACKOFF", 30.0)
+_RESTART_BACKOFF_MAX = env_float("CRG_RESTART_BACKOFF_MAX", 900.0)
+_RESTART_HEALTHY_SECONDS = env_float("CRG_RESTART_HEALTHY_AFTER", 600.0)
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -541,7 +541,7 @@ def _is_pid_alive(pid: int) -> bool:
 # alone reports it healthy forever.  Each watch child publishes its observer
 # state and last-event time here instead; anything older than this is a stall.
 # See: #811.
-_WATCH_HEALTH_STALE_SECONDS = float(os.environ.get("CRG_WATCH_HEALTH_STALE", "90"))
+_WATCH_HEALTH_STALE_SECONDS = env_float("CRG_WATCH_HEALTH_STALE", 90.0)
 
 
 def watch_health_dir() -> Path:

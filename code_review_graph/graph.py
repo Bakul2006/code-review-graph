@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
 import threading
 import time
@@ -33,8 +32,14 @@ from .constants import (
     IMPACT_SCORE_FLOOR,
     MAX_IMPACT_DEPTH,
     MAX_IMPACT_NODES,
+    env_int,
 )
-from .migrations import get_schema_version, run_migrations
+from .errors import GraphStoreError
+from .migrations import (
+    LATEST_VERSION,
+    get_schema_version,
+    run_migrations,
+)
 from .parser import EdgeInfo, NodeInfo, normalize_file_path
 
 logger = logging.getLogger(__name__)
@@ -205,29 +210,109 @@ class GraphStats:
 # ---------------------------------------------------------------------------
 
 
+_RECOVERY_HINT = (
+    "Delete it and run `code-review-graph build` to rebuild the graph."
+)
+
+
+def _describe_open_failure(db_path: Path, exc: Exception) -> str:
+    """Turn a raw SQLite/OS error into one actionable line.
+
+    ``sqlite3`` reports "file is not a database" for a corrupt or foreign
+    file and "attempt to write a readonly database" / "unable to open
+    database file" for a directory the process may not write to. Those two
+    need opposite fixes, so they get opposite messages instead of one
+    generic apology.
+    """
+    detail = str(exc).strip() or exc.__class__.__name__
+    lowered = detail.lower()
+    if isinstance(exc, OSError) or "readonly" in lowered or "unable to open" in lowered:
+        return (
+            f"cannot open the graph database for writing at {db_path} ({detail}). "
+            f"Check the permissions on {db_path.parent}, or set CRG_DATA_DIR to a "
+            "writable directory."
+        )
+    return (
+        f"the graph database at {db_path} is unreadable ({detail}). "
+        f"{_RECOVERY_HINT}"
+    )
+
+
+def _assert_usable_database(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Refuse a SQLite file this build cannot honestly answer from.
+
+    Two cases that both used to be accepted in silence:
+
+    * a perfectly valid SQLite file belonging to something else. ``CREATE
+      TABLE IF NOT EXISTS`` would graft our schema onto it and every query
+      would then answer "nothing found" about a graph that was never there.
+    * a file written by a newer release. ``run_migrations`` is a no-op once
+      the stored version is at or above ``LATEST_VERSION``, so the mismatch
+      only surfaced much later, as a missing column in an unrelated query.
+    """
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+    ).fetchall()
+    tables = {row[0] for row in rows if not str(row[0]).startswith("sqlite_")}
+    if tables and not tables & {"nodes", "metadata"}:
+        sample = ", ".join(sorted(tables)[:3])
+        raise GraphStoreError(
+            f"{db_path} is a SQLite database but not a code-review-graph graph "
+            f"(it holds {sample}). Point --data-dir somewhere else, or delete "
+            "the file and run `code-review-graph build`."
+        )
+
+    version = get_schema_version(conn)
+    if version > LATEST_VERSION:
+        raise GraphStoreError(
+            f"the graph database at {db_path} was written by a newer "
+            f"code-review-graph (schema v{version}; this build understands "
+            f"v{LATEST_VERSION}). Upgrade code-review-graph, or delete the file "
+            "and run `code-review-graph build`."
+        )
+
+
 class GraphStore:
     """SQLite-backed code knowledge graph."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
-            str(self.db_path), timeout=30, check_same_thread=False,
-            isolation_level=None,  # Disable implicit transactions (#135)
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._init_schema()
-        # Ensure schema_version is set, then run pending migrations
-        if get_schema_version(self._conn) < 1:
-            # Fresh DB — metadata table just created by _init_schema
-            self._conn.execute(
-                "INSERT OR IGNORE INTO metadata (key, value) "
-                "VALUES ('schema_version', '1')"
+        conn: sqlite3.Connection | None = None
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(
+                str(self.db_path), timeout=30, check_same_thread=False,
+                isolation_level=None,  # Disable implicit transactions (#135)
             )
-            self._conn.commit()
-        run_migrations(self._conn)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            _assert_usable_database(conn, self.db_path)
+            self._conn = conn
+            self._init_schema()
+            # Ensure schema_version is set, then run pending migrations
+            if get_schema_version(self._conn) < 1:
+                # Fresh DB — metadata table just created by _init_schema
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO metadata (key, value) "
+                    "VALUES ('schema_version', '1')"
+                )
+                self._conn.commit()
+            run_migrations(self._conn)
+        except (sqlite3.Error, OSError, GraphStoreError) as exc:
+            # A corrupt file, a foreign SQLite file, or a data directory this
+            # process cannot write to used to escape as a raw traceback from
+            # every single command. Report the cause and the recovery instead.
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:  # pragma: no cover - best-effort cleanup
+                    pass
+            if isinstance(exc, GraphStoreError):
+                raise
+            raise GraphStoreError(
+                _describe_open_failure(self.db_path, exc)
+            ) from exc
         self._nxg_cache: nx.DiGraph | None = None
         self._cache_lock = threading.Lock()
 
@@ -662,7 +747,7 @@ class GraphStore:
         ``CRG_MAX_TRANSITIVE_FRONTIER`` env var (50 if unset).
         """
         if max_frontier is None:
-            max_frontier = int(os.environ.get("CRG_MAX_TRANSITIVE_FRONTIER", "50"))
+            max_frontier = env_int("CRG_MAX_TRANSITIVE_FRONTIER", 50)
         conn = self._conn
         seen: set[str] = set()
         results: list[dict] = []

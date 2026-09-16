@@ -1,0 +1,431 @@
+"""What the tool says when it cannot do the job.
+
+Three release blockers, all the same shape: the tool answered as though
+nothing were wrong, or crashed with a traceback, instead of naming the
+problem.
+
+* an unreadable, foreign or newer-schema ``graph.db`` tracebacked out of
+  ``GraphStore.__init__`` on every command;
+* an unwritable data directory did the same;
+* ``detect-changes`` printed ``No changes detected.`` and exited 0 when it
+  could not run git at all, which is a false all-clear for any CI gate keyed
+  on that exit code.
+
+``tests/test_cli_surface.py`` drives all of this through real subprocesses,
+but it is an opt-in release gate (``-m cli_surface``) that the ordinary CI
+run does not collect. These are the in-suite regression tests, at the level
+of the functions that carry the contract.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from code_review_graph import cli
+from code_review_graph.errors import (
+    ChangeDiscoveryError,
+    CodeReviewGraphError,
+    GraphRootMismatchError,
+    GraphStoreError,
+)
+from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import (
+    assert_graph_serves_root,
+    full_build,
+    get_changed_files,
+    get_staged_and_unstaged,
+)
+from code_review_graph.migrations import LATEST_VERSION
+
+# ---------------------------------------------------------------------------
+# 1. An unusable graph.db
+# ---------------------------------------------------------------------------
+
+
+def _built_db(tmp_path: Path) -> Path:
+    """A real graph.db with one file in it, closed and ready to damage."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
+    db_path = repo / ".code-review-graph" / "graph.db"
+    store = GraphStore(db_path)
+    try:
+        full_build(repo, store)
+    finally:
+        store.close()
+    for suffix in ("-wal", "-shm"):
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+    return db_path
+
+
+def test_garbage_bytes_are_reported_not_raised(tmp_path):
+    db = _built_db(tmp_path)
+    db.write_bytes(os.urandom(64 * 1024))
+    with pytest.raises(GraphStoreError) as caught:
+        GraphStore(db)
+    message = str(caught.value)
+    assert str(db) in message
+    assert "build" in message
+    assert not isinstance(caught.value, sqlite3.Error)
+
+
+def test_a_truncated_database_is_reported(tmp_path):
+    """A partial write: a real SQLite header over a body that ends early."""
+    db = _built_db(tmp_path)
+    db.write_bytes(db.read_bytes()[:512])
+    with pytest.raises(GraphStoreError) as caught:
+        GraphStore(db)
+    assert str(db) in str(caught.value)
+
+
+def test_a_foreign_sqlite_file_is_not_adopted(tmp_path):
+    """``CREATE TABLE IF NOT EXISTS`` would otherwise graft our schema on."""
+    db = _built_db(tmp_path)
+    db.unlink()
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE invoices (id INTEGER PRIMARY KEY, total REAL)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(GraphStoreError, match="not a code-review-graph"):
+        GraphStore(db)
+
+    # And it is left exactly as it was found.
+    conn = sqlite3.connect(str(db))
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    conn.close()
+    assert tables == {"invoices"}
+
+
+def test_a_newer_schema_is_refused_with_both_versions(tmp_path):
+    """run_migrations is a no-op above LATEST_VERSION, so nothing else notices."""
+    db = _built_db(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+        (str(LATEST_VERSION + 5),),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(GraphStoreError) as caught:
+        GraphStore(db)
+    message = str(caught.value)
+    assert f"v{LATEST_VERSION + 5}" in message
+    assert f"v{LATEST_VERSION}" in message
+    assert "newer" in message
+
+
+def test_an_empty_file_is_still_a_new_database(tmp_path):
+    """SQLite's own rule, and the one `build` relies on. Not corruption."""
+    db = _built_db(tmp_path)
+    db.write_bytes(b"")
+    store = GraphStore(db)
+    try:
+        assert store.get_stats().total_nodes == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores the read-only bit",
+)
+def test_unwritable_data_directory_names_the_directory(tmp_path):
+    db = _built_db(tmp_path)
+    data_dir = db.parent
+    original = data_dir.stat().st_mode
+    data_dir.chmod(0o500)
+    try:
+        with pytest.raises(GraphStoreError) as caught:
+            GraphStore(db)
+    finally:
+        data_dir.chmod(original)
+    message = str(caught.value)
+    assert str(data_dir) in message
+    assert "CRG_DATA_DIR" in message
+
+
+def test_a_failed_open_leaves_no_connection_behind(tmp_path):
+    """Whatever went wrong, the file handle is not leaked to the caller."""
+    db = _built_db(tmp_path)
+    db.write_bytes(os.urandom(4096))
+    with pytest.raises(GraphStoreError):
+        GraphStore(db)
+    # Proven by the file being replaceable straight away on every platform,
+    # including Windows, where an open handle would block the unlink.
+    db.unlink()
+
+
+# ---------------------------------------------------------------------------
+# 2. A graph that belongs to another repository
+# ---------------------------------------------------------------------------
+
+
+def _graph_of(repo: Path) -> GraphStore:
+    (repo / ".git").mkdir(parents=True, exist_ok=True)
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    full_build(repo, store)
+    return store
+
+
+def test_a_foreign_repository_graph_is_refused(tmp_path):
+    donor = tmp_path / "donor"
+    donor.mkdir()
+    (donor / "donor_mod.py").write_text("def donor_only():\n    return 1\n", "utf-8")
+    host = tmp_path / "host"
+    host.mkdir()
+    (host / ".git").mkdir()
+
+    store = _graph_of(donor)
+    try:
+        with pytest.raises(GraphRootMismatchError) as caught:
+            assert_graph_serves_root(host, store)
+    finally:
+        store.close()
+    message = str(caught.value)
+    assert str(host) in message
+    assert "different repository root" in message
+
+
+def test_the_graph_of_this_repository_is_served(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def handle():\n    return 1\n", "utf-8")
+    store = _graph_of(repo)
+    try:
+        assert_graph_serves_root(repo, store) is None
+    finally:
+        store.close()
+
+
+def test_an_equivalent_spelling_of_the_same_root_is_served(tmp_path):
+    """A symlinked checkout is the same repository, not a foreign one.
+
+    This is the macOS ``/var`` against ``/private/var`` case, and any repo
+    reached through a symlinked parent on Linux.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "app.py").write_text("def handle():\n    return 1\n", "utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    store = _graph_of(real)
+    try:
+        assert_graph_serves_root(link, store) is None
+    finally:
+        store.close()
+
+
+def test_a_relative_path_graph_carries_no_root_identity(tmp_path):
+    """Relative markers cannot be attributed to any root, so they pass."""
+    from code_review_graph.parser import NodeInfo
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    try:
+        store.upsert_node(NodeInfo(
+            kind="File", name="src/app.py", file_path="src/app.py",
+            line_start=1, line_end=2, language="python",
+        ))
+        assert assert_graph_serves_root(repo, store) is None
+    finally:
+        store.close()
+
+
+def test_a_graph_of_files_not_on_this_machine_is_stale_not_foreign(tmp_path):
+    """Nothing is being served another live checkout's answers here."""
+    from code_review_graph.parser import NodeInfo
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    try:
+        store.upsert_node(NodeInfo(
+            kind="File", name="/nowhere/src/app.py", file_path="/nowhere/src/app.py",
+            line_start=1, line_end=2, language="python",
+        ))
+        assert assert_graph_serves_root(repo, store) is None
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# 3. Change discovery that could not look
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    return repo
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError(2, "No such file or directory", "git"),
+        subprocess.TimeoutExpired("git", 30),
+    ],
+    ids=["missing-binary", "timeout"],
+)
+def test_require_vcs_turns_an_unrunnable_git_into_an_error(failure, git_repo):
+    with patch("code_review_graph.incremental.subprocess.run", side_effect=failure):
+        with pytest.raises(ChangeDiscoveryError) as caught:
+            get_changed_files(git_repo, "HEAD~1", require_vcs=True)
+    assert "could not determine the changes" in str(caught.value)
+
+    with patch("code_review_graph.incremental.subprocess.run", side_effect=failure):
+        with pytest.raises(ChangeDiscoveryError):
+            get_staged_and_unstaged(git_repo, require_vcs=True)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError(2, "No such file or directory", "git"),
+        subprocess.TimeoutExpired("git", 30),
+    ],
+    ids=["missing-binary", "timeout"],
+)
+def test_without_require_vcs_the_lenient_contract_is_unchanged(failure, git_repo):
+    """``update`` recovers by re-parsing and hashing, so it keeps the [] path."""
+    with patch("code_review_graph.incremental.subprocess.run", side_effect=failure):
+        assert get_changed_files(git_repo, "HEAD~1") == []
+        assert get_staged_and_unstaged(git_repo) == []
+
+
+def test_the_timeout_message_names_the_knob(git_repo):
+    with patch(
+        "code_review_graph.incremental.subprocess.run",
+        side_effect=subprocess.TimeoutExpired("git", 30),
+    ):
+        with pytest.raises(ChangeDiscoveryError) as caught:
+            get_changed_files(git_repo, "HEAD~1", require_vcs=True)
+    assert "CRG_GIT_TIMEOUT" in str(caught.value)
+
+
+def test_a_base_ref_that_does_not_resolve_is_not_an_unrunnable_git(git_repo):
+    """A repository with no commits still has to work.
+
+    ``require_vcs`` is about a VCS that could not be run at all. A base ref
+    that simply is not there keeps the documented ``--cached`` fallback, or
+    ``detect-changes`` would fail on every fresh ``git init``.
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+
+        class _Result:
+            returncode = 128 if len(calls) == 1 else 0
+            stdout = b""
+
+        return _Result()
+
+    with patch("code_review_graph.incremental.subprocess.run", side_effect=fake_run):
+        assert get_changed_files(git_repo, "HEAD~1", require_vcs=True) == []
+    assert len(calls) == 2, "the --cached fallback was skipped"
+
+
+def test_analyze_changes_degrades_rather_than_failing_on_a_partial_diff(tmp_path):
+    """Files are known, lines are not: precision is lost, honesty is not."""
+    from code_review_graph.changes import analyze_changes
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "app.py").write_text("def handle():\n    return 1\n", "utf-8")
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    try:
+        full_build(repo, store)
+        with patch(
+            "code_review_graph.changes.parse_diff_ranges",
+            side_effect=ChangeDiscoveryError("git timed out after 30s"),
+        ):
+            result = analyze_changes(
+                store,
+                changed_files=["app.py"],
+                repo_root=str(repo),
+                require_vcs=True,
+            )
+    finally:
+        store.close()
+
+    assert "git timed out" in result["diff_ranges_unavailable"]
+    assert "line-level diff unavailable" in result["summary"]
+    assert result["changed_functions"], "degraded to nothing at all"
+
+
+def test_analyze_changes_refuses_when_there_is_nothing_else_to_go_on(tmp_path):
+    """With no file list either, an empty answer would be an unearned all-clear."""
+    from code_review_graph.changes import analyze_changes
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    try:
+        with patch(
+            "code_review_graph.changes.parse_diff_ranges",
+            side_effect=ChangeDiscoveryError("git could not be run"),
+        ):
+            with pytest.raises(ChangeDiscoveryError):
+                analyze_changes(
+                    store, changed_files=[], repo_root=str(repo), require_vcs=True
+                )
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. The house style, at the top level
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GraphStoreError("the graph database at /x/graph.db is unreadable"),
+        GraphRootMismatchError("the graph at /x was built for a different root"),
+        ChangeDiscoveryError("could not determine the changes: git timed out"),
+    ],
+    ids=["store", "root", "discovery"],
+)
+def test_main_reports_a_self_explaining_failure_in_one_line(error, capsys):
+    """One ``Error: ...`` line on stderr, exit 1, nothing on stdout."""
+    with patch.object(cli, "_run", side_effect=error):
+        with patch.object(sys, "argv", ["code-review-graph", "status"]):
+            with pytest.raises(SystemExit) as caught:
+                cli.main()
+    assert caught.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == f"Error: {error}"
+    assert "Traceback" not in captured.err
+
+
+def test_main_does_not_swallow_an_unforeseen_bug(capsys):
+    """Only self-explaining failures lose their traceback."""
+    with patch.object(cli, "_run", side_effect=ZeroDivisionError("boom")):
+        with patch.object(sys, "argv", ["code-review-graph", "status"]):
+            with pytest.raises(ZeroDivisionError):
+                cli.main()
+
+
+def test_every_reported_failure_shares_one_base_class():
+    """``main`` catches exactly one thing; this is what has to be under it."""
+    for error_type in (GraphStoreError, GraphRootMismatchError, ChangeDiscoveryError):
+        assert issubclass(error_type, CodeReviewGraphError)

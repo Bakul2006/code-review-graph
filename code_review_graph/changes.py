@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
+from .constants import env_int
+from .errors import ChangeDiscoveryError
 from .flows import get_affected_flows
 from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
 from .parser import normalize_file_path
@@ -31,7 +33,7 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "__construct", "__init__", "__destruct",
 })
 
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
+_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30)  # seconds, configurable
 
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
@@ -42,15 +44,40 @@ _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORE
 # ---------------------------------------------------------------------------
 
 
+def _vcs_unavailable(tool: str, exc: BaseException) -> ChangeDiscoveryError:
+    """Describe a VCS command that could not be run at all.
+
+    Mirrors :func:`code_review_graph.incremental._vcs_unavailable`; a missing
+    binary and a timeout say nothing about the working tree, so no caller may
+    read them as "no lines changed".
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return ChangeDiscoveryError(
+            f"could not determine the changed lines: {tool} timed out after "
+            f"{_GIT_TIMEOUT}s. Raise CRG_GIT_TIMEOUT, or re-run when the "
+            "repository is not busy."
+        )
+    return ChangeDiscoveryError(
+        f"could not determine the changed lines: {tool} could not be run "
+        f"({exc}). Install {tool} and make sure it is on PATH."
+    )
+
+
 def parse_git_diff_ranges(
     repo_root: str,
     base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Run ``git diff --unified=0`` and extract changed line ranges per file.
 
     Args:
         repo_root: Absolute path to the repository root.
         base: Git ref to diff against (default: ``HEAD~1``).
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when git
+            cannot be run at all, instead of returning an empty mapping that
+            a caller would read as "no lines changed".
 
     Returns:
         Mapping of file paths to lists of ``(start_line, end_line)`` tuples.
@@ -75,6 +102,8 @@ def parse_git_diff_ranges(
             return {}
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("git diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("git", exc) from exc
         return {}
 
     return _parse_unified_diff(result.stdout)
@@ -83,6 +112,8 @@ def parse_git_diff_ranges(
 def parse_svn_diff_ranges(
     repo_root: str,
     rev_range: str | None = None,
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Run ``svn diff`` and extract changed line ranges per file.
 
@@ -117,6 +148,8 @@ def parse_svn_diff_ranges(
             return {}
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("svn diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("svn", exc) from exc
         return {}
 
     return _parse_unified_diff(result.stdout)
@@ -125,6 +158,8 @@ def parse_svn_diff_ranges(
 def parse_diff_ranges(
     repo_root: str,
     base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Auto-detect VCS and return changed line ranges per file.
 
@@ -137,12 +172,15 @@ def parse_diff_ranges(
               For SVN: an optional revision range (e.g. ``"r100:HEAD"``);
               when *base* is not a valid SVN revision, working-copy changes
               (``svn diff``) are used instead.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            VCS binary is missing or times out, instead of returning ``{}``.
     """
     root_path = Path(repo_root)
     if (root_path / ".svn").exists():
         rev_range = base if _SAFE_SVN_REV.match(base) else None
-        return parse_svn_diff_ranges(repo_root, rev_range)
-    return parse_git_diff_ranges(repo_root, base)
+        return parse_svn_diff_ranges(repo_root, rev_range, require_vcs=require_vcs)
+    return parse_git_diff_ranges(repo_root, base, require_vcs=require_vcs)
 
 
 def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
@@ -397,6 +435,7 @@ def analyze_changes(
     repo_root: str | None = None,
     base: str = "HEAD~1",
     include_churn: bool = False,
+    require_vcs: bool = False,
 ) -> dict[str, Any]:
     """Analyze changes and produce risk-scored review guidance.
 
@@ -411,12 +450,17 @@ def analyze_changes(
         include_churn: Add an opt-in change-frequency term to each node's
             risk score. The trailing window defaults to 90 days and can be
             configured with ``CRG_CHURN_WINDOW_DAYS``.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            diff cannot be read at all, rather than silently degrading to a
+            file-level analysis. Review gates pass this.
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
         ``affected_flows``, ``test_gaps``, and ``review_priorities``.
     """
     # Compute changed ranges if not provided.
+    ranges_unavailable = ""
     if changed_ranges is None and repo_root is not None:
         # Diff keys are forward-slash paths relative to the repo root, but
         # the graph stores absolute native paths. Remap so lookups work on
@@ -426,9 +470,23 @@ def analyze_changes(
         # explicit changed_ranges path (MCP) is untouched — tools/review.py
         # remaps before calling, and remapping twice would corrupt keys.
         root_path = Path(repo_root)
+        try:
+            raw_ranges = parse_diff_ranges(repo_root, base, require_vcs=require_vcs)
+        except ChangeDiscoveryError as exc:
+            if not changed_files:
+                # Nothing else to go on: an empty answer here would be an
+                # all-clear the tool has not earned.
+                raise
+            # The changed files are already known, so an unreadable
+            # line-level diff costs precision, not honesty. Degrade to
+            # whole-file scoring and say so in the summary rather than
+            # presenting a file-level answer as a line-level one.
+            logger.warning("%s; scoring whole files instead", exc)
+            ranges_unavailable = str(exc)
+            raw_ranges = {}
         changed_ranges = {
             normalize_file_path(root_path / key): ranges
-            for key, ranges in parse_diff_ranges(repo_root, base).items()
+            for key, ranges in raw_ranges.items()
         }
 
     # The affected-flows lookup and the no-ranges fallback match
@@ -462,7 +520,7 @@ def analyze_changes(
     ]
 
     # Cap to prevent O(N*M) query explosion on large PRs.
-    _max_funcs = int(os.environ.get("CRG_MAX_CHANGED_FUNCS", "500"))
+    _max_funcs = env_int("CRG_MAX_CHANGED_FUNCS", 500)
     funcs_truncated = len(changed_funcs) > _max_funcs
     if funcs_truncated:
         changed_funcs = changed_funcs[:_max_funcs]
@@ -545,6 +603,11 @@ def analyze_changes(
             f"  - Warning: analysis capped at {_max_funcs} functions "
             f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
         )
+    if ranges_unavailable:
+        summary_parts.append(
+            "  - Warning: line-level diff unavailable, whole files scored "
+            f"({ranges_unavailable})"
+        )
 
     return {
         "summary": "\n".join(summary_parts),
@@ -554,4 +617,5 @@ def analyze_changes(
         "test_gaps": test_gaps,
         "review_priorities": review_priorities,
         "functions_truncated": funcs_truncated,
+        "diff_ranges_unavailable": ranges_unavailable,
     }

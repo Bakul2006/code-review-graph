@@ -22,10 +22,12 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
+from .constants import env_float, env_int
+from .errors import ChangeDiscoveryError, GraphRootMismatchError
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
 
-_MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
+_MAX_PARSE_WORKERS = env_int("CRG_PARSE_WORKERS", min(os.cpu_count() or 4, 8))
 
 # Set only while the in-process FastMCP server is using stdio transport.
 # This is deliberately separate from ``sys.stdin.isatty()``: CI, cron, and
@@ -272,10 +274,10 @@ NESTED_OUTPUT_DIR_MARKERS: dict[str, frozenset[str]] = {
 # (no file stats), stops at ``CRG_MODULE_SCAN_DEPTH`` levels, never descends
 # into an already-ignored tree, and its result is cached per repository so
 # incremental updates never pay for it twice inside the TTL.
-_MODULE_SCAN_DEPTH = int(os.environ.get("CRG_MODULE_SCAN_DEPTH", "3"))
-_MODULE_SCAN_MAX_DIRS = int(os.environ.get("CRG_MODULE_SCAN_MAX_DIRS", "2000"))
+_MODULE_SCAN_DEPTH = env_int("CRG_MODULE_SCAN_DEPTH", 3)
+_MODULE_SCAN_MAX_DIRS = env_int("CRG_MODULE_SCAN_MAX_DIRS", 2000)
 _MAX_NESTED_OUTPUT_PATTERNS = 200
-_NESTED_IGNORE_TTL_SECONDS = float(os.environ.get("CRG_NESTED_IGNORE_TTL", "300"))
+_NESTED_IGNORE_TTL_SECONDS = env_float("CRG_NESTED_IGNORE_TTL", 300.0)
 
 _nested_ignore_cache: dict[tuple[str, tuple[str, ...]], tuple[float, list[str]]] = {}
 _nested_ignore_lock = threading.Lock()
@@ -713,7 +715,7 @@ def _is_binary(path: Path) -> bool:
         return True
 
 
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
+_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30)  # seconds, configurable
 
 # When True, `git ls-files --recurse-submodules` is used so that files
 # inside git submodules are included in the graph.  Opt-in via env var;
@@ -940,11 +942,30 @@ def resolve_review_base(repo_root: Path, base: str) -> str:
     return base
 
 
+def _vcs_unavailable(tool: str, exc: BaseException) -> ChangeDiscoveryError:
+    """Describe a VCS command that could not be run at all.
+
+    Missing binary and timeout are the two failures that say nothing about
+    the working tree, so a caller must never read them as "nothing changed".
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return ChangeDiscoveryError(
+            f"could not determine the changes: {tool} timed out after "
+            f"{_GIT_TIMEOUT}s. Raise CRG_GIT_TIMEOUT, or re-run when the "
+            "repository is not busy."
+        )
+    return ChangeDiscoveryError(
+        f"could not determine the changes: {tool} could not be run ({exc}). "
+        f"Install {tool} and make sure it is on PATH."
+    )
+
+
 def get_changed_files(
     repo_root: Path,
     base: str = "HEAD~1",
     *,
     strict: bool = False,
+    require_vcs: bool = False,
 ) -> list[str]:
     """Get list of changed files via git diff or svn status.
 
@@ -953,14 +974,26 @@ def get_changed_files(
     range (e.g. ``"r100:HEAD"``) as *base* to compare against a specific
     revision instead.  When *strict* is true, Git discovery failures raise
     instead of being reported as an empty change list.
+
+    *require_vcs* is the narrower half of *strict*, for callers whose whole
+    answer is "these files changed": it raises
+    :class:`~code_review_graph.errors.ChangeDiscoveryError` when the VCS
+    binary is missing or times out, but keeps the documented fallback for a
+    base ref that simply does not resolve (a repository with no commits
+    still has to work).  Returning ``[]`` for a VCS that could not be run is
+    what let ``detect-changes`` report a clean tree it never looked at.
     """
     if detect_vcs(repo_root) == "svn":
-        return _get_svn_changed_files(repo_root, base if _SAFE_SVN_REV.match(base) else None)
+        return _get_svn_changed_files(
+            repo_root,
+            base if _SAFE_SVN_REV.match(base) else None,
+            require_vcs=require_vcs or strict,
+        )
     # Git path
     if base.startswith("-") or not _SAFE_GIT_REF.fullmatch(base):
         logger.warning("Invalid git ref rejected: %s", base)
         if strict:
-            raise RuntimeError(f"invalid git diff base: {base}")
+            raise ChangeDiscoveryError(f"invalid git diff base: {base}")
         return []
     try:
         # --name-status (not --name-only): renames/copies must report BOTH
@@ -974,7 +1007,7 @@ def get_changed_files(
         )
         if result.returncode != 0:
             if strict:
-                raise RuntimeError(
+                raise ChangeDiscoveryError(
                     f"git diff failed while discovering changed files (rc={result.returncode})"
                 )
             # Fallback: try diff against empty tree (initial commit)
@@ -989,9 +1022,11 @@ def get_changed_files(
             logger.warning("git diff failed while discovering changed files")
             return []
         return _decode_name_status_paths(result.stdout)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         if strict:
-            raise RuntimeError("git change discovery failed") from exc
+            raise ChangeDiscoveryError("git change discovery failed") from exc
+        if require_vcs:
+            raise _vcs_unavailable("git", exc) from exc
         return []
 
 
@@ -1038,12 +1073,21 @@ def _find_content_mismatches(
     return mismatched_files, current_hashes, text_files
 
 
-def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> list[str]:
+def _get_svn_changed_files(
+    repo_root: Path,
+    rev_range: str | None = None,
+    *,
+    require_vcs: bool = False,
+) -> list[str]:
     """Return changed files in an SVN working copy.
 
     When *rev_range* is given (e.g. ``"r100:HEAD"``), ``svn diff --summarize``
     is used to list files changed between those revisions.  Otherwise
     ``svn status`` reports working-copy modifications.
+
+    *require_vcs* has the same meaning as in :func:`get_changed_files`: an
+    ``svn`` that cannot be run is raised rather than reported as "nothing
+    changed".
     """
     try:
         if rev_range:
@@ -1081,13 +1125,25 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
                     path = line[8:].strip() if len(line) > 8 else line[1:].strip()
                     files.append(path)
             return files
-    except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if require_vcs:
+            raise _vcs_unavailable("svn", exc) from exc
+        return []
+    except UnicodeDecodeError:
         return []
 
-def get_staged_and_unstaged(repo_root: Path) -> list[str]:
-    """Get all modified files (staged + unstaged + untracked)."""
+
+def get_staged_and_unstaged(
+    repo_root: Path,
+    *,
+    require_vcs: bool = False,
+) -> list[str]:
+    """Get all modified files (staged + unstaged + untracked).
+
+    *require_vcs* has the same meaning as in :func:`get_changed_files`.
+    """
     if detect_vcs(repo_root) == "svn":
-        return _get_svn_changed_files(repo_root)
+        return _get_svn_changed_files(repo_root, require_vcs=require_vcs)
     try:
         result = subprocess.run(
             [
@@ -1119,7 +1175,9 @@ def get_staged_and_unstaged(repo_root: Path) -> list[str]:
                     index += 1
             index += 1
         return files
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if require_vcs:
+            raise _vcs_unavailable("git", exc) from exc
         return []
 
 def get_all_tracked_files(
@@ -1309,7 +1367,73 @@ def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
     )
 
 
-_MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
+#: How many markers the two filesystem probes below look at. They only have
+#: to establish which root the graph is anchored to, and every marker in one
+#: graph shares that root, so a handful is as conclusive as all of them.
+_ROOT_PROBE_LIMIT = 25
+
+
+def assert_graph_serves_root(repo_root: Path, store: GraphStore) -> None:
+    """Refuse to *answer* from a graph built for a different repository.
+
+    ``_assert_graph_matches_root`` guards the write side only: it runs during
+    incremental reconciliation, where a wrong root would purge files. Every
+    read-only consumer opened the same database without asking, so dropping
+    one repository's ``graph.db`` into another repository (a copied file, a
+    restored CI cache) served that repository's symbols and absolute paths
+    under this repository's name, and exited 0 while doing it.
+
+    Refusing to answer is not destructive the way purging is, so this check
+    is deliberately narrower than the write-side one: it fires only on an
+    unambiguously foreign graph. Four things are not that, and pass:
+
+    * a graph with no authoritative File markers at all;
+    * a graph of repo-relative paths, which carry no root identity;
+    * a different spelling of the same root (macOS ``/var`` against
+      ``/private/var``, a symlinked checkout) — resolved before comparing;
+    * a graph whose files are not on this machine at all, which is stale or
+      synthetic rather than another live checkout being served.
+    """
+    # Materialised, not consumed lazily: this runs on every command, so a
+    # store that answers with something other than a list of paths must skip
+    # the check rather than take the process down with it.
+    markers = [str(path) for path in store.get_file_marker_paths()]
+    absolute = [path for path in markers if Path(path).is_absolute()]
+    if not absolute:
+        return
+
+    prefix = normalize_file_path(_canonical_repo_root(repo_root))
+    prefix = prefix if prefix.endswith("/") else prefix + "/"
+    if any(normalize_file_path(path).startswith(prefix) for path in absolute):
+        return
+
+    probe = absolute[:_ROOT_PROBE_LIMIT]
+    if any(
+        normalize_file_path(os.path.realpath(path)).startswith(prefix)
+        for path in probe
+    ):
+        return
+
+    elsewhere = next((path for path in probe if Path(path).exists()), None)
+    if elsewhere is None:
+        logger.debug(
+            "Graph at %s holds no file under %s and none on this machine; "
+            "treating it as stale rather than as another repository's graph.",
+            store.db_path,
+            repo_root,
+        )
+        return
+
+    raise GraphRootMismatchError(
+        f"the graph at {store.db_path} was built for a different repository "
+        f"root: none of its {len(absolute)} file(s), such as "
+        f"{normalize_file_path(elsewhere)}, are under {repo_root}. Run "
+        "`code-review-graph build` here, or point --repo at the root it was "
+        "built for."
+    )
+
+
+_MAX_DEPENDENT_HOPS = env_int("CRG_DEPENDENT_HOPS", 2)
 _MAX_DEPENDENT_FILES = 500
 
 
@@ -1861,13 +1985,13 @@ def _raise_watch_postprocess_warnings(result: object) -> None:
 # watch per directory in the tree — including every temp directory a build tool
 # churns through inside ``target/`` or ``node_modules/``.  Planning the watches
 # ourselves keeps ignored trees off the OS watch list entirely.  See: #811.
-_WATCH_PLAN_DEPTH = int(os.environ.get("CRG_WATCH_PLAN_DEPTH", "3"))
-_MAX_WATCH_SCHEDULES = int(os.environ.get("CRG_MAX_WATCH_SCHEDULES", "24"))
+_WATCH_PLAN_DEPTH = env_int("CRG_WATCH_PLAN_DEPTH", 3)
+_MAX_WATCH_SCHEDULES = env_int("CRG_MAX_WATCH_SCHEDULES", 24)
 # Splitting a watch costs one watchdog emitter, so it has to buy more than it
 # costs: an ignored tree is only worth excluding once it holds this many
 # directories.  A lone ``__pycache__`` is not worth a thread; ``target/`` is.
-_WATCH_SPLIT_MIN_DIRS = int(os.environ.get("CRG_WATCH_SPLIT_MIN_DIRS", "4"))
-_WATCH_HEALTH_INTERVAL = float(os.environ.get("CRG_WATCH_HEALTH_INTERVAL", "10"))
+_WATCH_SPLIT_MIN_DIRS = env_int("CRG_WATCH_SPLIT_MIN_DIRS", 4)
+_WATCH_HEALTH_INTERVAL = env_float("CRG_WATCH_HEALTH_INTERVAL", 10.0)
 _WATCH_STOP_TIMEOUT = 10.0
 _WATCH_TICK_SECONDS = 1.0
 # A failed recursive promotion is retried no more often than this. Each attempt

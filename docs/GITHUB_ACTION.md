@@ -200,4 +200,13 @@ Options: `--input` (JSON file or `-` for stdin, default `-`), `--output`
 (file or `-` for stdout, default `-`), `--fail-on-risk none|high|critical`,
 `--max-functions` (default 10), `--max-flows` (default 5), `--quiet` (skip
 writing the body). Exit codes: 0 rendered and gate passed or disabled, 2 the
-input file could not be read, 3 risk gate breached.
+input file could not be read, 3 risk gate breached, 4 `detect-changes`
+produced no analysis at all.
+
+Exit 4 is deliberately distinct from 0. `detect-changes` prints exactly
+`No changes detected.` for a tree it read and found unchanged; anything else
+that is not JSON means the analysis never ran. The rendered comment then says
+so, and the action fails the job, because a reassuring comment on a pull
+request nobody analyzed is worse than no comment at all. This is not
+something `fail-on-risk: none` can switch off: an unknown risk is not a low
+one.

@@ -49,6 +49,8 @@ from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Iterable, TypedDict
 
+from .errors import CodeReviewGraphError
+
 logger = logging.getLogger(__name__)
 
 # Shared platform choices for install and init commands
@@ -692,7 +694,23 @@ def _warn_failed_files(result: dict) -> None:
 
 
 def main() -> None:
-    """Main CLI entry point."""
+    """Main CLI entry point.
+
+    Everything the tool can explain about its own failure is raised as a
+    :class:`~code_review_graph.errors.CodeReviewGraphError` and reported here
+    in the house style the rest of the CLI already uses: one ``Error: ...``
+    line on stderr, exit 1, no traceback for the user to decode. Anything
+    else really is a bug and keeps its traceback.
+    """
+    try:
+        _run()
+    except CodeReviewGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def _run() -> None:
+    """Parse the command line and dispatch one subcommand."""
     _configure_utf8_stdio()
     ap = argparse.ArgumentParser(
         prog="code-review-graph",
@@ -1624,6 +1642,7 @@ def main() -> None:
 
     from .graph import GraphStore
     from .incremental import (
+        assert_graph_serves_root,
         find_project_root,
         find_repo_root,
         get_db_path,
@@ -1745,6 +1764,16 @@ def main() -> None:
         )
         raise SystemExit(1)
     store = GraphStore(db_path)
+
+    try:
+        # A graph.db copied or cached from another checkout answers every
+        # question with that repository's symbols and absolute paths. The
+        # write side has refused that since #909; the read side used to
+        # accept it in silence.
+        assert_graph_serves_root(repo_root, store)
+    except BaseException:
+        store.close()
+        raise
 
     try:
         if args.command == "dead-code":
@@ -2120,9 +2149,14 @@ def main() -> None:
             from .incremental import get_changed_files, get_staged_and_unstaged, resolve_review_base
 
             base = resolve_review_base(repo_root, args.base)
-            changed = get_changed_files(repo_root, base)
+            # require_vcs: this command's exit code is a review gate. "I
+            # could not look" must never render as "there is nothing to
+            # review" — a CI job keyed on exit 0 would wave through a pull
+            # request nobody read. ChangeDiscoveryError reaches main() and
+            # becomes one `Error: ...` line and exit 1.
+            changed = get_changed_files(repo_root, base, require_vcs=True)
             if not changed:
-                changed = get_staged_and_unstaged(repo_root)
+                changed = get_staged_and_unstaged(repo_root, require_vcs=True)
 
             if not changed:
                 print("No changes detected.")
@@ -2133,6 +2167,7 @@ def main() -> None:
                     repo_root=str(repo_root),
                     base=base,
                     include_churn=getattr(args, "churn", False),
+                    require_vcs=True,
                 )
                 original_tokens = estimate_file_tokens(repo_root, changed)
                 attach_context_savings(
