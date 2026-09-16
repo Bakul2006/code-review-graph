@@ -101,6 +101,15 @@ def _run_postprocess(
             provider=embedding_provider,
             model=embedding_model,
         )
+        # No resolver runs at this level, but edges were still written, so
+        # the certainty column must not be left stale for the query layer.
+        try:
+            store.refresh_target_resolution()
+        except sqlite3.OperationalError as e:
+            logger.warning("Target-resolution refresh failed: %s", e)
+            warnings.append(
+                f"Target-resolution refresh failed: {type(e).__name__}: {e}"
+            )
         return warnings
 
     # Resolve bare and C++ scoped call targets before derived graph steps.
@@ -111,6 +120,9 @@ def _run_postprocess(
         build_result["cpp_scoped_edges_resolved"] = (
             store.resolve_cpp_scoped_call_targets()
         )
+        # Resolvers rewrite bare targets into qualified ones, so the stored
+        # certainty column is only correct once they have all run.
+        store.refresh_target_resolution()
     except sqlite3.OperationalError as e:
         logger.warning("Call-target resolution failed: %s", e)
         warnings.append(
@@ -676,6 +688,9 @@ def run_postprocess(
             result["cpp_scoped_edges_resolved"] = (
                 store.resolve_cpp_scoped_call_targets()
             )
+            # Resolvers rewrite bare targets into qualified ones, so the
+            # stored certainty column is only correct once they have run.
+            store.refresh_target_resolution()
         except sqlite3.OperationalError as e:
             logger.warning("Call-target resolution failed: %s", e)
             warnings.append(
