@@ -414,6 +414,20 @@ code-review-graph visualize                    # Interactive HTML graph (needs a
 code-review-graph visualize --format graphml   # Formats: html, json, graphml, cypher, obsidian, svg
 code-review-graph visualize --serve            # Serve graph.html on localhost:8765
 
+# Neighbourhood view: draw a symbol's surroundings instead of the repository.
+# The whole-repo page collapses to one bubble per community past 3000 nodes or
+# 9000 edges; a seeded page ships only the nodes within --depth hops.
+code-review-graph visualize --seed-symbol login             # depth 2 by default
+code-review-graph visualize --seed-symbol login --depth 3   # more context
+code-review-graph visualize --seed-file src/auth.py         # a file and its symbols
+code-review-graph visualize --seed-changed                  # the files in this review
+code-review-graph visualize --seed-changed --seed-changed-base origin/main
+code-review-graph visualize --seed-flow "login request"     # an execution flow
+code-review-graph visualize --path-from login --path-to audit_log
+code-review-graph visualize --seed-symbol login --render-depth 0  # expand on click
+code-review-graph visualize --seed-symbol login --max-nodes 300
+code-review-graph visualize --seed-symbol login --sidecar   # payload in graph.data.js
+
 # Analysis
 code-review-graph detect-changes               # Risk-scored change analysis (read-only)
 code-review-graph detect-changes --base HEAD~3 # Custom base revision
@@ -482,6 +496,26 @@ Notes:
   `dead-code` exit 1 when no graph exists and do not create one. `forget` and
   `dead-code` still move a legacy top-level `.code-review-graph.db` into
   `.code-review-graph/graph.db` before running.
+- `visualize` without a seed exports the whole repository, and falls back to
+  community (or file) bubbles once the rendered graph passes 3000 nodes or
+  9000 edges. With `--seed-symbol`, `--seed-file`, `--seed-changed`,
+  `--seed-flow` or `--path-from/--path-to` it exports a neighbourhood instead:
+  the nodes within `--depth` hops of the seed and the edges among them, with
+  everything else left out of the payload rather than drawn dimmed. A seeded
+  page always uses the full renderer and never aggregates.
+- A hop is a semantic edge (`CALLS`, `IMPORTS_FROM`, `INHERITS`, `IMPLEMENTS`,
+  `TESTED_BY`, `DEPENDS_ON`). `CONTAINS` is structural and is not a hop, so a
+  depth-2 neighbourhood of one function does not swallow its whole module; the
+  containing `File` nodes are still shipped so clustering and collapse work.
+- `--render-depth` (default 1) is how many hops are drawn on open. Clicking a
+  node on the edge of what is drawn reveals its next ring, `+1 hop` reveals a
+  whole ring, and both read from the payload already in the page.
+- `--path-from A --path-to B` highlights the shortest path through `CALLS`,
+  `IMPORTS_FROM` and `INHERITS`, following edge direction where one exists and
+  falling back to an undirected route otherwise. The page says which it used.
+- The default output is still a single self-contained `graph.html` you can
+  email. `--sidecar` moves the payload into `graph.data.js` next to it, which
+  is only worth it for a large neighbourhood.
 - `install` appends a Git `pre-commit` hook that prints a risk summary before
   each commit. The hook skips linked worktrees unless `CRG_HOOK_WORKTREES=1`
   is set, so a worktree does not build a second graph for another branch.
