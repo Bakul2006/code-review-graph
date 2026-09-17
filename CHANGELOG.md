@@ -43,19 +43,43 @@
 
 ### Fixed
 
-- Go and Ruby imports resolve to files instead of staying bare strings. Go
-  reads the module path from the nearest `go.mod` (nested modules win over
-  their ancestors, local `replace` targets and `vendor/` are honoured) and
-  maps an in-repo import to the non-test `.go` files of the package
-  directory it names; the standard library and undownloaded dependencies
-  stay unresolved. Ruby resolves `require_relative` against the requiring
-  file and `require`, `load`, `autoload` and `require_all` against the
-  repository's load roots (gemspec `require_paths`, `lib`, `test`, `spec`,
-  the Rails `app` roots, and `$LOAD_PATH.unshift` in a root script); gems
-  stay unresolved. On cli/cli, go import edges that name a real file go
-  from 0 of 8687 to 17527 of 22721, and `importers_of` for
-  `pkg/iostreams/iostreams.go` from 0 to 424. On jekyll, ruby edges go
-  from 0 of 227 to 159 of 264.
+- Go and Ruby imports resolve into the repository instead of staying bare
+  strings. Go reads the module path from the nearest `go.mod` (nested
+  modules win over their ancestors, and local `replace` targets are
+  honoured) and maps an in-repo import to the package DIRECTORY it names;
+  the standard library, undownloaded dependencies and anything the ignore
+  patterns exclude stay unresolved. Ruby resolves `require_relative`
+  against the requiring file and `require`, `load`, `autoload` and
+  `require_all` against the repository's load roots (gemspec
+  `require_paths`, `lib`, `test`, `spec`, the Rails `app` roots, and
+  `$LOAD_PATH.unshift` in a root script); gems stay unresolved.
+  `importers_of` for cli/cli's `pkg/iostreams/color.go` goes from 0 to 424,
+  and for jekyll's `test/helper.rb` from 0 to 51.
+- A Go import names a package and a Ruby `require_all` names a directory
+  tree, so both emit ONE edge naming that directory, tagged
+  `extra.import_scope`, and the read path expands a directory to its member
+  files. `importers_of` matches edges targeting a file's own package,
+  `imports_of` reports `import_target_kind`, and the impact traversal
+  follows a package target at every hop without spending one. Emitting an
+  edge per member file instead would make the edge count grow with imports
+  times package size: 73,507 edges for one imported kubernetes package, a
+  35% larger database, and an incremental update that disagrees with a
+  rebuild, because an edge's targets then depend on which files were in the
+  package when the importing file happened to be parsed.
+- No import edge names a path the build does not index. 73,507 kubernetes
+  import edges named files under `vendor/`, which `**/vendor/**` excludes,
+  so every one of them was a confident-looking path that matched no node.
+  Such an import keeps its bare module string, which is visibly external.
+- `get_impact_radius` bounds every list in its response by a fixed ceiling
+  -- the same 100 nodes, 150 edges and 200 files `get_review_context`
+  applies to the same radius -- and reports `edges_omitted`,
+  `changed_nodes_omitted` and `impacted_files_omitted` alongside the
+  existing `nodes_omitted` and `total_impacted`. `edges` and `changed_nodes`
+  had no ceiling at all and `max_results` was not exposed on the MCP tool,
+  so the response grew with the repository: 138k tokens on one changed file
+  of cli/cli and 189k on one of kubernetes, against a documented 12k budget.
+  Edges that touch the changed code are kept first, and `max_results` is now
+  an argument of `get_impact_radius_tool`.
 - Every specifier in a Go `import ( ... )` block carries its own line.
   8648 of cli/cli's 8690 import edges were stamped with the line of the
   `import (` token.

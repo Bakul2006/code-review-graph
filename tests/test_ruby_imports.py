@@ -33,6 +33,13 @@ def _want(path: Path) -> str:
     return normalize_file_path(path.resolve())
 
 
+def _scopes(edges) -> list[object]:
+    return [
+        e.extra.get("import_scope")
+        for e in edges if e.kind == "IMPORTS_FROM"
+    ]
+
+
 def _parse(repo: Path, rel: str, source: str):
     path = _write(repo, rel, source)
     parser = CodeParser(repo_root=str(repo))
@@ -132,13 +139,27 @@ class TestRubyImportForms:
         assert _targets(edges) == [_want(tmp_path / "app/models/user.rb")]
 
     def test_load_path_unshift_adds_a_root(self, tmp_path):
+        _write(tmp_path, "extras/widget.rb")
+        _write(
+            tmp_path, "Rakefile",
+            '$LOAD_PATH.unshift File.expand_path("extras", __dir__)\n',
+        )
+        edges = _parse(tmp_path, "run.rb", 'require "widget"\n')
+        assert _targets(edges) == [_want(tmp_path / "extras/widget.rb")]
+
+    def test_a_require_into_an_unindexed_directory_stays_bare(self, tmp_path):
+        """``**/vendor/**`` is a default ignore, so nothing in it is a node.
+
+        Naming a file no build indexes turns a visibly external bare string
+        into a confident path that resolves to nothing.
+        """
         _write(tmp_path, "vendor/extra/widget.rb")
         _write(
             tmp_path, "Rakefile",
             '$LOAD_PATH.unshift File.expand_path("vendor/extra", __dir__)\n',
         )
         edges = _parse(tmp_path, "run.rb", 'require "widget"\n')
-        assert _targets(edges) == [_want(tmp_path / "vendor/extra/widget.rb")]
+        assert _targets(edges) == ["widget"]
 
 
 class TestRubyNonFabrication:
@@ -204,31 +225,40 @@ class TestRubyNonFabrication:
 
 
 class TestRubyRequireAll:
-    """`require_all "dir"` loads a whole directory, so it fans out.
+    """`require_all "dir"` loads a whole directory TREE.
 
     jekyll declares six subsystems this way -- commands, converters,
     converters/markdown, drops, generators and tags -- and each was a
     single bare-string edge that matched no node.
+
+    It is the same shape of question as a Go package import and gets the
+    same answer: one edge naming the directory, expanded on the read path.
+    The scope differs because the semantics do -- ``require_all`` loads every
+    file BELOW the directory, while a Go package is exactly one directory --
+    so these edges are tagged ``tree`` and Go's are tagged ``package``.
     """
 
-    def test_require_all_names_every_file_under_the_directory(self, repo):
+    def test_require_all_names_the_directory_once(self, repo):
         _write(repo, "lib/thing/commands/build.rb")
         _write(repo, "lib/thing/commands/serve.rb")
         _write(repo, "lib/thing/commands/serve/servlet.rb")
         edges = _parse(repo, "lib/thing.rb", 'require_all "thing/commands"\n')
-        assert sorted(_targets(edges)) == sorted([
-            _want(repo / "lib/thing/commands/build.rb"),
-            _want(repo / "lib/thing/commands/serve.rb"),
-            _want(repo / "lib/thing/commands/serve/servlet.rb"),
-        ])
-        for target in _targets(edges):
-            assert Path(target).is_file(), target
+        assert _targets(edges) == [_want(repo / "lib/thing/commands")]
+        assert _scopes(edges) == ["tree"]
+        assert Path(_targets(edges)[0]).is_dir()
 
     def test_require_all_prefers_the_directory_over_a_same_named_file(self, repo):
         """lib/jekyll/filters.rb itself calls `require_all "jekyll/filters"`."""
         _write(repo, "lib/thing/filters/date_filters.rb")
         edges = _parse(repo, "lib/thing/filters.rb", 'require_all "thing/filters"\n')
-        assert _targets(edges) == [_want(repo / "lib/thing/filters/date_filters.rb")]
+        assert _targets(edges) == [_want(repo / "lib/thing/filters")]
+        assert _scopes(edges) == ["tree"]
+
+    def test_require_all_of_a_plain_file_resolves_like_require(self, repo):
+        """The gem falls back to a plain require for a file argument."""
+        edges = _parse(repo, "lib/thing.rb", 'require_all "thing/version"\n')
+        assert _targets(edges) == [_want(repo / "lib/thing/version.rb")]
+        assert _scopes(edges) == [None]
 
     def test_require_all_of_an_unknown_directory_stays_a_bare_string(self, repo):
         edges = _parse(repo, "lib/thing.rb", 'require_all "thing/nope"\n')

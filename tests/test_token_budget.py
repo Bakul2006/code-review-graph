@@ -53,7 +53,7 @@ import pytest
 from code_review_graph import main as crg_main
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
-from code_review_graph.tools import analysis_tools, community_tools, review
+from code_review_graph.tools import analysis_tools, community_tools, query, review
 from code_review_graph.tools import refactor_tools as refactor_mod
 
 try:  # pragma: no cover - exercised only when tiktoken is installed
@@ -189,9 +189,6 @@ HUGE = 10**6
 # Tools whose result lists live in code_review_graph/tools/query.py. That
 # module is owned elsewhere and its unbounded worst cases are reported, not
 # fixed, by this change:
-#   * get_impact_radius  -- changed_nodes and edges ignore max_results
-#     (3.4M tokens on a whole-repo diff), and max_results is not even
-#     exposed on the MCP tool signature.
 #   * find_large_functions -- limit is neither validated nor capped
 #     (737k tokens at limit=10**6).
 #   * traverse_graph -- token_budget is neither validated nor capped
@@ -200,7 +197,6 @@ HUGE = 10**6
 # Their *default* budgets are still asserted below; only the worst case is
 # skipped, so a regression in normal use is still caught here.
 QUERY_OWNED_UNBOUNDED = {
-    "get_impact_radius_tool",
     "find_large_functions_tool",
     "traverse_graph_tool",
     "semantic_search_nodes_tool",
@@ -238,12 +234,20 @@ BUDGETS: dict[str, dict[str, Any]] = {
     },
     "get_impact_radius_tool": {
         "default": {"changed_files": "LEAF"},
-        "worst": {"changed_files": "ALL", "max_depth": 5},
-        # Higher than it should be: changed_nodes and edges ignore
-        # max_results in query.py, so even a single-file default grows with
-        # the graph. Reported, not fixed here.
+        "worst": {
+            "changed_files": "ALL", "max_depth": 5, "max_results": HUGE,
+        },
         "default_max": 12_000,
-        "worst_max": None,  # see QUERY_OWNED_UNBOUNDED
+        # Every list now has a fixed ceiling -- the same 100 nodes / 150
+        # edges / 200 files get_review_context applies to the same radius --
+        # so a caller asking for everything on a whole-repo diff gets a
+        # response whose size is a constant rather than a function of the
+        # repository. Before those ceilings this case was 3.4M tokens on this
+        # fixture, and DEFAULT arguments cost 189k on kubernetes.
+        # Measured here: 43,641 with tiktoken, ~30k under the documented
+        # len/4 fallback; the ceiling is the sibling tool's, which carries
+        # the same lists at the same caps.
+        "worst_max": 50_000,
     },
     "query_graph_tool": {
         "default": {"pattern": "callers_of", "target": "helper_0_0_0"},
@@ -716,6 +720,9 @@ MAX_CEILINGS = {
     "refactor_tools._MAX_REFACTOR_RESULTS": (
         refactor_mod._MAX_REFACTOR_RESULTS, 150,
     ),
+    "query._MAX_IMPACT_NODES_SHOWN": (query._MAX_IMPACT_NODES_SHOWN, 100),
+    "query._MAX_IMPACT_EDGES": (query._MAX_IMPACT_EDGES, 150),
+    "query._MAX_IMPACT_FILES": (query._MAX_IMPACT_FILES, 200),
 }
 
 
@@ -790,6 +797,21 @@ def test_hard_ceilings_bind(repo):
     # Each snippet can overshoot by the "..." separators it inserts, so allow
     # a small margin over the raw line budget.
     assert emitted_lines <= review._MAX_REVIEW_SOURCE_LINES * 1.5
+
+    impact = crg_main.get_impact_radius_tool(
+        repo_root=root, changed_files=all_files, max_depth=5,
+        max_results=HUGE,
+    )
+    assert len(impact["impacted_nodes"]) <= query._MAX_IMPACT_NODES_SHOWN
+    assert len(impact["edges"]) <= query._MAX_IMPACT_EDGES
+    assert len(impact["changed_nodes"]) <= query._MAX_IMPACT_NODES_SHOWN
+    assert len(impact["impacted_files"]) <= query._MAX_IMPACT_FILES
+    # Every cap says what it dropped, so the response is never silently short.
+    assert impact["nodes_omitted"] == (
+        impact["total_impacted"] - len(impact["impacted_nodes"])
+    )
+    assert impact["changed_nodes_omitted"] > 0
+    assert impact["truncated"] is True
 
     dead = crg_main.refactor_tool(
         repo_root=root, mode="dead_code", max_results=HUGE,

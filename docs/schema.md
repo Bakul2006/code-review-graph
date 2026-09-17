@@ -92,7 +92,7 @@ was seen), `line`, `extra` (JSON), `confidence`, `confidence_tier` and, for
 | Kind | Source -> target | Notes |
 |---|---|---|
 | CALLS | caller -> called function | Target may be a bare name until a resolver qualifies it; `target_resolution` records which |
-| IMPORTS_FROM | importing file -> imported module or file | `file_path` equals the source |
+| IMPORTS_FROM | importing file -> imported module, file or package directory | `file_path` equals the source. `extra.import_scope` marks a DIRECTORY target: `package` (a Go import names a directory of files) or `tree` (a Ruby `require_all` names everything below one). The read path expands a directory to its members; see `import_scope_ancestors` in `graph.py` |
 | INHERITS | child class -> parent class | |
 | IMPLEMENTS | implementing class -> interface | |
 | CONTAINS | file -> class or function; class -> method | Structural containment |

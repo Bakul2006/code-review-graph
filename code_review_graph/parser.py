@@ -20,7 +20,6 @@ import subprocess
 import sys
 import threading
 from bisect import bisect_right
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path, PurePath
@@ -32,6 +31,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 from .config_keys import is_spring_config_path, normalize_spring_config_key
+from .constants import (
+    IMPORT_SCOPE_KEY,
+    IMPORT_SCOPE_PACKAGE,
+    IMPORT_SCOPE_TREE,
+)
 from .custom_languages import CustomLanguage, load_custom_languages
 
 try:
@@ -2932,10 +2936,6 @@ class CodeParser:
     """Parses source files using Tree-sitter and extracts structural information."""
 
     _MODULE_CACHE_MAX = 15_000  # Evict cache to cap memory on huge monorepos
-    # A Go import names a package and Ruby's `require_all` names a
-    # directory, so both fan out to the files inside. cli/cli averages 5
-    # files and peaks at 18; the cap is a guard, not a budget.
-    _IMPORT_FAN_OUT_MAX = 64
     # Ruby load-root discovery reads a handful of repository-root scripts.
     _RUBY_MANIFEST_SCAN_MAX = 10
     _RUBY_MANIFEST_MAX_BYTES = 256 * 1024
@@ -2960,9 +2960,13 @@ class CodeParser:
         self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
-        # Go's multi-target sibling of _module_file_cache: one import
-        # names a package directory, so it resolves to several files.
-        self._module_files_cache: dict[str, tuple[str, ...]] = {}
+        # Ignore patterns per repository boundary, so a resolver never names
+        # a path the build will not index; see :meth:`_path_is_indexed`.
+        self._ignore_patterns_cache: dict[str, Optional[list[str]]] = {}
+        # Memoised ignore-pattern verdicts. One verdict costs a resolve() and
+        # a walk of every pattern, and a whole-repository build asks about
+        # the same package directory once per import that names it.
+        self._indexed_path_cache: dict[str, bool] = {}
         # Directory listings for case-exact module lookup; see
         # :meth:`_file_exists_exact`. Shared by every language resolver.
         self._dir_entries_cache: dict[str, frozenset[str]] = {}
@@ -12102,76 +12106,63 @@ class CodeParser:
         """
         specs = self._extract_import_specs(child, language, source, file_path)
         for spec in specs:
-            targets = self._resolve_module_targets(
+            target, scope = self._resolve_import_target(
                 spec.module, file_path, language, spec.form,
             )
-            if not targets:
+            if target is None:
                 # Nothing in this repository: the standard library, a gem, a
-                # dependency that is not vendored. Keep the bare module
-                # string, which is what the edge said before -- never a
-                # guessed path.
-                targets = [spec.module]
-            for target in targets:
-                edges.append(EdgeInfo(
-                    kind="IMPORTS_FROM",
-                    source=file_path,
-                    target=target,
-                    file_path=file_path,
-                    line=spec.line,
-                ))
+                # dependency that is not vendored, or a directory the build
+                # does not index. Keep the bare module string, which is what
+                # the edge said before -- never a guessed path.
+                target, scope = spec.module, None
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path,
+                target=target,
+                file_path=file_path,
+                line=spec.line,
+                extra={IMPORT_SCOPE_KEY: scope} if scope else {},
+            ))
         return bool(specs)
 
-    def _resolve_module_targets(
+    def _resolve_import_target(
         self,
         module: str,
         file_path: str,
         language: str,
         form: Optional[str] = None,
-    ) -> list[str]:
-        """Every file in this repository that one import statement names.
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The single target one import statement names, and its scope.
 
-        One file for every language but Go, where an import names a
-        package -- a directory of files. Without that fan-out,
-        ``importers_of`` on any file of an imported package other than one
-        arbitrarily chosen member would still answer 0, which is the
-        question this resolver exists to answer.
+        Most languages name a file, and the scope is ``None``. Two do not:
+        a Go import names a PACKAGE, which is a directory of files, and
+        Ruby's ``require_all`` names a directory tree. Both resolve to the
+        directory itself with :data:`IMPORT_SCOPE_PACKAGE` or
+        :data:`IMPORT_SCOPE_TREE`, and the read path expands the directory
+        to its member files when a caller asks.
 
-        Memoised under the same ``language:caller_dir:module`` discipline
-        and the same eviction cap as :meth:`_resolve_module_to_file`.
+        Naming the directory rather than fanning out to one edge per file is
+        what keeps the edge count proportional to the number of imports
+        instead of imports times package size, and what makes an incremental
+        update equal a rebuild: the target no longer depends on which files
+        happened to be in the package when the importing file was parsed.
         """
-        caller_dir = Path(file_path).parent
         if language == "go":
-            return self._cached_multi_targets(
-                f"go:{caller_dir}:{module}",
-                lambda: self._resolve_go_package_files(module, file_path),
-            )
+            package_dir = self._resolve_go_package_dir(module, file_path)
+            if package_dir is None:
+                return None, None
+            return normalize_file_path(package_dir), IMPORT_SCOPE_PACKAGE
         if language == "ruby" and form == "require_all":
-            return self._cached_multi_targets(
-                f"ruby:require_all:{caller_dir}:{module}",
-                lambda: self._resolve_ruby_require_all_files(module, file_path),
-            )
+            directory = self._resolve_ruby_require_all_dir(module, file_path)
+            if directory is not None:
+                return normalize_file_path(directory), IMPORT_SCOPE_TREE
+            # ``require_all`` on a plain file argument behaves like
+            # ``require``, which is what the gem itself does.
+            form = "require"
         resolved = self._resolve_module_to_file(
             module, file_path, language, form=form,
         )
-        return [resolved] if resolved else []
-
-    def _cached_multi_targets(
-        self, cache_key: str, compute: Callable[[], list[str]],
-    ) -> list[str]:
-        """Memoise a multi-file resolution, then drop excluded files.
-
-        Same key shape, same eviction cap and the same ``exclude_files``
-        filter as :meth:`_resolve_module_to_file`; only the arity differs.
-        """
-        cached = self._module_files_cache.get(cache_key)
-        if cached is None:
-            cached = tuple(normalize_file_path(path) for path in compute())
-            if len(self._module_files_cache) >= self._MODULE_CACHE_MAX:
-                self._module_files_cache.clear()
-            self._module_files_cache[cache_key] = cached
-        return [
-            target for target in cached if target not in self._excluded_files
-        ]
+        return (resolved, None) if resolved else (None, None)
 
     def _extract_calls(
         self,
@@ -14824,18 +14815,7 @@ class CodeParser:
         below reaches around. Missing *here* also lets resolution fall through
         to the next candidate, exactly as the real absence would.
         """
-        parent = path.parent
-        key = str(parent)
-        entries = self._dir_entries_cache.get(key)
-        if entries is None:
-            try:
-                entries = frozenset(os.listdir(parent))
-            except OSError:
-                entries = frozenset()
-            if len(self._dir_entries_cache) >= self._MODULE_CACHE_MAX:
-                self._dir_entries_cache.clear()
-            self._dir_entries_cache[key] = entries
-        if path.name not in entries:
+        if path.name not in self._dir_entry_names(path.parent):
             return False
         try:
             if not path.is_file():
@@ -14846,6 +14826,79 @@ class CodeParser:
             return False
         return True
 
+    def _dir_entry_names(self, directory: Path) -> frozenset[str]:
+        """The real names in *directory*, cached per directory.
+
+        One listing backs every case-exact probe below, because a package is
+        probed once per import that names it.
+        """
+        key = str(directory)
+        entries = self._dir_entries_cache.get(key)
+        if entries is None:
+            try:
+                entries = frozenset(os.listdir(directory))
+            except OSError:
+                entries = frozenset()
+            if len(self._dir_entries_cache) >= self._MODULE_CACHE_MAX:
+                self._dir_entries_cache.clear()
+            self._dir_entries_cache[key] = entries
+        return entries
+
+    def _path_is_indexed(self, path: Path, boundary: Path) -> bool:
+        """Whether a build would index *path*, so an edge may name it.
+
+        The ignore patterns are the single source of truth for what becomes a
+        node. Resolving an import into ``vendor/`` -- excluded by the default
+        ``**/vendor/**`` -- produced 73,507 kubernetes edges naming files that
+        no node answers to: a confident-looking path that resolves to
+        nothing, which reads worse than the bare module string it replaced.
+        An import that lands on an unindexed path therefore resolves to
+        nothing, and the edge keeps the bare module string.
+
+        ``incremental`` imports this module, so the patterns can only be
+        fetched at call time; the answer is memoised per boundary, and a
+        parser is rebuilt for every build and every update.
+        """
+        key = str(path)
+        cached = self._indexed_path_cache.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._compute_path_is_indexed(path, boundary)
+        if len(self._indexed_path_cache) >= self._MODULE_CACHE_MAX:
+            self._indexed_path_cache.clear()
+        self._indexed_path_cache[key] = verdict
+        return verdict
+
+    def _compute_path_is_indexed(self, path: Path, boundary: Path) -> bool:
+        """The uncached body of :meth:`_path_is_indexed`."""
+        try:
+            relative = path.resolve().relative_to(boundary).as_posix()
+        except (OSError, ValueError, RuntimeError):
+            return True
+        patterns = self._ignore_patterns(boundary)
+        if patterns is None:
+            return True
+        from .incremental import _should_ignore
+
+        return not _should_ignore(relative, patterns)
+
+    def _ignore_patterns(self, boundary: Path) -> Optional[list[str]]:
+        """The ignore patterns in force under *boundary*, or ``None``."""
+        key = str(boundary)
+        if key in self._ignore_patterns_cache:
+            return self._ignore_patterns_cache[key]
+        patterns: Optional[list[str]]
+        try:
+            from .incremental import _load_ignore_patterns
+
+            patterns = _load_ignore_patterns(boundary)
+        except Exception:  # pragma: no cover - defensive
+            patterns = None
+        if len(self._ignore_patterns_cache) >= self._MODULE_CACHE_MAX:
+            self._ignore_patterns_cache.clear()
+        self._ignore_patterns_cache[key] = patterns
+        return patterns
+
     def _dir_exists_exact(self, path: Path) -> bool:
         """Case-exact ``is_dir`` for package lookup in any language.
 
@@ -14853,18 +14906,7 @@ class CodeParser:
         package is a directory, and ``Path.is_dir()`` would confirm a
         spelling that is not on disk.
         """
-        parent = path.parent
-        key = str(parent)
-        entries = self._dir_entries_cache.get(key)
-        if entries is None:
-            try:
-                entries = frozenset(os.listdir(parent))
-            except OSError:
-                entries = frozenset()
-            if len(self._dir_entries_cache) >= self._MODULE_CACHE_MAX:
-                self._dir_entries_cache.clear()
-            self._dir_entries_cache[key] = entries
-        if path.name not in entries:
+        if path.name not in self._dir_entry_names(path.parent):
             return False
         try:
             return path.is_dir()
@@ -15462,7 +15504,6 @@ class CodeParser:
         self._excluded_files = {normalize_file_path(Path(p).resolve()) for p in paths}
         # Drop resolutions cached before the exclusions were applied.
         self._module_file_cache.clear()
-        self._module_files_cache.clear()
         self._python_reexport_cache.clear()
 
     def _resolve_module_to_file(
@@ -15513,12 +15554,10 @@ class CodeParser:
         caller_dir = Path(file_path).parent
 
         if language == "go":
-            # A Go import names a package, which is a directory of files,
-            # not one file. This single-file contract answers with the
-            # package's first file; :meth:`_resolve_module_targets` is the
-            # entry point that emits an edge per file.
-            package_files = self._resolve_go_package_files(module, file_path)
-            return package_files[0] if package_files else None
+            # A Go import names a package -- a directory -- so there is no
+            # single file to answer with. :meth:`_resolve_import_target` is
+            # the entry point, and it resolves to the directory itself.
+            return None
 
         if language == "ruby":
             return self._resolve_ruby_module_file(module, file_path, form)
@@ -15910,72 +15949,97 @@ class CodeParser:
         parts = self._parts_within(record.root, relative, boundary)
         return None if parts is None else self._exact_dir(boundary, parts)
 
-    def _go_package_files(self, package_dir: Path) -> list[str]:
-        """The non-test ``.go`` files of one package directory.
+    def _go_package_holds_source(
+        self, package_dir: Path, boundary: Path,
+    ) -> bool:
+        """Whether *package_dir* holds at least one indexed ``.go`` file.
 
-        ``_test.go`` files are never importable from another package, so
-        they are not import targets; excluding them also holds the fan-out
-        down (cli/cli averages 5 files per in-repo package).
+        A Go import path names a package, and a directory with no indexed Go
+        source is not one that this graph can answer for: ``vendor/`` is
+        excluded by the default ignore patterns, and ``k8s.io/kubernetes``
+        has an ``api/`` directory of OpenAPI specs that no import can mean.
+        Only PRESENCE is tested, never how many files, so adding a file to a
+        package -- the case that made an incremental update disagree with a
+        rebuild -- never changes what an import of it resolves to.
         """
-        try:
-            entries = sorted(os.listdir(package_dir))
-        except OSError:
-            return []
-        files: list[str] = []
-        for name in entries:
-            if not name.endswith(".go") or name.endswith("_test.go"):
-                continue
-            candidate = package_dir / name
-            if self._file_exists_exact(candidate):
-                files.append(str(candidate))
-                if len(files) >= self._IMPORT_FAN_OUT_MAX:
-                    break
-        return files
+        if not self._path_is_indexed(package_dir, boundary):
+            return False
+        return any(
+            name.endswith(".go")
+            and self._path_is_indexed(package_dir / name, boundary)
+            for name in self._dir_entry_names(package_dir)
+        )
 
-    def _resolve_go_package_files(self, module: str, file_path: str) -> list[str]:
-        """Resolve one Go import path to the files of the package it names.
+    def _resolve_go_package_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """Resolve one Go import path to the package DIRECTORY it names.
 
-        Returns ``[]`` for the standard library, and for any dependency that
-        is neither vendored nor ``replace``d into this repository, so the
-        caller keeps the bare import string as the edge target rather than
-        fabricating a path.
+        A directory, not a file: a Go import names a package, and every file
+        in that directory is part of it. Emitting the directory once is what
+        keeps the edge count proportional to the number of import statements
+        rather than to imports times package size; the read path expands the
+        directory to its files. See :meth:`_resolve_import_target`.
+
+        Returns ``None`` for the standard library, for any dependency that is
+        neither vendored nor ``replace``d into this repository, and for any
+        directory the build does not index, so the caller keeps the bare
+        import string rather than naming a path nothing will answer to.
         """
         if not module or module.startswith("."):
-            return []
+            return None
         if "." not in module.split("/", 1)[0]:
             # No dot in the first segment is the standard library, by
             # definition (``fmt``, ``net/http``, ``path/filepath``). Searching
             # the filesystem for these instead would bind 149 of cli/cli's
             # 3575 standard-library imports to same-named repository
             # directories (context 133, embed 11, io 5).
-            return []
+            return None
+        # Memoised on the same cache, with the same key shape and eviction
+        # cap, as :meth:`_resolve_module_to_file`; the ``go-pkg`` prefix keeps
+        # a package directory from colliding with a file resolution.
+        cache_key = f"go-pkg:{Path(file_path).parent}:{module}"
+        if cache_key in self._module_file_cache:
+            cached = self._module_file_cache[cache_key]
+            return Path(cached) if cached else None
+        resolved = self._do_resolve_go_package_dir(module, file_path)
+        if len(self._module_file_cache) >= self._MODULE_CACHE_MAX:
+            self._module_file_cache.clear()
+        self._module_file_cache[cache_key] = str(resolved) if resolved else None
+        return resolved
+
+    def _do_resolve_go_package_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """The uncached body of :meth:`_resolve_go_package_dir`."""
         try:
             caller_dir = Path(file_path).resolve().parent
         except (OSError, RuntimeError, ValueError):
-            return []
+            return None
         boundary = self._import_repo_boundary(file_path)
         if not _path_is_within(caller_dir, boundary):
-            return []
+            return None
         chain = self._go_module_chain(caller_dir, boundary)
+        candidates: list[Path] = []
         for record in chain:
             package_dir = self._go_package_dir(record, module, boundary)
-            if package_dir is None:
-                continue
-            files = self._go_package_files(package_dir)
-            if files:
-                return files
+            if package_dir is not None:
+                candidates.append(package_dir)
         # ``vendor/<import path>`` holds a dependency's own source in-tree.
+        # It is only a target when the build actually indexes it: the default
+        # ignore patterns exclude ``**/vendor/**``, and 73,507 of kubernetes'
+        # import edges used to name files inside it that are not nodes.
         for record in chain:
             parts = self._parts_within(record.root / "vendor", module, boundary)
             if parts is None:
                 continue
             package_dir = self._exact_dir(boundary, parts)
-            if package_dir is None:
-                continue
-            files = self._go_package_files(package_dir)
-            if files:
-                return files
-        return []
+            if package_dir is not None:
+                candidates.append(package_dir)
+        for package_dir in candidates:
+            if self._go_package_holds_source(package_dir, boundary):
+                return package_dir
+        return None
 
     # ------------------------------------------------------------------
     # Ruby: load-path and caller-relative resolution
@@ -16120,40 +16184,45 @@ class CodeParser:
         self._ruby_load_roots_cache[key] = result
         return result
 
-    def _ruby_files_under(self, directory: Path) -> list[str]:
-        """Every ``.rb`` file below *directory*, in a stable order."""
-        files: list[str] = []
+    def _ruby_tree_holds_source(self, directory: Path, boundary: Path) -> bool:
+        """Whether any indexed ``.rb`` file sits below *directory*.
+
+        Like :meth:`_go_package_holds_source`, this tests presence and never
+        counts: what a ``require_all`` resolves to does not change when a
+        file is added to or removed from the tree it names.
+        """
+        if not self._path_is_indexed(directory, boundary):
+            return False
         for current, dirnames, filenames in os.walk(directory):
             dirnames.sort()
             for name in sorted(filenames):
-                if not name.endswith(".rb"):
-                    continue
-                candidate = Path(current) / name
-                if self._file_exists_exact(candidate):
-                    files.append(str(candidate))
-                    if len(files) >= self._IMPORT_FAN_OUT_MAX:
-                        return files
-        return files
+                if name.endswith(".rb") and self._path_is_indexed(
+                    Path(current) / name, boundary,
+                ):
+                    return True
+        return False
 
-    def _resolve_ruby_require_all_files(
+    def _resolve_ruby_require_all_dir(
         self, module: str, file_path: str,
-    ) -> list[str]:
-        """Resolve ``require_all "jekyll/commands"`` to a directory's files.
+    ) -> Optional[Path]:
+        """Resolve ``require_all "jekyll/commands"`` to the DIRECTORY it names.
 
         The ``require_all`` gem loads every ``.rb`` file below the directory
-        it names, so it is a fan-out like a Go package import, not a single
-        file. jekyll declares six subsystems this way (commands, converters,
-        converters/markdown, drops, generators, tags) and every one of them
-        was invisible to the graph. A name that is not a directory falls
-        back to the ordinary ``require`` probe, which is what the gem does
+        it names, so it is a directory-scoped import like a Go package
+        import, not a single file. jekyll declares six subsystems this way
+        (commands, converters, converters/markdown, drops, generators, tags)
+        and every one of them was invisible to the graph.
+
+        ``None`` when the name is not an indexed directory, which sends the
+        caller to the ordinary ``require`` probe -- what the gem itself does
         for a plain file argument.
         """
         if not module:
-            return []
+            return None
         try:
             caller_dir = Path(file_path).resolve().parent
         except (OSError, RuntimeError, ValueError):
-            return []
+            return None
         boundary = self._import_repo_boundary(file_path)
         for root in (caller_dir, *self._ruby_load_roots(boundary)):
             parts = self._parts_within(root, module, boundary)
@@ -16162,13 +16231,9 @@ class CodeParser:
             directory = self._exact_dir(boundary, parts)
             if directory is None:
                 continue
-            files = self._ruby_files_under(directory)
-            if files:
-                return files
-        single = self._resolve_module_to_file(
-            module, file_path, "ruby", form="require",
-        )
-        return [single] if single else []
+            if self._ruby_tree_holds_source(directory, boundary):
+                return directory
+        return None
 
     def _resolve_ruby_module_file(
         self, module: str, file_path: str, form: Optional[str],
@@ -16202,7 +16267,11 @@ class CodeParser:
                 if parts is None:
                     continue
                 found = self._exact_file(boundary, parts)
-                if found is not None:
+                # An unindexed file (``vendor/bundle``, anything a
+                # .code-review-graphignore excludes) is not a target: the
+                # graph has no node for it, so naming it would be a
+                # confident path that resolves to nothing.
+                if found is not None and self._path_is_indexed(found, boundary):
                     return str(found)
         return None
 

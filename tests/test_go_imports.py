@@ -7,9 +7,16 @@ the defect being fixed was a graph full of confident-looking bare strings
 ``importers_of`` and ``get_impact_radius`` answered 0 for packages with
 hundreds of real importers.
 
-A Go import names a *package*, which is a directory of files, not a single
-file, so one in-repo import produces one edge per non-test ``.go`` file in
-that directory.
+A Go import names a *package*, which is a DIRECTORY of files, not a single
+file, so one in-repo import produces exactly one edge, and that edge names
+the package directory. The read path expands a directory to its files when a
+caller asks (``importers_of``, ``get_impact_radius``).
+
+One edge per file in the package was the alternative, and it does not scale:
+on kubernetes it produced 73,507 edges for a single imported package, made an
+incremental update disagree with a rebuild (the edge's target set depended on
+which files were in the package when the importing file happened to be
+parsed), and multiplied every response that lists edges.
 """
 
 from pathlib import Path
@@ -42,6 +49,13 @@ def _want(path: Path) -> str:
     return normalize_file_path(path.resolve())
 
 
+def _scopes(edges) -> list[object]:
+    return [
+        e.extra.get("import_scope")
+        for e in edges if e.kind == "IMPORTS_FROM"
+    ]
+
+
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
     """A small Go module: two importable packages plus a vendored one."""
@@ -66,18 +80,19 @@ def _parse(repo: Path, rel: str, source: str):
 
 
 class TestGoImportForms:
-    def test_single_in_repo_import_names_every_file_in_the_package(self, repo):
-        """`import "<module>/pkg/sub"` -> both non-test files of pkg/sub."""
+    def test_single_in_repo_import_names_the_package_directory(self, repo):
+        """`import "<module>/pkg/sub"` -> one edge naming pkg/sub itself.
+
+        One edge, not one per file in the directory: the package has two
+        importable files and kubernetes' busiest has thirty.
+        """
         edges = _parse(
             repo, "main.go",
             'package main\n\nimport "github.com/org/repo/pkg/sub"\n',
         )
-        assert sorted(_targets(edges)) == sorted([
-            _want(repo / "pkg/sub/extra.go"),
-            _want(repo / "pkg/sub/sub.go"),
-        ])
-        for target in _targets(edges):
-            assert Path(target).is_file(), target
+        assert _targets(edges) == [_want(repo / "pkg/sub")]
+        assert _scopes(edges) == ["package"]
+        assert Path(_targets(edges)[0]).is_dir()
 
     def test_grouped_block_resolves_each_spec_at_its_own_line(self, repo):
         """Every spec in `import ( ... )` keeps its own line, not the block's."""
@@ -93,8 +108,8 @@ class TestGoImportForms:
         edges = _parse(repo, "main.go", source)
         by_target = dict(_target_lines(edges))
         assert by_target["fmt"] == 4
-        assert by_target[_want(repo / "pkg/sub/sub.go")] == 5
-        assert by_target[_want(repo / "internal/util/util.go")] == 6
+        assert by_target[_want(repo / "pkg/sub")] == 5
+        assert by_target[_want(repo / "internal/util")] == 6
 
     def test_named_import_resolves_and_drops_the_alias(self, repo):
         edges = _parse(
@@ -102,8 +117,8 @@ class TestGoImportForms:
             "package main\n\n"
             'import alias "github.com/org/repo/internal/util"\n',
         )
-        assert _targets(edges) == [_want(repo / "internal/util/util.go")]
-        assert Path(_targets(edges)[0]).is_file()
+        assert _targets(edges) == [_want(repo / "internal/util")]
+        assert Path(_targets(edges)[0]).is_dir()
 
     def test_blank_import_resolves_like_a_normal_import(self, repo):
         """`_ "pkg"` is a real side-effect dependency, not a comment."""
@@ -111,23 +126,31 @@ class TestGoImportForms:
             repo, "main.go",
             'package main\n\nimport _ "github.com/org/repo/internal/util"\n',
         )
-        assert _targets(edges) == [_want(repo / "internal/util/util.go")]
+        assert _targets(edges) == [_want(repo / "internal/util")]
 
     def test_dot_import_resolves_like_a_normal_import(self, repo):
         edges = _parse(
             repo, "main.go",
             'package main\n\nimport . "github.com/org/repo/internal/util"\n',
         )
-        assert _targets(edges) == [_want(repo / "internal/util/util.go")]
+        assert _targets(edges) == [_want(repo / "internal/util")]
 
-    def test_vendored_third_party_resolves_under_vendor(self, repo):
+    def test_vendored_third_party_stays_bare_because_vendor_is_not_indexed(
+        self, repo,
+    ):
+        """``**/vendor/**`` is a default ignore, so nothing in it is a node.
+
+        73,507 kubernetes import edges used to name a file under ``vendor/``.
+        None of those files is indexed, so every one of them was a confident
+        path that resolved to nothing -- worse than the bare import string it
+        replaced, because a bare string is visibly external.
+        """
         edges = _parse(
             repo, "main.go",
             'package main\n\nimport "github.com/ext/lib"\n',
         )
-        want = _want(repo / "vendor/github.com/ext/lib/lib.go")
-        assert _targets(edges) == [want]
-        assert Path(want).is_file()
+        assert _targets(edges) == ["github.com/ext/lib"]
+        assert _scopes(edges) == [None]
 
     def test_internal_package_resolves(self, repo):
         """`internal/` is the bulk of the loss: 3493 of cli/cli's 8687 edges."""
@@ -136,7 +159,7 @@ class TestGoImportForms:
             "package sub\n\n"
             'import "github.com/org/repo/internal/util"\n',
         )
-        assert _targets(edges) == [_want(repo / "internal/util/util.go")]
+        assert _targets(edges) == [_want(repo / "internal/util")]
 
     def test_standard_library_stays_a_bare_string(self, repo):
         source = (
@@ -170,7 +193,7 @@ class TestGoModuleAnchoring:
             "package main\n\n"
             'import "github.com/cli/cli/v2/pkg/iostreams"\n',
         )
-        assert _targets(edges) == [_want(tmp_path / "pkg/iostreams/iostreams.go")]
+        assert _targets(edges) == [_want(tmp_path / "pkg/iostreams")]
 
     def test_import_equal_to_the_module_path_names_the_root_package(self, tmp_path):
         _write(tmp_path, "go.mod", "module github.com/spf13/cobra\n\ngo 1.15\n")
@@ -180,10 +203,7 @@ class TestGoModuleAnchoring:
             tmp_path, "doc/md_docs.go",
             'package doc\n\nimport "github.com/spf13/cobra"\n',
         )
-        assert sorted(_targets(edges)) == sorted([
-            _want(tmp_path / "args.go"),
-            _want(tmp_path / "command.go"),
-        ])
+        assert _targets(edges) == [_want(tmp_path)]
 
     def test_nested_go_mod_wins_over_the_ancestor(self, tmp_path):
         """A file under a nested module resolves against that module first."""
@@ -195,7 +215,7 @@ class TestGoModuleAnchoring:
             tmp_path, "tools/main.go",
             'package main\n\nimport "example.com/tools/helper"\n',
         )
-        assert _targets(edges) == [_want(tmp_path / "tools/helper/helper.go")]
+        assert _targets(edges) == [_want(tmp_path / "tools/helper")]
 
     def test_nested_module_still_reaches_the_outer_module(self, tmp_path):
         _write(tmp_path, "go.mod", "module github.com/org/outer\n\ngo 1.22\n")
@@ -205,7 +225,7 @@ class TestGoModuleAnchoring:
             tmp_path, "tools/main.go",
             'package main\n\nimport "github.com/org/outer/pkg/thing"\n',
         )
-        assert _targets(edges) == [_want(tmp_path / "pkg/thing/thing.go")]
+        assert _targets(edges) == [_want(tmp_path / "pkg/thing")]
 
     def test_local_replace_directive_is_honoured(self, tmp_path):
         _write(
@@ -221,7 +241,7 @@ class TestGoModuleAnchoring:
             tmp_path, "main.go",
             'package main\n\nimport "github.com/org/lib"\n',
         )
-        assert _targets(edges) == [_want(tmp_path / "third_party/lib/lib.go")]
+        assert _targets(edges) == [_want(tmp_path / "third_party/lib")]
 
     def test_local_replace_block_form_is_honoured(self, tmp_path):
         _write(
@@ -239,7 +259,7 @@ class TestGoModuleAnchoring:
             tmp_path, "main.go",
             'package main\n\nimport "github.com/org/lib/sub"\n',
         )
-        assert _targets(edges) == [_want(tmp_path / "third_party/lib/sub/sub.go")]
+        assert _targets(edges) == [_want(tmp_path / "third_party/lib/sub")]
 
     def test_no_go_mod_leaves_every_import_bare(self, tmp_path):
         _write(tmp_path, "pkg/sub/sub.go", _pkg("sub"))
@@ -279,13 +299,17 @@ class TestGoNonFabrication:
         )
         assert _targets(edges) == ["github.com/org/repo/pkg/docsonly"]
 
-    def test_test_files_are_never_import_targets(self, repo):
-        """`_test.go` files are not importable by another package."""
+    def test_no_file_is_ever_an_import_target(self, repo):
+        """A Go import names a package, so the edge names a directory.
+
+        Nothing in the edge depends on which files the package contains,
+        which is what makes an incremental update equal a rebuild.
+        """
         edges = _parse(
             repo, "main.go",
             'package main\n\nimport "github.com/org/repo/pkg/sub"\n',
         )
-        assert not any(t.endswith("_test.go") for t in _targets(edges))
+        assert not any(t.endswith(".go") for t in _targets(edges))
 
     def test_target_outside_the_repository_root_is_not_emitted(self, tmp_path):
         """A `replace` pointing above the root must not escape it."""
