@@ -1190,9 +1190,13 @@ def test_hostile_symbol_is_neutralised(hostile_comment: str):
         max(0, raw_tag.start() - 40) : raw_tag.end() + 40
     ]
     assert "\\<img src=x onerror=alert(1)\\>" in hostile_comment, "content is kept"
-    # No markdown link survives either; the URL is left as inert text.
-    assert "[click](https://attacker.invalid)" not in hostile_comment
-    assert "https://attacker.invalid" in hostile_comment, "the text stays readable"
+    # No markdown link survives either: the brackets are backslashed, so the
+    # payload renders as inert text with the URL still legible. Asserting the
+    # whole escaped span pins both halves of that at once, the escaping and
+    # the surviving text. A bare URL substring check would be weaker: it also
+    # passes when the renderer stops escaping brackets, and reads to CodeQL
+    # as URL sanitization (py/incomplete-url-substring-sanitization).
+    assert "\\[click\\](https://attacker.invalid)" in hostile_comment
     links = re.findall(r"(?<!\\)\[[^\]\\]+\]\(([^)]+)\)", hostile_comment)
     assert links == ["https://github.com/tirth8205/code-review-graph"], links
     # Backticks are escaped, so the injected command never becomes code.
