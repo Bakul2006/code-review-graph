@@ -31,7 +31,9 @@ logger = logging.getLogger(__name__)
 def _handle_start(args: argparse.Namespace) -> None:
     """Start the daemon process."""
     from .daemon import (
+        DaemonAlreadyRunningError,
         WatchDaemon,
+        claim_daemon_lock,
         is_daemon_running,
         load_config,
         reap_orphaned_watchers,
@@ -40,6 +42,18 @@ def _handle_start(args: argparse.Namespace) -> None:
 
     if is_daemon_running():
         print("Error: Daemon is already running.")
+        sys.exit(1)
+
+    # ``is_daemon_running`` above is a read, and two starts a millisecond apart
+    # both pass it. The lock is the decision, and it is taken here — before the
+    # fork, before any watcher is spawned — so the loser prints one line and
+    # exits instead of dying inside a detached child nobody is reading. flock
+    # belongs to the open file description, so the daemon this process goes on
+    # to fork inherits the claim and keeps it after these parents exit.
+    try:
+        claim_daemon_lock()
+    except DaemonAlreadyRunningError as exc:
+        print(f"Error: Daemon is already running: {exc}.")
         sys.exit(1)
 
     # A daemon that was killed leaves its watchers running. Starting on top of

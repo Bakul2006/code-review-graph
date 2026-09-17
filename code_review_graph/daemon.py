@@ -399,6 +399,25 @@ def remove_repo_from_config(
 _lock_handles: dict[str, Any] = {}
 
 
+class DaemonAlreadyRunningError(RuntimeError):
+    """A live process already holds the daemon lock, so this one must not run.
+
+    ``is_daemon_running`` is a look, not a claim, and two ``crg-daemon start``
+    invocations a millisecond apart both used to pass it.  The lock is the only
+    thing that can decide between them, so refusing to start is expressed as an
+    exception out of the call that takes it rather than a boolean a caller can
+    ignore.
+    """
+
+    def __init__(self, pid: int | None, lock_path: Path) -> None:
+        self.pid = pid
+        self.lock_path = lock_path
+        holder = f"PID {pid}" if pid is not None else "an unrecorded PID"
+        super().__init__(
+            f"another code-review-graph daemon ({holder}) holds {lock_path}"
+        )
+
+
 def daemon_lock_path(path: Path | None = None) -> Path:
     """Companion lock file for a PID file.
 
@@ -447,6 +466,21 @@ def acquire_daemon_lock(path: Path | None = None) -> bool:
     return True
 
 
+def claim_daemon_lock(path: Path | None = None) -> None:
+    """Take the daemon lock, or refuse and name the process that holds it.
+
+    Call this before doing anything a second daemon must not do — forking,
+    spawning watchers, writing the PID file.  Under ``flock`` the lock belongs
+    to the open file description, so a daemon that forks after claiming keeps
+    holding it once the parents exit.
+
+    On Windows ``acquire_daemon_lock`` is a no-op that reports success, so this
+    never refuses there and two simultaneous starts are still possible.
+    """
+    if not acquire_daemon_lock(path):
+        raise DaemonAlreadyRunningError(read_pid(path), daemon_lock_path(path))
+
+
 def release_daemon_lock(path: Path | None = None) -> None:
     """Drop the daemon lock this process holds, if any."""
     handle = _lock_handles.pop(str(daemon_lock_path(path)), None)
@@ -480,7 +514,17 @@ def daemon_lock_held(path: Path | None = None) -> bool:
 
 
 def _process_command(pid: int) -> str | None:
-    """The command line of *pid*, or None when it cannot be determined."""
+    """The command line of *pid*, or None when it cannot be determined.
+
+    Windows returns None, and ``_looks_like_our_daemon`` reads that as "keep
+    the old behaviour", so none of the PID-identity work below reaches a
+    Windows user: there is no ``flock`` to fall back from either, so a PID
+    file naming any live process is still adopted there. What that costs is
+    written out in :func:`_looks_like_our_daemon`. Closing it needs a real
+    command line, which Windows exposes only through WMI or
+    ``NtQueryInformationProcess`` — neither is a change to make blind, with no
+    Windows machine to test it on.
+    """
     if sys.platform == "win32":  # pragma: no cover - POSIX in CI
         return None
     try:
@@ -501,7 +545,16 @@ def _process_command(pid: int) -> str | None:
 
 
 def _looks_like_our_daemon(pid: int) -> bool:
-    """Fallback identity check for platforms without ``flock``."""
+    """Fallback identity check for platforms without ``flock``.
+
+    On Windows this always returns True, because ``_process_command`` cannot
+    answer there. A Windows user therefore keeps the pre-existing behaviour in
+    full: ``crg-daemon status`` reports a daemon whenever ``daemon.pid`` names
+    a live process, and ``crg-daemon stop`` signals it, even when the PID was
+    recycled and now belongs to something unrelated. For the same reason
+    ``claim_daemon_lock`` cannot exclude a second daemon on Windows — see
+    :func:`acquire_daemon_lock`.
+    """
     command = _process_command(pid)
     if command is None:  # pragma: no cover - cannot tell; keep old behaviour
         return True
@@ -509,10 +562,22 @@ def _looks_like_our_daemon(pid: int) -> bool:
 
 
 def write_pid(pid: int | None = None, path: Path | None = None) -> None:
-    """Write the current (or given) PID to the PID file and claim the lock."""
+    """Claim the daemon lock, then write the current (or given) PID.
+
+    The lock is the exclusion; the PID file is only a label on it.  Discarding
+    the result of :func:`acquire_daemon_lock` here meant the new lock could
+    identify the daemon but never exclude a second one: two ``crg-daemon
+    start`` invocations that both raced past ``is_daemon_running`` each wrote
+    the PID file and each went on running, one of them invisible to every
+    later ``status`` and ``stop``.
+
+    Raises:
+        DaemonAlreadyRunningError: another live process holds the lock. The PID
+            file is left exactly as its owner wrote it.
+    """
     pid_path = path or default_pid_path()
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    acquire_daemon_lock(path)
+    claim_daemon_lock(path)
     pid_path.write_text(str(pid or os.getpid()), encoding="utf-8")
 
 

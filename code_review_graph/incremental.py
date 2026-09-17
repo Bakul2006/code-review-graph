@@ -1908,6 +1908,11 @@ _WATCH_TICK_SECONDS = 1.0
 # walks the parent subtree and, on Linux, can leave a partly built inotify
 # instance behind, so retrying every tick would consume the quota it waits for.
 _PROMOTION_RETRY_SECONDS = 30.0
+# Upper bound on the refused-watch record.  It is pruned of directories that no
+# longer exist on every reconciliation tick, so reaching this cap means a tree
+# that genuinely cannot be watched is larger than anyone will read; keeping the
+# most recent refusals is more useful than keeping the first ones.
+_MAX_UNWATCHED_TRACKED = int(os.environ.get("CRG_MAX_UNWATCHED_TRACKED", "256"))
 
 
 def _watch_child_dirs(
@@ -2112,9 +2117,15 @@ class _WatchSupervisor:
         self._promotion_failed = False
         # Directories the OS refused to watch (inotify ENOSPC, the watch
         # budget in #811).  Losing coverage quietly is the worst thing a
-        # watcher can do, so this set feeds `degraded` and, when it swallows
-        # everything, ends the process.
-        self._unwatched: set[str] = set()
+        # watcher can do, so this record feeds `degraded` and, when it swallows
+        # everything, ends the process.  A dict, not a set, because it is
+        # bounded by age as well as by existence: refusals are only ever
+        # dropped on a successful reschedule or an explicit release, and a
+        # directory that was refused and then deleted — a build tree recreated
+        # on every run — would otherwise be remembered, and published to the
+        # health file, for as long as the daemon lives.  Path -> wall-clock
+        # time of the most recent refusal, newest last.
+        self._unwatched: dict[str, float] = {}
         self._promotion_retry_at: dict[str, float] = {}
         self._last_health_write = 0.0
         self._last_health_state: tuple[bool, bool, tuple[str, ...]] | None = None
@@ -2171,12 +2182,12 @@ class _WatchSupervisor:
             # status` printed "ok" — blind, and claiming otherwise.
             # `_promote_to_recursive` already marked itself degraded on the
             # same failure; this path did not.
-            self._unwatched.add(key)
+            self._note_unwatched(key)
             logger.warning(
                 "Could not watch %s: %s — coverage of that directory is lost", key, exc
             )
             return
-        self._unwatched.discard(key)
+        self._unwatched.pop(key, None)
         self._watches[key] = _WatchEntry(handle, _watch_identity(key))
         if recursive:
             self._shallow.discard(key)
@@ -2201,6 +2212,7 @@ class _WatchSupervisor:
         )
         for path, recursive in plan:
             self._schedule(path, recursive=recursive)
+        self._prune_unwatched()
         if self._watches:
             logger.warning(
                 "Re-established %d watch(es) on %s after a total loss of coverage",
@@ -2265,7 +2277,27 @@ class _WatchSupervisor:
                 )
                 if self._adopt_directory(candidate, required=newly_included):
                     adopted.append(candidate)
+        self._prune_unwatched()
         return adopted, vanished
+
+    def _note_unwatched(self, key: str) -> None:
+        """Record a directory the OS refused, newest last, and bound the record."""
+        self._unwatched.pop(key, None)
+        self._unwatched[key] = time.time()
+        while len(self._unwatched) > _MAX_UNWATCHED_TRACKED:
+            self._unwatched.pop(next(iter(self._unwatched)))
+
+    def _prune_unwatched(self) -> None:
+        """Forget refusals for directories that are no longer there.
+
+        A refused directory never enters ``_watches``, so neither a successful
+        reschedule nor ``_release_directory`` ever reaches it once it is
+        deleted.  Without this the record only grows: ``degraded`` stays true
+        for the daemon's whole lifetime over directories that do not exist,
+        and ``crg-daemon status`` keeps reporting a gap nobody can close.
+        """
+        for path in [p for p in self._unwatched if not os.path.isdir(p)]:
+            self._unwatched.pop(path, None)
 
     def _children_of(self, parent: str) -> list[str]:
         """Watched paths directly underneath *parent*."""
@@ -2369,7 +2401,7 @@ class _WatchSupervisor:
         self._shallow.discard(path)
         self._repaired_roots.discard(path)
         # A directory we deliberately let go is not a coverage gap.
-        self._unwatched.discard(path)
+        self._unwatched.pop(path, None)
         if entry is None:
             return
         # unschedule() joins the emitter thread with no timeout, and a wedged

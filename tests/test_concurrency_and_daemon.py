@@ -261,6 +261,18 @@ def _metadata(db: Path, key: str) -> str | None:
         conn.close()
 
 
+def _set_metadata(db: Path, key: str, value: str) -> None:
+    """Put the graph into a chosen state, the way a crashed run would leave it."""
+    conn = _open_readonly(db)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _wait_for(predicate, timeout: float = _SETTLE, interval: float = 0.25) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1744,3 +1756,368 @@ class TestWatcherUnderStress:
         assert str(new_dir) not in supervisor.watched_paths
         assert supervisor.degraded is True
         assert str(new_dir) in supervisor.unwatched_paths
+
+
+# ---------------------------------------------------------------------------
+# 5. Telling a lock timeout apart from a genuine failure
+# ---------------------------------------------------------------------------
+
+
+# Poison one post-processing stage with a chosen sqlite3.OperationalError and
+# report the whole build result as JSON. An error constructed in Python carries
+# no ``sqlite_errorcode`` (the sqlite3 module sets that only on errors it
+# raises itself, and only from 3.11), so this drives the message fallback that
+# Python 3.10 relies on for every classification.
+_POISONED_BUILD = """
+import json, sqlite3, sys
+from code_review_graph.graph import GraphStore
+from code_review_graph.tools.build import build_or_update_graph
+
+repo, message = sys.argv[1], sys.argv[2]
+
+
+def boom(self, *args, **kwargs):
+    raise sqlite3.OperationalError(message)
+
+
+GraphStore.update_node_signatures = boom
+print("RESULT " + json.dumps(build_or_update_graph(
+    full_rebuild=True, repo_root=repo, postprocess="full",
+)))
+"""
+
+# The same poison, but through the hand-repair entry point.
+_POISONED_POSTPROCESS = """
+import json, sqlite3, sys
+from code_review_graph.graph import GraphStore
+from code_review_graph.tools.build import run_postprocess
+
+repo, message = sys.argv[1], sys.argv[2]
+
+
+def boom(self, *args, **kwargs):
+    raise sqlite3.OperationalError(message)
+
+
+GraphStore.resolve_bare_call_targets = boom
+print("RESULT " + json.dumps(run_postprocess(repo_root=repo)))
+"""
+
+
+def _run_poisoned(script: str, repo: Path, message: str, env: dict[str, str]) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(repo), message],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=_PROC_TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    line = next(
+        (ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None
+    )
+    assert line is not None, proc.stdout[-2000:]
+    return json.loads(line[len("RESULT "):])
+
+
+class TestErrorClassification:
+    """A lock timeout is transient; every other SQLite error is not."""
+
+    def test_only_a_lock_timeout_counts_as_contention(self, tmp_path: Path) -> None:
+        """``is_lock_contention`` separates SQLITE_BUSY from a real failure.
+
+        The two are indistinguishable by type — both arrive as
+        ``sqlite3.OperationalError`` — and treating the whole class as
+        contention is what pinned a graph as incomplete forever: the
+        build-state marker is deliberately left set for contention so the next
+        run redoes the lost stage, and an error that will recur every run can
+        never clear it.
+
+        Both errors here are raised by SQLite itself, so on Python 3.11+ this
+        exercises ``sqlite_errorcode``; the message fallback that 3.10 needs is
+        covered by the poisoned builds below.
+        """
+        from code_review_graph.tools.build import is_lock_contention
+
+        db = tmp_path / "probe.db"
+        holder = sqlite3.connect(str(db), timeout=0.1, isolation_level=None)
+        victim = sqlite3.connect(str(db), timeout=0.1, isolation_level=None)
+        try:
+            holder.execute("CREATE TABLE t (x)")
+            holder.execute("BEGIN EXCLUSIVE")
+            with pytest.raises(sqlite3.OperationalError) as busy:
+                victim.execute("INSERT INTO t VALUES (1)")
+            holder.rollback()
+            with pytest.raises(sqlite3.OperationalError) as malformed:
+                victim.execute("SELECT * FROM no_such_table")
+        finally:
+            holder.close()
+            victim.close()
+
+        # Canary: SQLite really produced two different failures, not one.
+        assert "locked" in str(busy.value)
+        assert "no such table" in str(malformed.value)
+
+        assert is_lock_contention(busy.value) is True
+        assert is_lock_contention(malformed.value) is False
+        # A disk problem and a read-only file are failures, not contention.
+        assert is_lock_contention(sqlite3.OperationalError("disk I/O error")) is False
+        assert is_lock_contention(
+            sqlite3.OperationalError("attempt to write a readonly database")
+        ) is False
+        assert is_lock_contention(ImportError("leidenalg")) is False
+
+    def test_a_genuine_postprocess_error_does_not_pin_the_graph_incomplete(
+        self, tmp_path: Path
+    ) -> None:
+        """A malformed statement clears the marker; a lock timeout keeps it.
+
+        ``build_state`` is written before the first node and cleared after the
+        last post-processing stage, and contention deliberately leaves it set:
+        the next run then redoes the stage it lost. Classifying *every*
+        ``sqlite3.OperationalError`` as contention turned that recovery into a
+        trap — a malformed statement or a failing disk kept the marker set on
+        every run, so the graph was marked incomplete forever and every later
+        update was promoted to a full rebuild that could not clear it.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 6)
+        env = _isolated_env(home)
+        db = _db_path(repo)
+
+        failed = _run_poisoned(_POISONED_BUILD, repo, "no such column: bogus", env)
+        assert any("Signature computation failed" in w for w in failed["warnings"])
+        assert _metadata(db, "build_state") == "complete", (
+            "a permanent SQLite error left the graph marked half built"
+        )
+        # And it is not passed off as a clean build.
+        assert failed["status"] == "partial"
+        assert failed.get("postprocess_contended") is not True
+
+        # The contrast, on the same code path: real contention still holds the
+        # marker, which is the behaviour this must not have broken.
+        contended = _run_poisoned(_POISONED_BUILD, repo, "database is locked", env)
+        assert contended["postprocess_contended"] is True
+        assert _metadata(db, "build_state") == "in-progress"
+
+    def test_hand_repair_clears_the_marker_despite_a_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """``postprocess`` is the hand repair, so a warning must not block it.
+
+        Clearing the marker only on an empty warning list meant the command
+        people reach for to repair a half-built graph could not repair it in
+        exactly the cases that produce warnings — a missing optional extra, a
+        stage that failed for its own reasons. Only genuine contention holds
+        the marker now, because only contention is worth redoing.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 6)
+        env = _isolated_env(home)
+        db = _db_path(repo)
+        assert _crg("build", "--repo", str(repo), env=env).returncode == 0
+        _set_metadata(db, "build_state", "in-progress")
+        assert _metadata(db, "build_state") == "in-progress"  # canary
+
+        result = _run_poisoned(
+            _POISONED_POSTPROCESS, repo, "no such column: bogus", env
+        )
+        assert any("Call-target resolution failed" in w for w in result["warnings"])
+        assert _metadata(db, "build_state") == "complete", (
+            "a hand repair could not clear the marker it exists to clear"
+        )
+
+        # Contention is still the one reason to leave the repair unfinished.
+        _set_metadata(db, "build_state", "in-progress")
+        contended = _run_poisoned(
+            _POISONED_POSTPROCESS, repo, "database is locked", env
+        )
+        assert contended["warnings"]
+        assert _metadata(db, "build_state") == "in-progress"
+
+
+# ---------------------------------------------------------------------------
+# 6. Two daemons starting at once
+# ---------------------------------------------------------------------------
+
+
+# Holds the daemon lock without writing a PID file: exactly the window a second
+# ``crg-daemon start`` used to slip through, between one daemon forking and
+# that daemon labelling its lock.
+_LOCK_SQUATTER = """
+import sys, time
+from code_review_graph.daemon import acquire_daemon_lock
+assert acquire_daemon_lock(), "squatter could not take the lock"
+print("HELD", flush=True)
+time.sleep(float(sys.argv[1]))
+"""
+
+# Takes the lock the way the daemon does, PID file and all.
+_PID_HOLDER = """
+import sys, time
+from pathlib import Path
+from code_review_graph.daemon import write_pid
+write_pid(path=Path(sys.argv[1]))
+print("HELD", flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
+class _HeldLock:
+    """Context manager owning a process that holds the daemon lock."""
+
+    def __init__(self, script: str, *args: str, env: dict[str, str]) -> None:
+        self._cmd = [sys.executable, "-c", script, *args]
+        self._env = env
+        self.proc: subprocess.Popen[str] | None = None
+
+    def __enter__(self) -> "_HeldLock":
+        self.proc = subprocess.Popen(
+            self._cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._env,
+        )
+        assert self.proc.stdout is not None
+        line = self.proc.stdout.readline().strip()
+        assert line == "HELD", f"holder never took the daemon lock: {line!r}"
+        return self
+
+    @property
+    def pid(self) -> int:
+        assert self.proc is not None
+        return self.proc.pid
+
+    def __exit__(self, *_exc) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+        if self.proc is not None:
+            self.proc.wait(timeout=30)
+
+
+class TestDaemonExclusion:
+    """The daemon lock has to exclude a second daemon, not just label one."""
+
+    def test_write_pid_refuses_when_another_process_holds_the_lock(
+        self, tmp_path: Path, daemon_env
+    ) -> None:
+        """A second claim is refused, and says whose it is.
+
+        ``write_pid`` took the lock and discarded the answer, so the lock
+        identified the daemon but excluded nothing: the second caller
+        overwrote the PID file and carried on, leaving one of the two daemons
+        invisible to every later ``status`` and ``stop``.
+        """
+        env, _spawned = daemon_env
+        pid_path = Path(env["CRG_HOME"]) / "daemon.pid"
+
+        with _HeldLock(_PID_HOLDER, str(pid_path), "120", env=env) as holder:
+            assert pid_path.read_text(encoding="utf-8").strip() == str(holder.pid)
+
+            with pytest.raises(daemon_mod.DaemonAlreadyRunningError) as refused:
+                daemon_mod.write_pid(path=pid_path)
+
+            # It names the holder, so the message is actionable.
+            assert str(holder.pid) in str(refused.value)
+            assert str(daemon_mod.daemon_lock_path(pid_path)) in str(refused.value)
+            assert refused.value.pid == holder.pid
+            # And the refusal left the holder's label untouched.
+            assert pid_path.read_text(encoding="utf-8").strip() == str(holder.pid)
+
+    def test_second_start_is_refused_while_the_lock_is_held(
+        self, tmp_path: Path, daemon_env
+    ) -> None:
+        """Two ``crg-daemon start`` calls at once: one daemon, not two.
+
+        ``is_daemon_running`` is a read of the PID file, and a daemon that has
+        forked but not yet written that file is invisible to it — the same
+        window two simultaneous starts race through. The lock is what decides,
+        so the start that loses it stops, names the winner, and exits non-zero
+        instead of forking a second daemon onto the same repositories.
+        """
+        env, spawned = daemon_env
+
+        with _HeldLock(_LOCK_SQUATTER, "120", env=env):
+            pid_file = Path(env["CRG_HOME"]) / "daemon.pid"
+            # Canary: the PID file really is absent, so `is_daemon_running`
+            # cannot be what refuses this start.
+            assert not pid_file.exists()
+
+            started = _daemon_cli("start", env=env)
+            output = started.stdout + started.stderr
+            if started.returncode == 0 and _daemon_pid(env) is not None:
+                spawned.append(_daemon_pid(env))  # pragma: no cover - failure path
+
+            assert started.returncode != 0, output
+            assert "already running" in output.lower(), output
+            assert not pid_file.exists(), "a refused start still labelled the lock"
+
+
+# ---------------------------------------------------------------------------
+# 7. The refused-watch record stays bounded
+# ---------------------------------------------------------------------------
+
+
+class TestUnwatchedRecord:
+    """What the supervisor remembers about directories it could not watch."""
+
+    def test_refusals_for_vanished_directories_are_forgotten(
+        self, tmp_path: Path
+    ) -> None:
+        """Churned build directories must not accumulate for the daemon's life.
+
+        A refused directory never enters ``_watches``, so neither a successful
+        reschedule nor ``_release_directory`` ever reaches it. A tree that is
+        created and deleted on every build therefore left one entry per run:
+        ``degraded`` stayed true forever over directories that no longer
+        exist, and every health file published the growing list.
+        """
+        repo = _make_repo(tmp_path / "repo", 6)
+        observer = _WorkingObserver()
+        supervisor = _WatchSupervisor(observer, repo, [], max_schedules=512)
+        supervisor.schedule_initial(handler=object())
+        assert supervisor.watched_paths, "nothing was watched to begin with"
+        assert supervisor.degraded is False  # canary: a clean start
+
+        churned = [repo / "src" / f"build{i}" for i in range(40)]
+        supervisor._observer = _ExhaustedObserver()
+        for directory in churned:
+            directory.mkdir()
+            supervisor._adopt_directory(str(directory))
+        # Canary: every refusal really was recorded, which is the behaviour
+        # that must survive.
+        assert {str(d) for d in churned} <= set(supervisor.unwatched_paths)
+        assert supervisor.degraded is True
+
+        for directory in churned:
+            directory.rmdir()
+        supervisor._observer = observer
+        supervisor.sync_watches()
+
+        assert [p for p in supervisor.unwatched_paths if p.startswith(
+            str(repo / "src" / "build")
+        )] == [], supervisor.unwatched_paths
+        assert supervisor.degraded is False
+
+    def test_the_record_is_capped_even_if_nothing_is_ever_pruned(
+        self, tmp_path: Path
+    ) -> None:
+        """A cap bounds the record between reconciliations.
+
+        Pruning runs once a tick; the cap is what keeps a burst inside one tick
+        from growing the health payload without limit. The newest refusals are
+        the ones kept, because they are the ones that still describe the tree.
+        """
+        from code_review_graph.incremental import _MAX_UNWATCHED_TRACKED
+
+        repo = _make_repo(tmp_path / "repo", 6)
+        supervisor = _WatchSupervisor(_WorkingObserver(), repo, [], max_schedules=8)
+        total = _MAX_UNWATCHED_TRACKED + 25
+        for i in range(total):
+            supervisor._note_unwatched(str(repo / "src" / f"gone{i:05d}"))
+
+        assert len(supervisor.unwatched_paths) == _MAX_UNWATCHED_TRACKED
+        assert str(repo / "src" / f"gone{total - 1:05d}") in supervisor.unwatched_paths
+        assert str(repo / "src" / "gone00000") not in supervisor.unwatched_paths

@@ -70,16 +70,59 @@ def _run_embedding_refresh(
         )
 
 
+# SQLITE_BUSY and SQLITE_LOCKED are the only two primary result codes that
+# mean "somebody else holds it, come back later".  Extended result codes carry
+# their detail in the high bits, so the low byte is what identifies the family.
+_CONTENTION_ERRORCODES = frozenset({5, 6})
+
+# ``sqlite_errorcode`` arrived in Python 3.11 and is only set on exceptions the
+# sqlite3 module itself raises, so the message is the fallback for 3.10 and for
+# any error re-raised by our own code.
+_CONTENTION_MESSAGES = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+)
+
+
+def is_lock_contention(exc: BaseException) -> bool:
+    """True only for SQLite refusing a write because another process holds it.
+
+    Every other ``sqlite3.OperationalError`` — a malformed statement, a disk
+    I/O error, a read-only database file — is a genuine failure that the next
+    run will hit again in exactly the same way.  The distinction is not
+    cosmetic: contention deliberately leaves the ``build_state`` marker set so
+    the next run redoes the lost stage, so classifying a permanent error as
+    contention marks the graph incomplete forever and promotes every later
+    update to a full rebuild that cannot clear it.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    errorcode = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(errorcode, int):
+        return (errorcode & 0xFF) in _CONTENTION_ERRORCODES
+    message = str(exc).lower()
+    return any(text in message for text in _CONTENTION_MESSAGES)
+
+
 def _note_contention(build_result: dict[str, Any], exc: BaseException) -> None:
-    """Flag a post-processing stage that was lost to write-lock contention.
+    """Classify a post-processing stage that failed.
 
     Contention is transient: another process held the SQLite write lock, and
-    the next run can redo the stage.  A missing optional dependency is not,
-    which is why only ``sqlite3.OperationalError`` sets the flag — otherwise
-    one absent extra would pin the repository into permanent full rebuilds.
+    the next run can redo the stage, so the build-state marker stays set.  A
+    genuine SQLite error is recorded separately — it downgrades the build to
+    ``partial`` instead of being retried forever.  Anything else (a missing
+    optional dependency, say) is left to the warning list alone: one absent
+    extra must not pin the repository into permanent full rebuilds.
     """
-    if isinstance(exc, sqlite3.OperationalError):
+    if not isinstance(exc, sqlite3.OperationalError):
+        return
+    if is_lock_contention(exc):
         build_result["postprocess_contended"] = True
+    else:
+        build_result["postprocess_failed"] = True
+
+
 def _fts_file_hint(
     repo_root: str | None,
     changed_files: list[str] | None,
@@ -138,6 +181,7 @@ def _run_postprocess(
             store.refresh_target_resolution()
         except sqlite3.OperationalError as e:
             logger.warning("Target-resolution refresh failed: %s", e)
+            _note_contention(build_result, e)
             warnings.append(
                 f"Target-resolution refresh failed: {type(e).__name__}: {e}"
             )
@@ -703,6 +747,10 @@ def build_or_update_graph(
         )
         if warnings:
             build_result["warnings"] = warnings
+        # A genuine SQLite failure is not something the next run repairs, so it
+        # is reported now rather than hidden behind an "ok" status.
+        if build_result.get("postprocess_failed"):
+            build_result["status"] = "partial"
         # Last thing written, after post-processing: only now is the graph
         # genuinely what its freshness metadata claims.  A stage that lost the
         # write lock keeps the marker set so the next run redoes it, rather
@@ -759,6 +807,7 @@ def run_postprocess(
             store.refresh_target_resolution()
         except sqlite3.OperationalError as e:
             logger.warning("Call-target resolution failed: %s", e)
+            _note_contention(result, e)
             warnings.append(
                 f"Call-target resolution failed: {type(e).__name__}: {e}"
             )
@@ -789,6 +838,7 @@ def run_postprocess(
             result["signatures_updated"] = True
         except (sqlite3.OperationalError, TypeError, KeyError) as e:
             logger.warning("Signature computation failed: %s", e)
+            _note_contention(result, e)
             warnings.append(f"Signature computation failed: {type(e).__name__}: {e}")
 
         if fts:
@@ -800,6 +850,7 @@ def run_postprocess(
             except (sqlite3.OperationalError, ImportError) as e:
                 store.rollback()
                 logger.warning("FTS index rebuild failed: %s", e)
+                _note_contention(result, e)
                 warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")
 
         if flows:
@@ -813,6 +864,7 @@ def run_postprocess(
             except (sqlite3.OperationalError, ImportError) as e:
                 store.rollback()
                 logger.warning("Flow detection failed: %s", e)
+                _note_contention(result, e)
                 warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
 
         if communities:
@@ -830,6 +882,7 @@ def run_postprocess(
             except (sqlite3.OperationalError, ImportError) as e:
                 store.rollback()
                 logger.warning("Community detection failed: %s", e)
+                _note_contention(result, e)
                 warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
 
         _run_embedding_refresh(
@@ -845,8 +898,12 @@ def run_postprocess(
             time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         # An explicit postprocess run is how a half-built graph is repaired by
-        # hand, so it clears the interrupted-build marker too.
-        if not warnings:
+        # hand, so it clears the interrupted-build marker.  Only real write-lock
+        # contention holds it back: that stage has to be redone by a later run.
+        # Requiring an empty warning list instead meant a repair could never
+        # clear the marker for the failures that make people reach for it in
+        # the first place, such as an optional dependency that is not installed.
+        if not result.get("postprocess_contended"):
             store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
         result["summary"] = "Post-processing complete."
         if warnings:
