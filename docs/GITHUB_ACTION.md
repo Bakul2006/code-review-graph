@@ -67,7 +67,7 @@ To turn the review into a merge gate:
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `github-token` | yes | none | Token used to post the sticky PR comment via the GitHub API. The workflow's default `GITHUB_TOKEN` works when the job has `pull-requests: write`. |
+| `github-token` | yes | none | Token used to post the sticky PR comment via the GitHub API. The workflow's default `GITHUB_TOKEN` works when the job has `pull-requests: write`. A personal access token or a GitHub App installation token also works; see [Which comment gets updated](#which-comment-gets-updated). |
 | `comment` | no | `true` | Post (and keep updated) the sticky PR comment. Set to `false` to run analysis and gating without commenting. |
 | `fail-on-risk` | no | `none` | Fail the job when the overall risk score reaches a level: `none` (never fail), `high` (risk >= 0.70), `critical` (risk >= 0.85). |
 | `python-version` | no | `3.12` | Python version used to run code-review-graph (3.10 or newer). |
@@ -180,6 +180,28 @@ database) with `actions/cache`:
   own sticky marker before posting. Avoid `pull_request_target` with a checkout
   of PR code because it can execute untrusted code with a privileged token
   ([details](https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/)).
+
+## Which comment gets updated
+
+The Action keeps one comment per pull request and rewrites it on every push.
+It finds that comment by the hidden marker `<!-- code-review-graph-report -->`
+plus the comment's author, because the marker is published here and anyone can
+paste it into a comment of their own.
+
+How the author is established depends on the token:
+
+- A personal access token answers `GET /user`, so the Action matches its own
+  login exactly.
+- An installation token (the workflow's default `GITHUB_TOKEN`, or a GitHub
+  App's) cannot call `GET /user`, and its comments are authored by a bot
+  account whose login the Action cannot learn: `github-actions[bot]` for the
+  default token, `<app-slug>[bot]` for an App. There the Action matches a
+  marker comment written by a bot. Pull request participants are never bots,
+  so a pasted marker is still not adopted.
+
+If several bots post marker comments on the same pull request under
+installation tokens, give the Action a personal access token so its identity
+is exact.
 
 ## Dogfooding
 

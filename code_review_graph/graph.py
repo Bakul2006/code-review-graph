@@ -249,21 +249,26 @@ class GraphStats:
 
 
 class CorruptGraphDatabaseError(sqlite3.DatabaseError):
-    """The graph database file exists but SQLite cannot read it.
+    """The graph database file exists but cannot be opened as this graph.
 
     Raised instead of a bare ``sqlite3.DatabaseError`` so a caller that is
     about to rebuild the graph from scratch anyway (``build``) can discard
     the unusable file and carry on, and every other caller can report one
     actionable line instead of a traceback. A restored CI cache is the
-    common source: a truncated or half-written ``graph.db`` turns every
-    later run red until someone clears the cache by hand.
+    common source: an unusable ``graph.db`` turns every later run red until
+    someone clears the cache by hand.
+
+    Two shapes of unusable reach here, and both are unrecoverable in place:
+    a file SQLite cannot read at all (truncated, half-written, not a
+    database), and a perfectly valid SQLite file whose tables are the wrong
+    shape, which ``CREATE TABLE IF NOT EXISTS`` will not repair.
     """
 
     def __init__(self, db_path: str | Path, reason: object) -> None:
         self.db_path = Path(db_path)
         self.reason = str(reason)
         super().__init__(
-            f"{self.db_path} is not a readable SQLite database: {self.reason}"
+            f"{self.db_path} cannot be opened as a graph database: {self.reason}"
         )
 
 
@@ -274,6 +279,26 @@ _CORRUPTION_MESSAGES = (
     "database disk image is malformed",
     "file is encrypted",
     "malformed database schema",
+)
+
+#: SQLite's wording when a statement names a table or column that is not
+#: shaped the way this schema expects. A file can be perfectly readable and
+#: still answer this way: ``_init_schema`` uses ``CREATE TABLE IF NOT
+#: EXISTS``, so a ``nodes`` table left behind by something else is never
+#: replaced, and the first index or migration that mentions a column it does
+#: not have fails.
+#:
+#: Deliberately narrow, because everything listed here ends in the file being
+#: deleted. "database is locked", "attempt to write a readonly database" and
+#: "disk I/O error" are environment problems and must never cost anyone their
+#: database. "already exists" and "duplicate column name" are excluded for the
+#: same reason: every migration guards its DDL with a check first, so those
+#: two mean two processes migrated the same healthy database at once, not that
+#: the database is wrong.
+_INCOMPATIBLE_SCHEMA_MESSAGES = (
+    "no such column",
+    "no such table",
+    "has no column named",
 )
 
 
@@ -296,8 +321,35 @@ def _is_unreadable_database(db_path: Path, exc: sqlite3.DatabaseError) -> bool:
     return bool(header) and not header.startswith(_SQLITE_HEADER)
 
 
+def _has_incompatible_schema(db_path: Path, exc: sqlite3.DatabaseError) -> bool:
+    """True when *db_path* is readable SQLite holding the wrong tables.
+
+    Both halves are required. The message has to name a schema object, which
+    rules out locks, read-only filesystems and I/O errors; and the file has
+    to still answer a read of ``sqlite_master``, which rules out reporting a
+    genuinely broken file as merely mis-shaped.
+    """
+    message = str(exc).lower()
+    if not any(known in message for known in _INCOMPATIBLE_SCHEMA_MESSAGES):
+        return False
+    if not db_path.is_file():
+        # Never let the probe below be the thing that creates the file.
+        return False
+    try:
+        probe = sqlite3.connect(str(db_path), timeout=5)
+    except sqlite3.DatabaseError:
+        return False
+    try:
+        probe.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
 def discard_corrupt_database(db_path: str | Path) -> bool:
-    """Delete an unreadable graph database and its WAL sidecars.
+    """Delete an unusable graph database and its WAL sidecars.
 
     Returns True when at least one file was removed. Only ever call this
     where the graph is about to be rebuilt from scratch: the data is gone.
@@ -347,7 +399,10 @@ class GraphStore:
             except sqlite3.Error:  # pragma: no cover - close on a dead handle
                 logger.debug("Could not close %s after a failed open",
                              self.db_path)
-            if _is_unreadable_database(self.db_path, exc):
+            if (
+                _is_unreadable_database(self.db_path, exc)
+                or _has_incompatible_schema(self.db_path, exc)
+            ):
                 raise CorruptGraphDatabaseError(self.db_path, exc) from exc
             raise
         self._nxg_cache: nx.DiGraph | None = None

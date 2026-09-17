@@ -132,6 +132,13 @@ HOSTILE_NAMES: dict[str, str] = {
     # value normalisation collapses one onto the other.
     "newline_twin": "collide\nme",
     "space_twin": "collide me",
+    # U+007F (DEL) is an ordinary character in XML 1.0 -- the Char production
+    # admits all of [#x20-#xD7FF] -- and _sanitize_name keeps it, so it is
+    # part of a node's identity. These two differ only by it: an exporter
+    # that strips it turns them into one node, which is the newline collision
+    # above in a smaller form.
+    "del_twin": "del\x7ftwin",
+    "del_shadow": "deltwin",
 }
 
 # A file path containing ": ", which is legal on POSIX and breaks unquoted
@@ -635,6 +642,47 @@ def test_graphml_newline_and_space_twins_stay_two_nodes(corpus: Corpus):
     # value, which is what makes it survive the round trip.
     assert f'id="{newline_twin}"' not in text
     _record("graphml", "twins_kept_apart", 2)
+
+
+def test_graphml_keeps_del_bearing_names_distinct(corpus: Corpus):
+    """U+007F is a legal XML 1.0 character and part of a node's identity.
+
+    XML 1.0's Char production admits the whole of [#x20-#xD7FF], so DEL
+    needs no escaping and no removal, and ``_sanitize_name`` leaves it in a
+    node name. Dropping it on the way out rewrites the identity the export
+    carries: 'del\\x7ftwin' and 'deltwin' come back as one name.
+    """
+    text = _graphml_text(corpus)
+    qns = _graphml_qualified_names(text)
+    twin = corpus.qn("del_twin")
+    shadow = corpus.qn("del_shadow")
+    assert "\x7f" in twin, "the fixture no longer plants a DEL"
+    assert twin.replace("\x7f", "") == shadow, "twins drifted apart"
+    assert qns.count(twin) == 1, f"DEL was stripped from the identity: {twin!r}"
+    assert qns.count(shadow) == 1, qns.count(shadow)
+    assert len(qns) == len(set(qns)), "two names collapsed onto one node"
+    _record("graphml", "del_twins_kept_apart", 2)
+
+
+def test_graphml_del_survives_a_real_graphml_reader(corpus: Corpus, tmp_path):
+    """Teeth for the check above: a reader, not just the raw text.
+
+    Writing the DEL out is only half of it -- an XML parser has to hand it
+    back. It does: unlike a carriage return, DEL is not touched by
+    line-end normalisation, and unlike a newline in an attribute value it is
+    not whitespace-normalised in element content.
+    """
+    import networkx as nx
+
+    fixed = tmp_path / "ns-fixed-del.graphml"
+    fixed.write_text(
+        _with_official_namespace(_graphml_text(corpus)), encoding="utf-8"
+    )
+    graph = nx.read_graphml(str(fixed))
+    qns = {d.get("qualified_name") for _, d in graph.nodes(data=True)}
+    assert corpus.qn("del_twin") in qns
+    assert corpus.qn("del_shadow") in qns
+    _record("graphml", "del_round_tripped", 2)
 
 
 def test_graphml_escapes_hostile_names(corpus: Corpus):

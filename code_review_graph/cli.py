@@ -692,14 +692,16 @@ def _warn_failed_files(result: dict) -> None:
 
 
 def _open_graph_store(db_path: Path, command: str):
-    """Open the graph store, recovering from an unreadable database file.
+    """Open the graph store, recovering from an unusable database file.
 
-    A restored CI cache can hold a truncated or half-written ``graph.db``.
-    SQLite then refuses to open it and the command dies with a traceback,
-    which is why ``action.yml``'s ``update || build`` fallback could not
-    recover: the full build failed for exactly the same reason. ``build``
-    rewrites the graph from scratch, so there the bad file is discarded and
-    the build proceeds; every other command reports one actionable line.
+    A restored CI cache can hold a truncated or half-written ``graph.db``,
+    and it can just as easily hold a valid SQLite file whose tables are the
+    wrong shape. SQLite refuses either one and the command dies with a
+    traceback, which is why ``action.yml``'s ``update || build`` fallback
+    could not recover: the full build failed for exactly the same reason.
+    ``build`` rewrites the graph from scratch, so there the bad file is
+    discarded and the build proceeds; every other command reports one
+    actionable line.
     """
     from .graph import CorruptGraphDatabaseError, GraphStore, discard_corrupt_database
 
@@ -708,14 +710,14 @@ def _open_graph_store(db_path: Path, command: str):
     except CorruptGraphDatabaseError as exc:
         if command != "build":
             print(
-                f"The graph database at {db_path} is unreadable "
+                f"The graph database at {db_path} is unusable "
                 f"({exc.reason}). Run `code-review-graph build` to rebuild "
                 "it from scratch.",
                 file=sys.stderr,
             )
             raise SystemExit(1) from None
         logging.warning(
-            "Graph database at %s is unreadable (%s); discarding it and "
+            "Graph database at %s is unusable (%s); discarding it and "
             "building from scratch.",
             db_path, exc.reason,
         )

@@ -71,7 +71,16 @@ GRAPHML_NS = "http://graphml.graphdrawing.org/xmlns"
 GRAPHML_SCHEMA = "http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd"
 
 #: Characters XML 1.0 forbids outright — not even as a character reference.
-_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+#:
+#: This is exactly the complement of the XML 1.0 ``Char`` production below
+#: U+0020: everything from U+0000 to U+001F except tab, newline and carriage
+#: return. U+007F (DEL) is deliberately *not* here. ``Char`` admits the whole
+#: of ``[#x20-#xD7FF]``, so DEL is a legal XML 1.0 character, and
+#: ``_sanitize_name`` keeps it in a node name. Dropping it would rewrite the
+#: identity this export carries: two names differing only by a DEL would come
+#: back from the file as one, which is the newline-collision bug this export
+#: already avoids for ``node/@id``, in a smaller form.
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def _xml_text(value: object) -> str:
