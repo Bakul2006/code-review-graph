@@ -355,6 +355,12 @@ off for the whole repository.
   `<python> -m code_review_graph serve`, depending on what it detects. If the
   launcher it chose is missing, install it (`pip install uv` or `brew install uv`)
   or re-run `code-review-graph install` from the environment you want to use.
+- You can edit the entry yourself, for example
+  `uv run --project /path/to/checkout code-review-graph serve` when the server
+  lives outside the project you are editing. A later `install` leaves a
+  hand-edited entry exactly as you wrote it and says so; it only replaces
+  entries whose command line it recognises as one it wrote itself. The same
+  holds for hooks: a hook command you wrote is never rewritten or removed.
 
 ## Windows / WSL
 

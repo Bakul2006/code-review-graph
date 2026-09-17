@@ -797,14 +797,6 @@ HUSK_XFAIL = (
 
 GIT_HOOK_PLATFORMS = ("claude", "codex", "qoder")
 
-GIT_HOOK_XFAIL = (
-    "uninstall._remove_git_hook stops dropping at the first line that strips "
-    "to 'fi'. The installed pre-commit hook nests an if/elif/else inside its "
-    "outer 'if command -v', so the inner 'fi' ends the drop and the outer "
-    "'fi' is written back: the hook becomes '#!/bin/sh\\nfi', a shell syntax "
-    "error, and every git commit in the repository fails afterwards"
-)
-
 
 @pytest.mark.parametrize("key", PLATFORM_KEYS)
 def test_step4a_uninstall_removes_the_registration_and_keeps_user_settings(
@@ -912,13 +904,17 @@ def test_step4c_uninstall_leaves_no_empty_config_husk(sandbox: Sandbox, key: str
     _record("step4c_husks", key, len(created))
 
 
-@pytest.mark.parametrize(
-    "key",
-    [pytest.param(k, marks=[pytest.mark.xfail(strict=True, reason=GIT_HOOK_XFAIL)])
-     for k in GIT_HOOK_PLATFORMS],
-)
+@pytest.mark.parametrize("key", GIT_HOOK_PLATFORMS)
 def test_step4d_uninstall_keeps_git_commit_working(sandbox: Sandbox, key: str) -> None:
-    """Uninstall must not leave a pre-commit hook that breaks every commit."""
+    """Uninstall must not leave a pre-commit hook that breaks every commit.
+
+    Guards the release blocker this suite recorded: ``_remove_git_hook`` used
+    to stop dropping at the first line that strips to ``fi``, and the installed
+    hook nests an if/elif/else inside its outer ``if command -v``. The inner
+    ``fi`` ended the drop, the outer one was written back, and the hook became
+    ``#!/bin/sh\\nfi`` -- a syntax error that failed every later ``git commit``.
+    The block now carries explicit begin/end markers and is cut out whole.
+    """
     hook = sandbox.repo / ".git" / "hooks" / "pre-commit"
     run_install(sandbox, key)
     assert hook.exists(), f"{key}: no pre-commit hook was installed to begin with"
@@ -983,24 +979,15 @@ def test_step4e_platform_scoped_unbind_covers_every_platform(
 # ---------------------------------------------------------------------------
 
 
-STALE_CONFIG_XFAIL = (
-    "GH #558: install_platform_configs treats any existing 'code-review-graph' "
-    "entry as up to date and returns early, so an older release's absolute "
-    "interpreter path and dead cwd are never replaced"
-)
-
-
-@pytest.mark.parametrize(
-    "key",
-    [
-        pytest.param(
-            k,
-            marks=[pytest.mark.xfail(strict=True, reason=STALE_CONFIG_XFAIL)],
-        )
-        for k in PLATFORM_KEYS
-    ],
-)
+@pytest.mark.parametrize("key", PLATFORM_KEYS)
 def test_step5_stale_config_entry_is_replaced(sandbox: Sandbox, key: str) -> None:
+    """An entry a previous release wrote is replaced, not treated as current.
+
+    Guards GH #558: ``install_platform_configs`` (and the TOML and YAML merges)
+    used to treat any existing ``code-review-graph`` entry as up to date and
+    return early, so an older release's absolute interpreter path and dead
+    ``cwd`` survived every reinstall.
+    """
     expect = EXPECTATIONS[key]
     config = sandbox.config_path(key)
     write_stale_config(config, expect)
@@ -1021,7 +1008,10 @@ def test_step5_stale_config_entry_is_replaced(sandbox: Sandbox, key: str) -> Non
         f"{key}: the older release's absolute interpreter path survives in {config}"
     )
     checks += 1
-    assert entry.get("cwd", STALE_CWD) != STALE_CWD, (
+    # The default must not be STALE_CWD itself: OpenCode and Hermes pin no cwd
+    # at all (step 1 asserts exactly that), and an absent cwd is the opposite
+    # of a surviving stale one.
+    assert entry.get("cwd", "") != STALE_CWD, (
         f"{key}: the older release's dead cwd survives in {config}"
     )
     checks += 1
@@ -1029,49 +1019,55 @@ def test_step5_stale_config_entry_is_replaced(sandbox: Sandbox, key: str) -> Non
     _record("step5_stale_config", key, checks)
 
 
-# Platforms whose install writes a hooks file the previous release could have
-# written differently, mapped to the file and the command substring involved.
 # Platforms whose install writes a hooks file, mapped to the file, the event,
-# and a hook command in the shape an older release left behind. The old shapes
-# are taken from this project's own history: an absolute interpreter path for
-# the settings-based hooks, an absolute script path for Gemini CLI's.
-_OLD_PYTHON_HOOK = (
-    f"{STALE_ABSOLUTE} -m code_review_graph update --skip-flows --repo {STALE_CWD}"
+# the matcher an older release filed its group under, and the hook command that
+# release wrote. Every shape below is a real one, read back out of this
+# project's released tags: v2.2.0 wrote ``--quiet --skip-flows`` under matcher
+# ``Edit|Write|Bash``, v2.3.3 wrote the Codex one-liner without the ``cat``
+# prelude, and Gemini CLI's hook has always pointed at a ``crg-*.sh`` script
+# (here under a checkout that no longer exists).
+_OLD_SETTINGS_HOOK = "code-review-graph update --quiet --skip-flows"
+_OLD_CODEX_HOOK = (
+    "git rev-parse --git-dir >/dev/null 2>&1"
+    " && code-review-graph update --skip-flows || true"
 )
-HOOK_PLATFORMS: dict[str, tuple[str, str, str]] = {
-    "claude": ("repo:.claude/settings.json", "PostToolUse", _OLD_PYTHON_HOOK),
-    "qoder": ("repo:.qoder/settings.json", "PostToolUse", _OLD_PYTHON_HOOK),
-    "codebuddy": ("repo:.codebuddy/settings.json", "PostToolUse", _OLD_PYTHON_HOOK),
-    "codex": ("home:.codex/hooks.json", "PostToolUse", _OLD_PYTHON_HOOK),
+HOOK_PLATFORMS: dict[str, tuple[str, str, str, str]] = {
+    "claude": (
+        "repo:.claude/settings.json", "PostToolUse", "Edit|Write|Bash", _OLD_SETTINGS_HOOK,
+    ),
+    "qoder": (
+        "repo:.qoder/settings.json", "PostToolUse", "Edit|Write|Bash", _OLD_SETTINGS_HOOK,
+    ),
+    "codebuddy": (
+        "repo:.codebuddy/settings.json", "PostToolUse", "Edit|Write|Bash",
+        _OLD_SETTINGS_HOOK,
+    ),
+    "codex": (
+        "home:.codex/hooks.json", "PostToolUse", "Write|Edit|Bash", _OLD_CODEX_HOOK,
+    ),
     "gemini-cli": (
         "repo:.gemini/settings.json",
         "AfterTool",
+        "write_file|replace",
         f"bash {STALE_CWD}/.gemini/hooks/crg-update.sh",
     ),
 }
-
-STALE_HOOK_XFAIL = (
-    "the hook merge compares whole entries (or exact command strings), so an "
-    "older release's hook shape is kept and the current one is appended "
-    "beside it, leaving the repo running two code-review-graph hooks on the "
-    "same event"
-)
-
 
 def _is_crg_hook_command(command: str) -> bool:
     """Both spellings this project has ever put in a hook command."""
     return ENTRY_NAME in command or "crg-" in command
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        pytest.param(k, marks=[pytest.mark.xfail(strict=True, reason=STALE_HOOK_XFAIL)])
-        for k in sorted(HOOK_PLATFORMS)
-    ],
-)
+@pytest.mark.parametrize("key", sorted(HOOK_PLATFORMS))
 def test_step5b_stale_hook_shape_is_replaced(sandbox: Sandbox, key: str) -> None:
-    marker, event, stale_command = HOOK_PLATFORMS[key]
+    """Reinstalling replaces our hook rather than adding a second one.
+
+    The hook merges used to compare whole entries (or exact command strings),
+    so an older release's hook shape was kept and the current one appended
+    beside it, and the repository then ran two code-review-graph hooks on the
+    same event.
+    """
+    marker, event, stale_matcher, stale_command = HOOK_PLATFORMS[key]
     settings_path = sandbox.resolve(marker)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(
@@ -1080,7 +1076,7 @@ def test_step5b_stale_hook_shape_is_replaced(sandbox: Sandbox, key: str) -> None
                 "hooks": {
                     event: [
                         {
-                            "matcher": "Edit|Write",
+                            "matcher": stale_matcher,
                             "hooks": [
                                 {"type": "command", "command": stale_command, "timeout": 30}
                             ],
@@ -1100,17 +1096,17 @@ def test_step5b_stale_hook_shape_is_replaced(sandbox: Sandbox, key: str) -> None
     body = settings_path.read_text(encoding="utf-8")
     data = json.loads(body)
     groups = data["hooks"][event]
-    crg_hooks = [
-        hook
-        for group in groups
-        for hook in group.get("hooks", [])
-        if _is_crg_hook_command(hook.get("command", ""))
+    commands = [
+        hook.get("command", "") for group in groups for hook in group.get("hooks", [])
     ]
+    crg_hooks = [command for command in commands if _is_crg_hook_command(command)]
 
     checks = 0
     assert crg_hooks, f"{key}: reinstall wrote no hook at all into {settings_path}"
     checks += 1
-    assert stale_command not in body, (
+    # Compared exactly, not by substring: one released Codex command is a
+    # prefix of the one that replaced it.
+    assert stale_command not in commands, (
         f"{key}: the older release's hook command survives in {settings_path}"
     )
     checks += 1
