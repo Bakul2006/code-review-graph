@@ -114,8 +114,16 @@ detail_level: str = "standard"   # "standard" or "minimal"
 max_results: int = 100           # Graph nodes per list (max 100) and edges (max 150)
 max_files: int = 25              # Files listed and given snippets (max 200)
 ```
-Snippets share an 800-line budget across the response. Each list reports its
-untruncated `*_total`, and `context.truncated` marks any cut.
+`changed_files` is ordered by risk score (highest first, per file in
+`context.file_risk`), and both `max_files` and the shared 800-line snippet
+budget are spent in that order. The budget buys whole changed regions -- the
+diff hunks, each widened to its enclosing definition when that definition is
+short enough to read whole -- granted round-robin across the ranked files, so
+a file with one small change costs one small grant and a file with six hunks
+gets six turns. No single file may hold more than 40% of the budget.
+`context.source_regions` reports `shown`, `total`, and an `incomplete` map of
+the files whose regions did not all fit. Each list reports its untruncated
+`*_total`, and `context.truncated` / `context.source_truncated` mark any cut.
 Responses may include estimated `context_savings` metadata.
 
 #### `traverse_graph_tool`
@@ -435,6 +443,12 @@ code-review-graph detect-changes --base origin/main # Branch refs use their merg
 code-review-graph detect-changes --brief       # Compact panel with token-savings estimate
 code-review-graph detect-changes --brief --verify  # ...and cross-check against tiktoken
 code-review-graph detect-changes --churn       # Add opt-in change-frequency risk (CRG_CHURN_WINDOW_DAYS, default 90)
+                                                #   The MCP tools (detect_changes, get_minimal_context) always include it.
+                                                #   Cached per commit; CRG_CHURN_TIMEOUT (5s) and CRG_CHURN_MAX_COMMITS
+                                                #   (2000) bound the git log. A repository that cannot answer in time is
+                                                #   recorded as unavailable for the life of the process, so the timeout is
+                                                #   paid once, and the response says so: `churn_status` is "unavailable"
+                                                #   and the summary carries a "Degraded" line.
 code-review-graph dead-code                    # Functions/classes with no callers or test references
 code-review-graph dead-code --kind Function --file-pattern src/ --json
 

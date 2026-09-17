@@ -45,6 +45,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -790,6 +791,25 @@ def test_hard_ceilings_bind(repo):
     # Each snippet can overshoot by the "..." separators it inserts, so allow
     # a small margin over the raw line budget.
     assert emitted_lines <= review._MAX_REVIEW_SOURCE_LINES * 1.5
+    # The source lines themselves are accounted for exactly: the budget is
+    # allocated once over the risk-ranked file list, and what a file does not
+    # use is handed to the next file rather than spent twice.
+    source_lines = sum(
+        1
+        for snippet in context["source_snippets"].values()
+        for line in snippet.splitlines()
+        if re.match(r"^\d+: ", line)
+    )
+    assert source_lines <= review._MAX_REVIEW_SOURCE_LINES
+    # And no single file may hold more than its capped share of that budget.
+    share_cap = review._source_share_cap(
+        review._MAX_REVIEW_SOURCE_LINES, review._MAX_LINES_PER_FILE,
+    )
+    for name, snippet in context["source_snippets"].items():
+        held = sum(
+            1 for line in snippet.splitlines() if re.match(r"^\d+: ", line)
+        )
+        assert held <= share_cap, f"{name} starved the rest of the ranking"
 
     dead = crg_main.refactor_tool(
         repo_root=root, mode="dead_code", max_results=HUGE,
