@@ -53,6 +53,12 @@ def _node_ids(store: GraphStore) -> set[int]:
     return {row[0] for row in store._conn.execute("SELECT id FROM nodes")}
 
 
+def _rebuilt_entries(store: GraphStore) -> list[tuple]:
+    """What the index would hold if it were rebuilt from scratch right now."""
+    rebuild_fts_index(store)
+    return _index_entries(store)
+
+
 def _function(name: str, file_path: str, line: int = 1) -> NodeInfo:
     return NodeInfo(
         kind="Function",
@@ -210,6 +216,57 @@ class TestFtsDelta:
             update_fts_index(self.store, ["alpha.py"])
 
         assert _fts_search(self.store._conn, "vanishing_helper") == []
+
+    def test_delta_removes_the_docstring_terms_of_a_changed_node(self):
+        """Every indexed column has to be replayed to delete an entry.
+
+        ``nodes_fts`` grew ``docstring`` and ``name_tokens`` in v13. An
+        external-content delete only removes the terms it is handed, so a
+        mirror that still carried the four original columns would leave the
+        old prose in the index: a query for it would keep matching, now
+        pointing at a node whose docstring no longer says it.
+        """
+        node = _function("authenticate_request", "beta.py", 1)
+        node.extra = {"docstring": "verifies the caller's zygomorphic token"}
+        self.store.store_file_nodes_edges("beta.py", [node], [], "hash-beta-1")
+        self._set_signatures()
+        rebuild_fts_index(self.store)
+        assert _fts_search(self.store._conn, "zygomorphic")
+
+        replacement = _function("authenticate_request", "beta.py", 1)
+        replacement.extra = {"docstring": "verifies nothing in particular"}
+        self.store.store_file_nodes_edges(
+            "beta.py", [replacement], [], "hash-beta-2"
+        )
+        self._set_signatures()
+
+        mode: list[str] = []
+        update_fts_index(self.store, ["beta.py"], _out_mode=mode)
+
+        assert mode == ["delta"]
+        assert _fts_search(self.store._conn, "zygomorphic") == []
+        assert _index_entries(self.store) == _rebuilt_entries(self.store)
+
+    def test_delta_removes_the_token_split_of_a_renamed_node(self):
+        """``name_tokens`` is derived, so it drifts with the node's name."""
+        self.store.store_file_nodes_edges(
+            "gamma.py", [_function("zygomorphicHelper", "gamma.py", 1)], [], "g1"
+        )
+        self._set_signatures()
+        rebuild_fts_index(self.store)
+        assert _fts_search(self.store._conn, "zygomorphic")
+
+        self.store.store_file_nodes_edges(
+            "gamma.py", [_function("plainHelper", "gamma.py", 1)], [], "g2"
+        )
+        self._set_signatures()
+
+        mode: list[str] = []
+        update_fts_index(self.store, ["gamma.py"], _out_mode=mode)
+
+        assert mode == ["delta"]
+        assert _fts_search(self.store._conn, "zygomorphic") == []
+        assert _index_entries(self.store) == _rebuilt_entries(self.store)
 
     def test_delta_repairs_drift_without_a_file_hint(self):
         """Rows changed behind the index are resynced even with no hint."""
