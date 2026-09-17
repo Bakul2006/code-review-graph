@@ -16,7 +16,7 @@ from ..incremental import (
     get_staged_and_unstaged,
     resolve_review_base,
 )
-from ..parser import normalize_file_path
+from ..parser import is_test_file, normalize_file_path
 from ._common import (
     _bounded,
     _get_store,
@@ -175,10 +175,18 @@ def get_review_context(
                 n.name for n in impact["changed_nodes"][:5]
             ]
 
-            # Count test gaps among changed functions.
+            # Count test gaps among changed functions. The file path is
+            # checked as well as the stored flag so a graph built before
+            # the parser marked every test-file node (#1014) does not count
+            # test helpers as untested production code. ``root`` makes that
+            # check read the path inside the repository: stored paths are
+            # absolute, and a checkout under a directory named "test" would
+            # otherwise suppress every gap in the repository (#1023).
             changed_funcs = [
                 n for n in impact["changed_nodes"]
-                if n.kind == "Function" and not n.is_test
+                if n.kind == "Function"
+                and not n.is_test
+                and not is_test_file(n.file_path, root)
             ]
             test_edges = [
                 e for e in impact["edges"] if e.kind == "TESTED_BY"
@@ -291,7 +299,7 @@ def get_review_context(
             context["source_snippets"] = snippets
 
         # Generate review guidance
-        guidance = _generate_review_guidance(impact, changed_files)
+        guidance = _generate_review_guidance(impact, changed_files, root)
         context["review_guidance"] = guidance
 
         summary_parts = [
@@ -365,9 +373,15 @@ def _extract_relevant_lines(
 
 
 def _generate_review_guidance(
-    impact: dict, changed_files: list[str]
+    impact: dict, changed_files: list[str], repo_root: "str | Path | None" = None,
 ) -> str:
-    """Generate review guidance based on the impact analysis."""
+    """Generate review guidance based on the impact analysis.
+
+    *repo_root* is what makes the test-file check read a project path rather
+    than an absolute one. Without it, directory conventions are skipped for
+    absolute paths, which can leave a test helper in the untested list but
+    never hides a production gap. See #1023.
+    """
     guidance_parts = []
 
     # Check for test coverage
@@ -379,7 +393,9 @@ def _generate_review_guidance(
 
     untested = [
         f for f in changed_funcs
-        if f.qualified_name not in tested_funcs and not f.is_test
+        if f.qualified_name not in tested_funcs
+        and not f.is_test
+        and not is_test_file(f.file_path, repo_root)
     ]
     if untested:
         guidance_parts.append(
