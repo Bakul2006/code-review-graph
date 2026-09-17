@@ -13,6 +13,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1785,14 +1786,82 @@ _GENERATED_HOOK_MATCHERS: dict[str, frozenset[str | None]] = {
 }
 
 
+# Characters that begin a second command or a redirection. A word carrying one
+# of these unquoted is not part of a path, so the line is a compound command
+# somebody wrote, not a plain call to one of our scripts.
+_SHELL_OPERATOR_RE = re.compile(r"[|&;<>`]|\$\(")
+
+# A word that opens a fresh argument -- an option, an absolute POSIX path, a
+# Windows drive or UNC path -- and so cannot be the continuation of the
+# previous word's path.
+_NEW_ARGUMENT_RE = re.compile(r"\A(?:[-/\\]|[A-Za-z]:[\\/])")
+
+
+def _shell_words(command: str) -> list[tuple[str, str]] | None:
+    """Split ``command`` into shell words as ``(raw, unquoted)`` pairs.
+
+    ``str.split`` is the wrong tool: it cannot see through ``"..."`` and it
+    breaks ``/Users/jo smith/hooks/crg-update.sh`` -- one path on a home
+    directory with a space in it -- into two words. ``shlex`` understands
+    quoting, and non-POSIX mode leaves backslashes alone so a Windows path
+    survives the trip. Returns None for a line no shell could parse, such as
+    one with an unterminated quote; nothing about such a line is certain
+    enough to act on.
+    """
+    lexer = shlex.shlex(command, posix=False, punctuation_chars=False)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        raw_words = list(lexer)
+    except ValueError:
+        return None
+    return [(word, _unquote_word(word)) for word in raw_words]
+
+
+def _unquote_word(word: str) -> str:
+    """Strip one layer of matching surrounding quotes from a shell word."""
+    for quote in ('"', "'"):
+        if len(word) >= 2 and word.startswith(quote) and word.endswith(quote):
+            return word[1:-1]
+    return word
+
+
 def _is_generated_hook_script(command: str) -> bool:
-    """Return whether ``command`` just runs a hook script this project writes."""
-    parts = command.split()
-    if not parts or len(parts) > 2:
+    """Return whether ``command`` just runs a hook script this project writes.
+
+    Ownership is the script's own file name, so the answer must not depend on
+    how the path leading to it is spelled: quoted or bare, absolute or
+    relative, ``/`` or ``\\``, with a space in the home directory, with a
+    trailing argument. What still disqualifies a command is a second program:
+    a chained or redirected command, or one of our scripts passed as an
+    argument to somebody else's.
+    """
+    words = _shell_words(command)
+    if not words:
         return False
-    if len(parts) == 2 and _launcher_basename(parts[0]) not in _HOOK_SCRIPT_RUNNERS:
+    # A quoted word's contents are literal, so an operator character inside
+    # one is part of the path and not a chained command.
+    if any(raw == value and _SHELL_OPERATOR_RE.search(value) for raw, value in words):
         return False
-    return _launcher_basename(parts[-1]) in _GENERATED_HOOK_SCRIPTS
+    values = [value for _raw, value in words]
+    start = (
+        1
+        if len(values) > 1 and _launcher_basename(values[0]) in _HOOK_SCRIPT_RUNNERS
+        else 0
+    )
+    # An unquoted path with a space in it arrives as several words, so grow the
+    # candidate one word at a time. Stop as soon as the next word opens a new
+    # argument, or the previous one already ended in a script of its own,
+    # because then the words are two arguments rather than one path.
+    for end in range(start + 1, len(values) + 1):
+        if end > start + 1:
+            if _NEW_ARGUMENT_RE.match(values[end - 1]):
+                break
+            if values[end - 2].lower().endswith(".sh"):
+                break
+        if _launcher_basename(" ".join(values[start:end])) in _GENERATED_HOOK_SCRIPTS:
+            return True
+    return False
 
 
 def _is_generated_hook_command(command: Any) -> bool:

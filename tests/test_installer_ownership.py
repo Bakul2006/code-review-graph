@@ -54,6 +54,16 @@ def _hook_commands(settings: dict, event: str) -> list[str]:
         "code-review-graph update",
         "code-review-graph detect-changes",
         "code-review-graph update --skip-flows --verbose",
+        # One of our scripts handed to someone else's script as an argument is
+        # their command, not ours: the program being run is ``run.sh``.
+        "bash /opt/acrg-tools/run.sh /home/u/.cursor/hooks/crg-update.sh",
+        # A second command chained onto ours makes the whole line theirs, and
+        # that stays true when the path has a space in it.
+        "/home/u/.cursor/hooks/crg-update.sh && notify-team",
+        "/Users/jo smith/.cursor/hooks/crg-update.sh; rm -rf /tmp/scratch",
+        # An unterminated quote is a line no shell can parse, so nothing about
+        # it can be claimed with certainty.
+        '"/Users/jo smith/.cursor/hooks/crg-update.sh',
     ],
 )
 def test_user_hook_commands_are_not_claimed(command: str) -> None:
@@ -80,10 +90,65 @@ def test_user_hook_commands_are_not_claimed(command: str) -> None:
         "bash .gemini/hooks/crg-update.sh",
         "/home/u/.cursor/hooks/crg-session-start.sh",
         "bash /previous/checkout/.gemini/hooks/crg-update.sh",
+        # The script's own file name decides ownership, so none of the ways a
+        # path can be spelled may change the answer: a space in the home
+        # directory, a quoted command, a trailing argument, Windows
+        # separators, a relative path.
+        "/Users/jo smith/.cursor/hooks/crg-update.sh",
+        '"/Users/jo smith/.cursor/hooks/crg-session-start.sh"',
+        "'/Users/jo smith/.cursor/hooks/crg-pre-commit.sh'",
+        "bash /Users/jo smith/.gemini/hooks/crg-update.sh",
+        'bash "/Users/jo smith/.gemini/hooks/crg-update.sh"',
+        "C:\\Users\\jo\\.cursor\\hooks\\crg-update.sh",
+        "C:\\Users\\jo smith\\.cursor\\hooks\\crg-pre-commit.sh",
+        ".cursor/hooks/crg-update.sh",
+        "/home/u/.cursor/hooks/crg-update.sh --repo /srv/mono",
+        # v2.3.3-v2.3.6 pinned the repo with ``json.dumps``, so the path
+        # arrives quoted and a space in it is still our own command.
+        "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1"
+        " && code-review-graph update --skip-flows"
+        ' --repo "/Users/jo smith/mono repo" || true',
+        "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1"
+        ' && code-review-graph status --repo "/Users/jo smith/mono repo"'
+        " || echo 'Not a git repo, skipping'",
     ],
 )
 def test_generated_hook_commands_are_claimed(command: str) -> None:
     assert skills._is_generated_hook_command(command) is True
+
+
+def test_install_twice_under_a_home_with_a_space_leaves_one_cursor_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A space in the home directory must not stack a second hook beside ours.
+
+    Cursor's command is the absolute path of the script, so on a machine whose
+    home directory has a space in it the previous release's entry only looks
+    like a foreign command if ownership is decided by whitespace.
+    """
+    home = tmp_path / "jo smith"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    skills.install_cursor_hooks()
+    skills.install_cursor_hooks()
+
+    config = json.loads((home / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
+    for event, entries in config["hooks"].items():
+        assert len(entries) == 1, f"{event} kept a duplicate hook: {entries}"
+
+
+def test_a_quoted_cursor_hook_from_an_earlier_release_is_replaced() -> None:
+    """A release that quoted the command wrote the same hook, not a new one."""
+    quoted = '"/Users/jo smith/.cursor/hooks/crg-update.sh"'
+    merged = skills._merge_flat_hook_entries(
+        [{"command": quoted, "timeout": 5}, {"command": ACRG_TOOLS_COMMAND, "timeout": 9}],
+        [{"command": "/Users/jo smith/.cursor/hooks/crg-update.sh", "timeout": 5}],
+    )
+    assert merged == [
+        {"command": "/Users/jo smith/.cursor/hooks/crg-update.sh", "timeout": 5},
+        {"command": ACRG_TOOLS_COMMAND, "timeout": 9},
+    ]
 
 
 def test_install_keeps_a_users_own_hook_on_another_matcher(tmp_path: Path) -> None:
