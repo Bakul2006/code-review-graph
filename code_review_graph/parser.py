@@ -1473,23 +1473,78 @@ _TEST_PATTERNS = [
     re.compile(r"_spec$"),
 ]
 
-_TEST_FILE_PATTERNS = [
-    re.compile(r"test_.*\.py$"),
-    re.compile(r".*_test\.py$"),
-    re.compile(r".*\.test\.[jt]sx?$"),
-    re.compile(r".*\.spec\.[jt]sx?$"),
-    re.compile(r".*_test\.go$"),
-    re.compile(r"tests?/"),
-    re.compile(r"[\\/]__tests__[\\/]"),
-    re.compile(r".*_test\.dart$"),
-    re.compile(r"test[_-].*\.[rR]$"),
-    re.compile(r"tests/testthat/"),
-    re.compile(r".*Test\.kt$"),
-    re.compile(r".*Test\.java$"),
-    re.compile(r".*_test\.resi?$"),
-    re.compile(r".*\.test\.resi?$"),
-    re.compile(r"test/runtests\.jl$"),
-    re.compile(r"test/.*\.jl$"),
+# Path separator or start of the repository-relative path.  Directory and
+# stem patterns anchor on it so "src/latest/" is not read as a "test/"
+# directory and "contests/" is not read as "tests/".  Both separators are
+# accepted: the graph stores POSIX paths, but callers pass native ones.
+_SEP = r"(?:^|[\\/])"
+
+# Absolute-path shapes, tested against the POSIX-normalised spelling: a
+# leading slash, a Windows drive letter, or a UNC share.
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:/|//)")
+
+# Directory conventions.  These are matched against the path RELATIVE to the
+# repository root, never against the absolute path the graph stores: the
+# directories ABOVE a checkout are not part of the project, so a repository
+# cloned into a CI workspace named "test" would otherwise have every one of
+# its production symbols classified as test code.
+_TEST_DIR_PATTERNS = [
+    # Python ``tests/``, Go and Rust ``tests/``, Java/Kotlin ``src/test/``.
+    # The singular ``test/`` is handled separately below so a library that
+    # ships a ``test`` subpackage keeps its production status.
+    re.compile(_SEP + r"tests[\\/]"),
+    re.compile(_SEP + r"__tests__[\\/]"),
+    re.compile(_SEP + r"e2e[_-]?tests?[\\/]"),
+    re.compile(_SEP + r"testthat[\\/]"),
+    # Ruby RSpec.  The directory name alone is not evidence: "spec/" and
+    # "specs/" just as often hold design documents or generated API specs,
+    # which are production artefacts.  Require a Ruby source file under it.
+    re.compile(_SEP + r"specs?[\\/].*\.(?:rb|rake)$"),
+]
+
+# The singular ``test/`` directory, kept out of the list above so the
+# shipped-package exception in :func:`_is_shipped_test_package` applies to it
+# alone.
+_SINGULAR_TEST_DIR_RE = re.compile(_SEP + r"test[\\/]")
+
+# Directories that hold helpers *for* tests.  Ambiguous on purpose: a shared
+# library published from ``test-utils/`` is production code with a public API,
+# so this is opt-in (``include_helper_dirs``) rather than part of the default
+# answer.  Only dead-code detection asks for it, where a false "dead" report
+# costs a reviewer more than a missed one.  See :func:`is_test_file`.
+_TEST_HELPER_DIR_PATTERNS = [
+    re.compile(_SEP + r"test[_-]utils?[\\/]"),
+]
+
+# Filename conventions.  Matched against the basename alone, so they hold
+# whatever the repository root is.
+_TEST_NAME_PATTERNS = [
+    # Python: pytest/unittest stems plus conftest, which holds fixtures.
+    re.compile(r"^test_.*\.py$"),
+    re.compile(r"_test\.py$"),
+    re.compile(r"^conftest\.py$"),
+    # JavaScript / TypeScript.
+    re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$"),
+    # Go.
+    re.compile(r"_test\.go$"),
+    # Ruby.
+    re.compile(r"_(?:test|spec)\.rb$"),
+    # Java / Kotlin / Scala / Groovy, C#, PHP (PHPUnit).  The character
+    # before "Test" must be lowercase or a digit so the suffix is a class
+    # name boundary rather than a substring: "ABTest.php" is an A/B testing
+    # feature, not a test for a class named "AB".  Acronym-prefixed suites
+    # such as "APITest.java" are caught by the test-directory rule instead.
+    re.compile(r"[a-z0-9]Tests?\.(?:java|kt|kts|scala|groovy)$"),
+    re.compile(r"[a-z0-9]Tests?\.cs$"),
+    re.compile(r"[a-z0-9]Test\.php$"),
+    # Dart.
+    re.compile(r"_test\.dart$"),
+    # R.
+    re.compile(r"^test[_-].*\.[rR]$"),
+    # ReScript.
+    re.compile(r"[_.]test\.resi?$"),
+    # Julia.
+    re.compile(r"^runtests\.jl$"),
 ]
 
 _TEST_RUNNER_NAMES = frozenset({
@@ -2093,19 +2148,214 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
     return modules
 
 
-def _is_test_file(path: str) -> bool:
-    return any(p.search(path) for p in _TEST_FILE_PATTERNS)
+@lru_cache(maxsize=64)
+def _repo_root_prefixes(repo_root: str) -> tuple[str, ...]:
+    """Return the POSIX spellings a path under *repo_root* may start with.
+
+    Both the spelling the caller gave and its symlink-resolved form are
+    returned: ``/tmp`` and ``/private/tmp`` name the same directory on macOS,
+    and a graph built through one spelling is often queried through the other.
+    """
+    root = normalize_file_path(repo_root).rstrip("/")
+    if not root:
+        return ()
+    prefixes = [root]
+    try:
+        resolved = normalize_file_path(Path(repo_root).resolve()).rstrip("/")
+    except (OSError, ValueError, RuntimeError):
+        resolved = ""
+    if resolved and resolved not in prefixes:
+        prefixes.append(resolved)
+    return tuple(prefixes)
+
+
+@lru_cache(maxsize=2048)
+def _resolved_dir(directory: str) -> str:
+    """Symlink-resolved POSIX spelling of *directory*, or "" if unresolvable."""
+    try:
+        return normalize_file_path(Path(directory).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return ""
+
+
+def _strip_prefix(normalized: str, root: str) -> Optional[str]:
+    if normalized == root:
+        return ""
+    if normalized.startswith(root + "/"):
+        return normalized[len(root) + 1:]
+    # macOS and Windows filesystems are case-insensitive by default, so the
+    # stored path and the configured root can differ only in case.
+    if normalized.lower().startswith(root.lower() + "/"):
+        return normalized[len(root) + 1:]
+    return None
+
+
+def _repo_relative_path(
+    normalized: str, repo_root: "str | PurePath | None",
+) -> Optional[str]:
+    """Return *normalized* relative to *repo_root*, or ``None`` if unknowable.
+
+    ``None`` means "this path cannot be placed inside a repository", which
+    happens in exactly two ways: the path is absolute and no root was given,
+    or it is absolute and lies outside the root (a dependency, a generated
+    file, a stale row from another checkout).  Callers must not fall back to
+    the absolute path in that case — see :func:`is_test_file`.
+    """
+    if not _ABSOLUTE_PATH_RE.match(normalized):
+        # Already relative; by convention that is relative to the repo root.
+        return normalized
+    if repo_root is None:
+        return None
+    prefixes = _repo_root_prefixes(str(repo_root))
+    for root in prefixes:
+        relative = _strip_prefix(normalized, root)
+        if relative is not None:
+            return relative
+    # The two spellings can still name the same directory: ``/tmp`` and
+    # ``/private/tmp`` on macOS, or a checkout reached through a symlink.
+    # Resolving the path's own directory (cached, so once per directory) is
+    # the last attempt before giving up.
+    directory, _, name = normalized.rpartition("/")
+    resolved = _resolved_dir(directory) if directory else ""
+    if resolved and resolved != directory:
+        candidate = f"{resolved}/{name}"
+        for root in prefixes:
+            relative = _strip_prefix(candidate, root)
+            if relative is not None:
+                return relative
+    return None
+
+
+@lru_cache(maxsize=256)
+def _is_python_package_dir(directory: str) -> bool:
+    """Whether *directory* is an importable Python package (has __init__.py)."""
+    try:
+        return os.path.isfile(os.path.join(directory, "__init__.py"))
+    except (OSError, ValueError):
+        return False
+
+
+def _is_shipped_test_package(
+    normalized: str, relative: str, repo_root: "str | PurePath | None",
+) -> bool:
+    """Whether the singular ``test/`` directory in *relative* is shipped code.
+
+    ``django/test/client.py`` is production code: ``django/test/`` carries an
+    ``__init__.py`` and sits inside the ``django`` package, so users import it
+    as ``django.test``.  A top-level ``test/`` directory in an application is
+    not shipped — its parent is the repository root, which is not a package —
+    and neither is a ``test/`` directory holding a test-named module, which
+    the filename rules have already claimed before this is reached.
+
+    Returns False whenever the directories cannot be inspected (a relative
+    path with no root, a graph queried away from its checkout, a deleted
+    file), which keeps the conservative answer: the file stays test code.
+    """
+    if not relative.endswith(".py"):
+        return False
+    segments = relative.split("/")
+    dirs = segments[:-1]
+    try:
+        # The innermost "test" directory decides; anything under it inherits.
+        index = len(dirs) - 1 - dirs[::-1].index("test")
+    except ValueError:
+        return False
+    if index == 0:
+        # Top-level test/: its parent is the repository root, not a package.
+        return False
+    # The directories are read off disk, so they need a filesystem path. A
+    # relative input only has one when the caller gave the root; guessing
+    # against the working directory would make the answer depend on where
+    # the process happens to be running.
+    if len(normalized) > len(relative) and normalized.endswith(relative):
+        prefix = normalized[: len(normalized) - len(relative)]
+    elif repo_root is not None:
+        prefix = normalize_file_path(repo_root).rstrip("/") + "/"
+    else:
+        return False
+    test_dir = prefix + "/".join(dirs[: index + 1])
+    parent_dir = prefix + "/".join(dirs[:index])
+    return _is_python_package_dir(test_dir) and _is_python_package_dir(parent_dir)
+
+
+def repo_relative_path(
+    path: "str | PurePath", repo_root: "str | PurePath | None" = None,
+) -> Optional[str]:
+    """Return *path* as a POSIX path inside *repo_root*, or ``None``.
+
+    ``None`` says the path cannot be placed inside the repository — it is
+    absolute and either no root was given or it lies outside that root.  Any
+    rule that reads meaning from a directory name (``tests/``, a package
+    directory matched against an import specifier) needs this: the
+    directories above a checkout belong to whoever cloned it, not to the
+    project, and reading them as project structure is how a CI workspace
+    named "test" silences an entire report.  See #1023.
+    """
+    return _repo_relative_path(normalize_file_path(path), repo_root)
+
+
+def is_test_file(
+    path: "str | PurePath",
+    repo_root: "str | PurePath | None" = None,
+    *,
+    include_helper_dirs: bool = False,
+) -> bool:
+    """Return whether *path* holds test code.
+
+    Everything in a test file is test code: the test functions, the classes
+    that group them, the fixtures and the private helpers they call.  Callers
+    outside the parser use this to keep test-file symbols out of reports about
+    production code.
+
+    *repo_root* is required to answer directory conventions such as ``tests/``
+    for an absolute path, because those directories must be inside the project.
+    The graph stores absolute paths, so without a root a repository checked
+    out under a directory named ``test`` (a CI workspace, a job directory)
+    would have every production symbol classified as test code and the
+    untested-code report would go silent.  When the root is unknown, or the
+    path lies outside it, only the filename conventions apply; that under-
+    reports test files but never hides a production gap.
+
+    *include_helper_dirs* additionally claims ``test-utils/`` and
+    ``test_utils/``.  Those directories are genuinely ambiguous — shared
+    libraries are published from them — so only dead-code detection opts in,
+    where over-suppressing costs less than a false "dead" report.
+    """
+    normalized = normalize_file_path(path)
+    basename = normalized.rsplit("/", 1)[-1]
+    if any(p.search(basename) for p in _TEST_NAME_PATTERNS):
+        return True
+
+    relative = _repo_relative_path(normalized, repo_root)
+    if relative is None:
+        return False
+    if any(p.search(relative) for p in _TEST_DIR_PATTERNS):
+        return True
+    if include_helper_dirs and any(
+        p.search(relative) for p in _TEST_HELPER_DIR_PATTERNS
+    ):
+        return True
+    if _SINGULAR_TEST_DIR_RE.search(relative):
+        return not _is_shipped_test_package(normalized, relative, repo_root)
+    return False
+
+
+# Historical private spelling, kept because other modules import it.
+_is_test_file = is_test_file
 
 
 def _is_test_function(
-    name: str, file_path: str, decorators: tuple[str, ...] = (),
+    name: str,
+    file_path: str,
+    decorators: tuple[str, ...] = (),
+    repo_root: "str | PurePath | None" = None,
 ) -> bool:
     """A function is a test if its name matches test patterns, it lives
     in a test file and has a test-runner name, or it has a @Test annotation.
     """
     if any(p.search(name) for p in _TEST_PATTERNS):
         return True
-    if _is_test_file(file_path) and name in _TEST_RUNNER_NAMES:
+    if is_test_file(file_path, repo_root) and name in _TEST_RUNNER_NAMES:
         return True
     if decorators and any(d in _TEST_ANNOTATIONS for d in decorators):
         return True
@@ -2886,6 +3136,16 @@ class CodeParser:
 
         return SHEBANG_INTERPRETER_TO_LANGUAGE.get(interpreter)
 
+    def _is_test_path(self, path: "str | PurePath") -> bool:
+        """Whether *path* holds test code, judged inside this repository.
+
+        Every test-ness question the parser asks goes through here so the
+        repository root is never left out: :func:`is_test_file` reads
+        directory conventions from the path relative to the root, and an
+        absolute path with no root silently loses them.
+        """
+        return is_test_file(path, self._repo_root)
+
     def parse_file(self, path: Path) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a single file and return extracted nodes and edges."""
         try:
@@ -2903,6 +3163,24 @@ class CodeParser:
         *source* so the stored file hash always describes the bytes that were
         actually parsed (issue #746).
         """
+        nodes, edges = self._extract_bytes(path, source)
+        # Every node from a test file is test code, whatever its kind: the
+        # test classes, the fixtures and the private helpers as much as the
+        # test functions.  Marking them here rather than at each of the ~40
+        # NodeInfo construction sites is what keeps Class nodes from being
+        # reported as untested production code (issue #1014).  It runs after
+        # extraction so TESTED_BY generation, which keys off the test
+        # functions alone, is unaffected.
+        fallback_path = normalize_file_path(path)
+        for node in nodes:
+            if not node.is_test and self._is_test_path(node.file_path or fallback_path):
+                node.is_test = True
+        return nodes, edges
+
+    def _extract_bytes(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Language dispatch for :meth:`parse_bytes`."""
         language = self.detect_language(path, source)
         if not language:
             return [], []
@@ -3005,7 +3283,7 @@ class CodeParser:
         file_path_str = normalize_file_path(path)
 
         # File node
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
         file_extra: dict = {}
         # C#: record the namespace(s) this file declares so query-time
         # fallbacks can resolve namespace-form IMPORTS_FROM targets (from
@@ -3259,7 +3537,7 @@ class CodeParser:
                 line_start=1,
                 line_end=source.count(b"\n") + 1,
                 language="blade",
-                is_test=_is_test_file(file_path),
+                is_test=self._is_test_path(file_path),
             ),
         ]
         edges: list[EdgeInfo] = []
@@ -3286,7 +3564,7 @@ class CodeParser:
 
         tree = vue_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
             kind="File",
@@ -3409,7 +3687,7 @@ class CodeParser:
 
         tree = svelte_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
             kind="File",
@@ -3598,7 +3876,7 @@ class CodeParser:
                 line_start=1,
                 line_end=1,
                 language=kernel_lang,
-                is_test=_is_test_file(file_path_str),
+                is_test=self._is_test_path(file_path_str),
             )], []
 
         return self._parse_notebook_cells(path, cells, kernel_lang)
@@ -3617,7 +3895,7 @@ class CodeParser:
             default_language: Default language for the File node.
         """
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         # Group cells by language
         lang_cells: dict[str, list[CellInfo]] = {}
@@ -3821,7 +4099,7 @@ class CodeParser:
                 line_start=1,
                 line_end=1,
                 language="python",
-                is_test=_is_test_file(file_path_str),
+                is_test=self._is_test_path(file_path_str),
             )
             file_node.extra["notebook_format"] = "databricks_py"
             return [file_node], []
@@ -3854,7 +4132,7 @@ class CodeParser:
         statements = _vbnet_logical_lines(cleaned)
         file_path = normalize_file_path(path)
         line_count = text.count("\n") + 1
-        test_file = _is_test_file(file_path)
+        test_file = self._is_test_path(file_path)
 
         nodes = [NodeInfo(
             kind="File",
@@ -4095,7 +4373,7 @@ class CodeParser:
                 key = ((scope or "").casefold(), name.casefold())
                 member_index = member_nodes.get(key)
                 if member_index is None:
-                    is_test = _is_test_function(name, file_path)
+                    is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
                     extra = {"vbnet_kind": member_kind}
                     if type_params:
                         extra["vbnet_type_parameters"] = type_params
@@ -4275,7 +4553,7 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
         is_interface = path.suffix.lower() == ".resi"
 
         # Strip comments and string/backtick literal content so downstream
@@ -4367,7 +4645,7 @@ class CodeParser:
             if not is_top_level(off, parent):
                 continue  # nested local `let` — not a structural node
             line_start = offset_to_line(off)
-            is_test_fn = _is_test_function(name, file_path_str)
+            is_test_fn = _is_test_function(name, file_path_str, repo_root=self._repo_root)
             let_entries.append({
                 "name": name,
                 "start_off": off,
@@ -4682,7 +4960,7 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
@@ -7858,7 +8136,7 @@ class CodeParser:
             )
             if fn_name is None:
                 return False
-            is_test = _is_test_function(fn_name, file_path)
+            is_test = _is_test_function(fn_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(fn_name, file_path, enclosing_class)
             nodes.append(NodeInfo(
@@ -8856,7 +9134,7 @@ class CodeParser:
             if lhs is not None and lhs.type == "call_expression":
                 name = self._julia_short_func_name(lhs)
                 if name:
-                    is_test = _is_test_function(name, file_path, ())
+                    is_test = _is_test_function(name, file_path, (), repo_root=self._repo_root)
                     kind = "Test" if is_test else "Function"
                     lexical_parent = self._julia_scope_join(
                         enclosing_class, enclosing_func,
@@ -9281,7 +9559,7 @@ class CodeParser:
         # Check for anonymous function: local foo = function(...) end
         for expr in expr_list.children:
             if expr.type == "function_definition":
-                is_test = _is_test_function(var_name, file_path)
+                is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
                 kind = "Test" if is_test else "Function"
                 qualified = self._qualify(var_name, file_path, enclosing_class)
                 params = self._get_params(expr, language, source)
@@ -9362,7 +9640,7 @@ class CodeParser:
         if not table_name or not method_name:
             return False
 
-        is_test = _is_test_function(method_name, file_path)
+        is_test = _is_test_function(method_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(method_name, file_path, table_name)
         params = self._get_params(child, language, source)
@@ -9524,7 +9802,7 @@ class CodeParser:
         if not name:
             return False
 
-        is_test = _is_test_function(name, file_path)
+        is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(name, file_path, enclosing_class)
 
@@ -9849,7 +10127,7 @@ class CodeParser:
             if not var_name or not func_node:
                 continue
 
-            is_test = _is_test_function(var_name, file_path)
+            is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(var_name, file_path, enclosing_class)
             params = self._get_params(func_node, language, source)
@@ -9921,7 +10199,7 @@ class CodeParser:
         if not prop_name or not func_node:
             return False
 
-        is_test = _is_test_function(prop_name, file_path)
+        is_test = _is_test_function(prop_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(prop_name, file_path, enclosing_class)
         params = self._get_params(func_node, language, source)
@@ -10029,7 +10307,7 @@ class CodeParser:
         if member_name is None:
             return False
 
-        is_test = _is_test_function(member_name, file_path)
+        is_test = _is_test_function(member_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(member_name, file_path, enclosing_class)
         params = self._get_params(right, language, source)
@@ -11587,12 +11865,12 @@ class CodeParser:
         if deco_list:
             decorators = tuple(deco_list)
 
-        is_test = _is_test_function(name, file_path, decorators)
+        is_test = _is_test_function(name, file_path, decorators, repo_root=self._repo_root)
         # PHPUnit's name convention is ``test*`` (not only ``test_*``).
         if (
             language == "php"
             and child.type == "method_declaration"
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and name.startswith("test")
         ):
             is_test = True
@@ -11940,7 +12218,7 @@ class CodeParser:
         if (
             call_name
             and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and call_name not in _TEST_RUNNER_NAMES
         ):
             effective_call_name = (
@@ -11951,7 +12229,7 @@ class CodeParser:
         if (
             effective_call_name
             and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and effective_call_name in _TEST_RUNNER_NAMES
         ):
             test_desc = self._get_test_description(child, source)
@@ -18502,7 +18780,7 @@ class CodeParser:
 
         if right.type == "function_definition" and left.type == "identifier":
             name = left.text.decode("utf-8", errors="replace")
-            is_test = _is_test_function(name, file_path)
+            is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(name, file_path, enclosing_class)
             params = self._get_params(right, language, source)
