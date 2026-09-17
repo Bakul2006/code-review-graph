@@ -1183,7 +1183,10 @@ class TestInterruption:
         assert _metadata(db, "git_head_sha") is not None
         assert counts["fts_hits"] == 0
         assert counts["flows"] == 0
-        assert _metadata(db, "build_state") == "in-progress"
+        # Every file was stored, so the marker records the narrower failure:
+        # derived data outstanding, not files missing. Which one it is decides
+        # whether a hand repair can finish the graph.
+        assert _metadata(db, "build_state") == "postprocess-pending"
 
         status = _crg("status", "--repo", str(repo), env=env)
         assert status.returncode == 0
@@ -1207,6 +1210,89 @@ class TestInterruption:
         after = _counts(db)
         assert after["fts_hits"] > 0, "FTS index still empty after update"
         assert after["flows"] > 0, "flows still missing after update"
+
+    def test_a_hand_repair_of_a_stored_graph_clears_the_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """``postprocess`` finishes the build it can finish, and says so.
+
+        Killed after the last file was stored, the graph's contents are whole
+        and only the derived data is missing. That is the one state
+        ``code-review-graph postprocess`` exists to repair. Clearing the
+        marker afterwards is not a courtesy: leaving it set would promote
+        every later update to a full rebuild of a graph that is already right.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 24)
+        env = _isolated_env(home, serial=True)
+
+        _kill_during_build("after_anchor", repo, env)
+        db = _db_path(repo)
+        counts = _counts(db)
+        # Canaries: every file landed, and the derived data really is missing,
+        # so the repair below repairs something.
+        assert counts["files"] == 24
+        assert counts["nodes"] == 24 * 4
+        assert counts["fts_hits"] == 0
+        # The marker distinguishes this from a build that never stored the
+        # graph, which is what makes the repair below legitimate.
+        assert _metadata(db, "build_state") == "postprocess-pending"
+
+        repaired = _crg("postprocess", "--repo", str(repo), env=env)
+        assert repaired.returncode == 0, repaired.stderr
+        after = _counts(db)
+        assert after["fts_hits"] > 0, "FTS index still empty after postprocess"
+        assert after["flows"] > 0, "flows still missing after postprocess"
+        assert _metadata(db, "build_state") == "complete", (
+            "a genuine repair could not clear the marker it exists to clear"
+        )
+
+        status = _crg("status", "--repo", str(repo), env=env)
+        assert "INCOMPLETE" not in status.stdout
+
+    def test_postprocess_cannot_clear_a_build_that_never_stored_the_graph(
+        self, tmp_path: Path
+    ) -> None:
+        """The other direction: derived data over missing files is not health.
+
+        Killed mid-parse, the graph holds a handful of files out of 24. Every
+        post-processing stage reads the stored nodes, so all of them succeed
+        and none of them can notice: flows, communities and a search index get
+        rebuilt, correctly, for a graph that is missing most of the
+        repository. Clearing the marker there hands back a half-built graph
+        labelled healthy, which is the exact failure the marker was added to
+        prevent, reached from the repair side.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 24)
+        env = _isolated_env(home, serial=True)
+
+        _kill_during_build("parse", repo, env)
+        db = _db_path(repo)
+        partial = _counts(db)
+        # Canary: it stored something, and it is genuinely short of the repo.
+        assert partial["nodes"] > 0
+        assert 0 < partial["files"] < 24
+        assert _metadata(db, "build_state") == "in-progress"
+
+        ran = _crg("postprocess", "--repo", str(repo), env=env)
+        assert ran.returncode == 0, ran.stderr
+        assert _metadata(db, "build_state") == "in-progress", (
+            "postprocess declared a graph with missing files complete"
+        )
+        # And it is not reported as a repair that worked.
+        assert "INCOMPLETE" in ran.stdout, ran.stdout
+
+        # The graph still says what it is, and the repair that works is still
+        # the one offered.
+        status = _crg("status", "--repo", str(repo), env=env)
+        assert "INCOMPLETE" in status.stdout
+        assert _counts(db)["files"] < 24
+
+        rebuilt = _crg("build", "--repo", str(repo), env=env)
+        assert rebuilt.returncode == 0, rebuilt.stderr
+        assert _counts(db)["files"] == 24
+        assert _metadata(db, "build_state") == "complete"
 
 
 # ---------------------------------------------------------------------------
@@ -1899,7 +1985,10 @@ class TestErrorClassification:
         # marker, which is the behaviour this must not have broken.
         contended = _run_poisoned(_POISONED_BUILD, repo, "database is locked", env)
         assert contended["postprocess_contended"] is True
-        assert _metadata(db, "build_state") == "in-progress"
+        # The files were all stored before the poisoned stage ran, so the
+        # marker holds at the post-processing state rather than claiming the
+        # graph is missing files.
+        assert _metadata(db, "build_state") == "postprocess-pending"
 
     def test_hand_repair_clears_the_marker_despite_a_warning(
         self, tmp_path: Path
@@ -1917,8 +2006,11 @@ class TestErrorClassification:
         env = _isolated_env(home)
         db = _db_path(repo)
         assert _crg("build", "--repo", str(repo), env=env).returncode == 0
-        _set_metadata(db, "build_state", "in-progress")
-        assert _metadata(db, "build_state") == "in-progress"  # canary
+        # The state a build that stored every file and then died leaves: the
+        # graph's contents are whole, its derived data is not. That is the
+        # state this command exists to clear.
+        _set_metadata(db, "build_state", "postprocess-pending")
+        assert _metadata(db, "build_state") == "postprocess-pending"  # canary
 
         result = _run_poisoned(
             _POISONED_POSTPROCESS, repo, "no such column: bogus", env
@@ -1929,12 +2021,12 @@ class TestErrorClassification:
         )
 
         # Contention is still the one reason to leave the repair unfinished.
-        _set_metadata(db, "build_state", "in-progress")
+        _set_metadata(db, "build_state", "postprocess-pending")
         contended = _run_poisoned(
             _POISONED_POSTPROCESS, repo, "database is locked", env
         )
         assert contended["warnings"]
-        assert _metadata(db, "build_state") == "in-progress"
+        assert _metadata(db, "build_state") == "postprocess-pending"
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..build_state import (
+    BUILD_COMPLETE,
+    BUILD_IN_PROGRESS,
+    BUILD_STATE_KEY,
+    INCOMPLETE_BUILD_STATES,
+    advance_to_postprocess_pending,
+    graph_contents_are_complete,
+    read_build_state,
+)
 from ..incremental import (
     full_build,
     incremental_update,
@@ -18,26 +27,21 @@ from ._common import _get_store
 
 logger = logging.getLogger(__name__)
 
-# Written before anything is stored and cleared only once post-processing has
-# finished.  Freshness metadata alone cannot express "half built": ``full_build``
-# records ``last_updated`` and the VCS anchor as soon as the last file is
-# stored, so a process killed between that point and post-processing left a
-# graph with every node in place, a current anchor, an empty FTS index and no
-# flows — and the next ``update`` read the anchor, reported "no changes" and
-# repaired nothing.  This marker is the evidence that the previous run did not
-# finish; :func:`build_or_update_graph` promotes the next run to a full rebuild
-# when it finds one.
-BUILD_STATE_KEY = "build_state"
-BUILD_IN_PROGRESS = "in-progress"
-BUILD_COMPLETE = "complete"
+# The build-state vocabulary is imported above rather than defined here:
+# ``full_build`` has to advance it as soon as the last file is stored, and it
+# cannot import this module without a cycle. See
+# :mod:`code_review_graph.build_state` for what each state means.
 
 
 def build_was_interrupted(store: Any) -> bool:
-    """True when the previous build died before it finished post-processing."""
-    try:
-        return str(store.get_metadata(BUILD_STATE_KEY) or "") == BUILD_IN_PROGRESS
-    except sqlite3.Error:  # pragma: no cover - defensive
-        return False
+    """True when the previous build died before it finished post-processing.
+
+    Both incomplete states answer yes: a build that never stored every file
+    and a build that stored them all but left the derived data unbuilt are
+    each a graph whose freshness metadata overstates it.  What separates them
+    is which repair works, which is :func:`graph_contents_are_complete`.
+    """
+    return read_build_state(store) in INCOMPLETE_BUILD_STATES
 
 
 def _run_embedding_refresh(
@@ -733,6 +737,15 @@ def build_or_update_graph(
                 "summary": summary,
             }
 
+        # Every file that could be stored is stored, so what is still
+        # outstanding is derived data alone. Recording that distinction here is
+        # what lets an explicit ``postprocess`` tell a graph it can genuinely
+        # repair from one whose files never all landed. ``full_build`` already
+        # advances it before writing the anchor, so a kill in the gap between
+        # the two is on the right side of the line; this covers the
+        # incremental path and is a no-op when the state is already advanced.
+        advance_to_postprocess_pending(store)
+
         # Pass changed_files for incremental flow/community detection
         changed = result.get("changed_files") if not full_rebuild else None
         warnings = _run_postprocess(
@@ -795,6 +808,12 @@ def run_postprocess(
     warnings: list[str] = []
 
     try:
+        # Read before anything runs: the stages below rebuild derived data
+        # from whatever nodes are stored, and none of them can put back a file
+        # the interrupted build never parsed.
+        state_before = read_build_state(store)
+        graph_complete = graph_contents_are_complete(state_before)
+
         try:
             resolved = store.resolve_bare_call_targets()
             resolved += store.resolve_bare_tested_by_sources()
@@ -897,15 +916,39 @@ def run_postprocess(
             "last_postprocessed_at",
             time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
-        # An explicit postprocess run is how a half-built graph is repaired by
-        # hand, so it clears the interrupted-build marker.  Only real write-lock
-        # contention holds it back: that stage has to be redone by a later run.
-        # Requiring an empty warning list instead meant a repair could never
-        # clear the marker for the failures that make people reach for it in
-        # the first place, such as an optional dependency that is not installed.
-        if not result.get("postprocess_contended"):
-            store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
-        result["summary"] = "Post-processing complete."
+        # The marker clears when, and only when, post-processing finished over
+        # a graph that holds every file.  Two conditions, both explicit:
+        #
+        # * The build that stored the graph got as far as storing all of it.
+        #   An explicit postprocess is the hand repair for a build that died
+        #   after that point, and must be able to finish it. Refusing on any
+        #   warning meant it could not repair the very failures people reach
+        #   for it to repair.  But it cannot conjure back files a dead build
+        #   never parsed, so over an ``in-progress`` graph it is not a repair
+        #   at all: the derived data it writes is complete for a graph that is
+        #   missing files, and calling that healthy is the same lie from the
+        #   other side.
+        # * No stage lost the SQLite write lock.  Contention is transient and
+        #   the lost stage has to be redone, so the marker stays set for it.
+        if not graph_complete:
+            warning = (
+                "The last build stopped before every file was stored, so the "
+                "graph is still incomplete. Post-processing rebuilt what it "
+                "could from the stored nodes; run 'code-review-graph build' "
+                "to finish the graph itself."
+            )
+            logger.warning(warning)
+            warnings.append(warning)
+            result["build_incomplete"] = True
+            result["status"] = "partial"
+            result["summary"] = (
+                "Post-processing ran, but the graph is missing files from an "
+                "unfinished build. Run a full build to repair it."
+            )
+        else:
+            if not result.get("postprocess_contended"):
+                store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
+            result["summary"] = "Post-processing complete."
         if warnings:
             result["warnings"] = warnings
         return result

@@ -22,6 +22,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
+from .build_state import advance_to_postprocess_pending
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
 
@@ -1539,6 +1540,11 @@ def full_build(
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     _store_cpp_identity_pending(store, cpp_errors)
+    # Storing is over: every file that could be parsed has its rows. Recorded
+    # before the anchor and before post-processing, so a process killed from
+    # here on leaves a graph that ``postprocess`` can genuinely finish, told
+    # apart from one killed mid-parse that only a build can repair.
+    advance_to_postprocess_pending(store)
     # Failed files are reported in ``errors`` and simply hold no rows; the
     # anchor still describes the commit the stored files were parsed at.
     _store_vcs_metadata(repo_root, store)
@@ -1840,6 +1846,9 @@ def incremental_update(
         store.set_metadata("last_build_type", "incremental")
         if not remaining_identity:
             store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+        # Same point as in ``full_build``: the changed files are stored, so a
+        # kill from here leaves only derived data to rebuild.
+        advance_to_postprocess_pending(store)
         freshness_advanced = _store_vcs_metadata(repo_root, store)
         store.commit()
 

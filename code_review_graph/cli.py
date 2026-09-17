@@ -1699,6 +1699,16 @@ def _dispatch() -> None:
             if result.get("fts_indexed"):
                 parts.append(f"{result['fts_indexed']} FTS entries")
             print(f"Post-processing: {', '.join(parts) or 'done'}")
+            if result.get("build_incomplete"):
+                # Post-processing rebuilt derived data for the nodes that are
+                # stored, which is not the same as a repaired graph: the build
+                # that stored them never finished, so files are still missing.
+                print(
+                    "Build state: INCOMPLETE - the last build stopped before "
+                    "every file was stored, so files are still missing from "
+                    "the graph. Post-processing cannot add them. Run "
+                    "'code-review-graph build' to rebuild."
+                )
         finally:
             store.close()
         return
@@ -1958,10 +1968,12 @@ def _dispatch() -> None:
                         print(panel)
 
         elif args.command == "status":
+            from .build_state import BUILD_IN_PROGRESS, read_build_state
             from .tools.build import build_was_interrupted
 
             stats = store.get_stats()
             interrupted = build_was_interrupted(store)
+            files_missing = read_build_state(store) == BUILD_IN_PROGRESS
             stored_branch = store.get_metadata("git_branch")
             stored_sha = store.get_metadata("git_head_sha")
             from .incremental import _git_branch_info, detect_vcs
@@ -1996,7 +2008,16 @@ def _dispatch() -> None:
                 print(f"Files: {stats.files_count}")
                 print(f"Languages: {', '.join(stats.languages)}")
                 print(f"Last updated: {stats.last_updated or 'never'}")
-                if interrupted:
+                if interrupted and files_missing:
+                    # Nothing derived can put back a file that was never
+                    # parsed, so this one names the repair that works.
+                    print(
+                        "Build state: INCOMPLETE - the last build stopped "
+                        "before every file was stored, so files are missing "
+                        "from the graph. Run 'code-review-graph build' to "
+                        "rebuild it."
+                    )
+                elif interrupted:
                     # The nodes can all be present and the graph still be a
                     # half-built one: search and flows are derived afterwards.
                     print(
