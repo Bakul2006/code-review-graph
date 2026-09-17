@@ -658,6 +658,26 @@ class GraphStore:
         row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def get_repo_root(self) -> Optional[str]:
+        """Absolute root of the repository this graph describes, if known.
+
+        ``file_path`` values are absolute, so any consumer that reads a path
+        convention out of them (``tests/``, ``src/test/``) has to know where
+        the repository starts, or it reads the directories above the checkout
+        instead. Builds record the root; for a graph built before they did,
+        the default database location ``<root>/.code-review-graph/graph.db``
+        gives the same answer. ``None`` means neither applies, and callers
+        must degrade explicitly rather than assume the whole path is inside
+        the repository.
+        """
+        recorded = self.get_metadata("repo_root")
+        if recorded:
+            return recorded
+        parent = self.db_path.parent
+        if parent.name == ".code-review-graph":
+            return str(parent.parent)
+        return None
+
     def has_nodes(self) -> bool:
         row = self._conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchone()
         return row is not None
