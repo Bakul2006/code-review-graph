@@ -28,7 +28,12 @@ from pathlib import Path
 
 import pytest
 
-from code_review_graph.graph import GraphStore, import_scope_ancestors
+from code_review_graph.graph import (
+    IMPACT_FRONTIER_DIRS_SQL,
+    GraphStore,
+    _impact_candidate_sql,
+    import_scope_ancestors,
+)
 from code_review_graph.incremental import full_build, incremental_update
 from code_review_graph.tools.query import get_impact_radius, query_graph
 
@@ -363,3 +368,70 @@ class TestScopeAncestors:
         entries = import_scope_ancestors("/repo/pkg/core/core.go")
         assert entries[0] == ("/repo/pkg/core", ("package", "tree"))
         assert all(scopes == ("tree",) for _dir, scopes in entries[1:])
+
+
+class TestTraversalQueryPlan:
+    """The directory branch must be an index seek, not a rescan.
+
+    Left to itself SQLite drove this branch from the covering index on
+    ``kind`` alone and rescanned every IMPORTS_FROM row once per frontier
+    directory: 18 seconds of a 19-second kubernetes traversal, against 1.5
+    with the plan pinned by CROSS JOIN and INDEXED BY. A token budget cannot
+    catch that, and neither can a small fixture -- only the plan can.
+    """
+
+    def _plan(self, store: GraphStore, sql: str) -> list[str]:
+        conn = store._conn
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_frontier "
+            "(node_qn TEXT PRIMARY KEY, score REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_next "
+            "(node_qn TEXT PRIMARY KEY, score REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_frontier_dirs "
+            "(dir TEXT PRIMARY KEY, score REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_policies "
+            "(kind TEXT PRIMARY KEY, weight REAL NOT NULL, "
+            "direction TEXT NOT NULL)"
+        )
+        params = (
+            (0.5, 0.6, "incoming", "outgoing", 0.5, 0.6, "incoming",
+             "incoming", 0.5, 0.6, "incoming", "incoming", 0.05)
+            if "?" in sql else ()
+        )
+        return [
+            row["detail"]
+            for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+        ]
+
+    def test_the_directory_branch_seeks_on_the_target(self, tmp_path):
+        repo = _go_repo(tmp_path, members=2, importers=2)
+        _init_repo(repo)
+        store = _build(repo)
+        try:
+            plan = self._plan(store, _impact_candidate_sql(""))
+        finally:
+            store.close()
+        seeks = [
+            line for line in plan
+            if "idx_edges_target_kind" in line and "target_qualified=?" in line
+        ]
+        assert seeks, f"directory branch is not an index seek: {plan}"
+
+    def test_the_frontier_directories_are_driven_by_the_frontier(self, tmp_path):
+        """Not by every File node in the graph, which was the same defect."""
+        repo = _go_repo(tmp_path, members=2, importers=2)
+        _init_repo(repo)
+        store = _build(repo)
+        try:
+            plan = self._plan(store, IMPACT_FRONTIER_DIRS_SQL)
+        finally:
+            store.close()
+        assert not any(
+            "SCAN n" in line or "idx_nodes_kind" in line for line in plan
+        ), f"frontier directories scan the nodes table: {plan}"

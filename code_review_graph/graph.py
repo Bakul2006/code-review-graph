@@ -302,6 +302,71 @@ def import_scope_ancestors(file_path: str) -> list[tuple[str, tuple[str, ...]]]:
     return out
 
 
+#: Fills ``_impact_frontier_dirs`` with the package directory of every File
+#: node on the frontier, once per hop. CROSS JOIN drives it from the frontier,
+#: which is small, rather than from every File node in the graph.
+IMPACT_FRONTIER_DIRS_SQL = """
+INSERT INTO _impact_frontier_dirs (dir, score)
+SELECT dir, MAX(score) FROM (
+    SELECT crg_parent_dir(n.file_path) AS dir, f.score AS score
+    FROM _impact_frontier f
+    CROSS JOIN nodes n
+      ON n.qualified_name = f.node_qn AND n.kind = 'File'
+)
+WHERE dir IS NOT NULL
+GROUP BY dir
+"""
+
+
+def _impact_candidate_sql(resolution_guard: str) -> str:
+    """One hop of the impact relaxation.
+
+    *resolution_guard* is either the empty string or a fixed predicate chosen
+    by a validated enum; no caller value reaches the SQL text.
+
+    The third branch is the directory-scoped one. A Go import names a
+    package, so its edge targets the file's DIRECTORY rather than the file,
+    and expanding it here -- at every hop, without spending one -- is what
+    one edge per import buys: the alternative is one edge per file in the
+    package, which on kubernetes is 73,507 edges for a single directory.
+
+    ``CROSS JOIN`` and ``INDEXED BY`` pin that branch to one index seek per
+    frontier package. Left to itself SQLite drove it from the covering index
+    on ``kind`` alone and rescanned every IMPORTS_FROM row once per
+    directory: 18 seconds of a 19-second kubernetes traversal, against 1.5
+    with the plan pinned. ``tests/test_import_scope.py`` asserts the plan.
+    """
+    return f"""
+    INSERT INTO _impact_next (node_qn, score)
+    SELECT node_qn, MAX(score)
+    FROM (
+        SELECT e.target_qualified AS node_qn,
+               f.score * COALESCE(p.weight, ?) * ? AS score
+        FROM _impact_frontier f
+        JOIN edges e ON e.source_qualified = f.node_qn
+        LEFT JOIN _impact_policies p ON p.kind = e.kind
+        WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
+        UNION ALL
+        SELECT e.source_qualified AS node_qn,
+               f.score * COALESCE(p.weight, ?) * ? AS score
+        FROM _impact_frontier f
+        JOIN edges e ON e.target_qualified = f.node_qn
+        LEFT JOIN _impact_policies p ON p.kind = e.kind
+        WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
+        UNION ALL
+        SELECT e.source_qualified AS node_qn,
+               d.score * COALESCE(p.weight, ?) * ? AS score
+        FROM _impact_frontier_dirs d
+        CROSS JOIN edges e INDEXED BY idx_edges_target_kind
+          ON e.target_qualified = d.dir AND e.kind = 'IMPORTS_FROM'
+        LEFT JOIN _impact_policies p ON p.kind = e.kind
+        WHERE COALESCE(p.direction, ?) = ?
+    ) candidates
+    WHERE score > ?
+    GROUP BY node_qn
+    """  # noqa: S608
+
+
 # ---------------------------------------------------------------------------
 # GraphStore
 # ---------------------------------------------------------------------------
@@ -2215,47 +2280,7 @@ class GraphStore:
             "SELECT qn, 1.0 FROM _impact_seeds"
         )
 
-        # ``resolution_guard`` is either the empty string or a fixed predicate
-        # chosen by a validated enum; no caller value reaches the SQL text.
-        candidate_sql = f"""
-        INSERT INTO _impact_next (node_qn, score)
-        SELECT node_qn, MAX(score)
-        FROM (
-            SELECT e.target_qualified AS node_qn,
-                   f.score * COALESCE(p.weight, ?) * ? AS score
-            FROM _impact_frontier f
-            JOIN edges e ON e.source_qualified = f.node_qn
-            LEFT JOIN _impact_policies p ON p.kind = e.kind
-            WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
-            UNION ALL
-            SELECT e.source_qualified AS node_qn,
-                   f.score * COALESCE(p.weight, ?) * ? AS score
-            FROM _impact_frontier f
-            JOIN edges e ON e.target_qualified = f.node_qn
-            LEFT JOIN _impact_policies p ON p.kind = e.kind
-            WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
-            UNION ALL
-            -- A Go import names a package, so its edge targets the file's
-            -- DIRECTORY rather than the file. Expanding it here, at every
-            -- hop, is what one edge per import buys: the alternative is one
-            -- edge per file in the package, which on kubernetes is 73,507
-            -- edges for a single directory. The directories come from
-            -- _impact_frontier_dirs, filled just above. CROSS JOIN and
-            -- INDEXED BY pin the plan to one seek per frontier package:
-            -- left to itself SQLite drove this from the covering index on
-            -- kind alone and rescanned every IMPORTS_FROM row per directory
-            -- (18s of a 19s kubernetes traversal).
-            SELECT e.source_qualified AS node_qn,
-                   d.score * COALESCE(p.weight, ?) * ? AS score
-            FROM _impact_frontier_dirs d
-            CROSS JOIN edges e INDEXED BY idx_edges_target_kind
-              ON e.target_qualified = d.dir AND e.kind = 'IMPORTS_FROM'
-            LEFT JOIN _impact_policies p ON p.kind = e.kind
-            WHERE COALESCE(p.direction, ?) = ?
-        ) candidates
-        WHERE score > ?
-        GROUP BY node_qn
-        """  # noqa: S608
+        candidate_sql = _impact_candidate_sql(resolution_guard)
         candidate_params = (
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
@@ -2271,21 +2296,10 @@ class GraphStore:
             IMPACT_DIRECTION_INCOMING,
             IMPACT_SCORE_FLOOR,
         )
-        frontier_dirs_sql = """
-        INSERT INTO _impact_frontier_dirs (dir, score)
-        SELECT dir, MAX(score) FROM (
-            SELECT crg_parent_dir(n.file_path) AS dir, f.score AS score
-            FROM _impact_frontier f
-            CROSS JOIN nodes n
-              ON n.qualified_name = f.node_qn AND n.kind = 'File'
-        )
-        WHERE dir IS NOT NULL
-        GROUP BY dir
-        """
         for _ in range(max_depth):
             self._conn.execute("DELETE FROM _impact_next")
             self._conn.execute("DELETE FROM _impact_frontier_dirs")
-            self._conn.execute(frontier_dirs_sql)
+            self._conn.execute(IMPACT_FRONTIER_DIRS_SQL)
             self._conn.execute(candidate_sql, candidate_params)
             self._conn.execute(
                 "DELETE FROM _impact_next "
