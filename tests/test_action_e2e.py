@@ -1188,9 +1188,13 @@ def test_hostile_symbol_is_neutralised(hostile_comment: str):
         max(0, raw_tag.start() - 40) : raw_tag.end() + 40
     ]
     assert "\\<img src=x onerror=alert(1)\\>" in hostile_comment, "content is kept"
-    # No markdown link survives either; the URL is left as inert text.
+    # No markdown link survives either; the URL is left as inert text. The
+    # assertion carries the escaped brackets rather than the bare URL on
+    # purpose: a containment test against a literal that is a whole URL by
+    # itself is CodeQL's py/incomplete-url-substring-sanitization pattern,
+    # and tests/test_codeql_url_substring.py keeps it out of this repository.
     assert "[click](https://attacker.invalid)" not in hostile_comment
-    assert "https://attacker.invalid" in hostile_comment, "the text stays readable"
+    assert "\\[click\\](https://attacker.invalid)" in hostile_comment, "kept, inert"
     links = re.findall(r"(?<!\\)\[[^\]\\]+\]\(([^)]+)\)", hostile_comment)
     assert links == ["https://github.com/tirth8205/code-review-graph"], links
     # Backticks are escaped, so the injected command never becomes code.
