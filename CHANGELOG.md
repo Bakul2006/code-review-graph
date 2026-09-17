@@ -62,10 +62,18 @@
   `imports_of` reports `import_target_kind`, and the impact traversal
   follows a package target at every hop without spending one. Emitting an
   edge per member file instead would make the edge count grow with imports
-  times package size: 73,507 edges for one imported kubernetes package, a
-  35% larger database, and an incremental update that disagrees with a
-  rebuild, because an edge's targets then depend on which files were in the
-  package when the importing file happened to be parsed.
+  times package size. On kubernetes/kubernetes that was 588,972 edges for
+  93,624 import statements (73,507 of them for a single imported package),
+  a 28% larger database, 525s of build time against 129s, and an
+  incremental update that disagrees with a rebuild by 2,648 edge rows on
+  one added file, because an edge's targets then depend on which files were
+  in the package when the importing file happened to be parsed.
+- The impact traversal's directory branch is pinned to an index seek on
+  `(target_qualified, kind)`. Left to itself SQLite drove it from the
+  covering index on `kind` alone and rescanned every `IMPORTS_FROM` row once
+  per frontier directory, which was 18 seconds of a 19-second kubernetes
+  traversal; pinned it is 1.8s, against 6.5s for the same answer under the
+  per-file fan-out. `tests/test_import_scope.py` asserts the plan.
 - No import edge names a path the build does not index. 73,507 kubernetes
   import edges named files under `vendor/`, which `**/vendor/**` excludes,
   so every one of them was a confident-looking path that matched no node.
