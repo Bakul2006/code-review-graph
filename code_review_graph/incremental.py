@@ -829,6 +829,11 @@ def _decode_name_status_paths(output: bytes) -> list[str]:
 
 def _store_vcs_metadata(repo_root: Path, store: "GraphStore") -> bool:
     """Persist VCS branch/revision info and report whether its anchor was stored."""
+    # The root the stored absolute ``file_path`` values were built from.
+    # Consumers that read a path convention out of a file path (``tests/``,
+    # ``src/test/``) need it to know where the repository starts; without it
+    # they would read the directories above the checkout. See #1023.
+    store.set_metadata("repo_root", str(repo_root))
     vcs = detect_vcs(repo_root)
     if vcs == "git":
         branch, sha = _git_branch_info(repo_root)
