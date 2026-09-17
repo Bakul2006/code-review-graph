@@ -12,14 +12,16 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
 import sys
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
+from . import jsonc
 from ._legacy_instructions import LEGACY_INSTRUCTION_SECTIONS
 
 logger = logging.getLogger(__name__)
@@ -401,12 +403,43 @@ def _build_server_entry(
 
 
 # Fields an MCP entry written by this project has ever carried. An entry
-# holding anything else (``env``, ``url``, ``disabled``, ``autoApprove``, ...)
-# was shaped by hand and is never rewritten.
-_GENERATED_ENTRY_FIELDS = frozenset({"name", "type", "command", "args", "cwd", "tools"})
+# holding anything else (``url``, ``disabled``, ``autoApprove``, ...) was
+# shaped by hand and is never rewritten.
+_GENERATED_ENTRY_FIELDS = frozenset(
+    {"name", "type", "command", "args", "cwd", "tools", "env"}
+)
 
-# Both spellings this project has ever used on a command line.
-_SERVER_LAUNCH_TOKENS = frozenset({"code-review-graph", "code_review_graph"})
+# ``type`` values this project writes. A user pointing the same name at an
+# ``sse`` or ``http`` transport wrote that entry themselves.
+_GENERATED_ENTRY_TYPES = frozenset({"stdio", "local"})
+
+# Every argument vector a release of this project has written after the
+# launcher, mapped to the launcher basenames allowed to carry it. Matching the
+# whole vector is the boundary: a hand-tuned
+# ``uv run --project <path> code-review-graph serve`` (the shape the
+# troubleshooting guide asks people to write) is not in this table, so the
+# ``--project`` flag someone added survives a reinstall.
+_GENERATED_SERVE_ARGV: dict[tuple[str, ...], frozenset[str]] = {
+    # ``uvx code-review-graph serve``
+    ("code-review-graph", "serve"): frozenset({"uvx"}),
+    # ``code-review-graph serve``
+    ("serve",): frozenset({"code-review-graph"}),
+    # ``poetry run ...`` / ``uv run ...``
+    ("run", "code-review-graph", "serve"): frozenset({"poetry", "uv"}),
+    # ``<interpreter> -m code_review_graph serve``
+    ("-m", "code_review_graph", "serve"): frozenset({"python"}),
+}
+
+# ``python``, ``python3``, ``python3.12``, ``pythonw`` and nothing else.
+_PYTHON_LAUNCHER_RE = re.compile(r"\Apythonw?[0-9]*(?:\.[0-9]+)*\Z")
+
+
+def _launcher_basename(token: str) -> str:
+    """Return the bare program name of a command token, without ``.exe``."""
+    name = token.replace("\\", "/").rsplit("/", 1)[-1]
+    if name.lower().endswith(".exe"):
+        name = name[: -len(".exe")]
+    return name
 
 
 def _entry_command_tokens(entry: dict[str, Any]) -> list[str] | None:
@@ -427,25 +460,42 @@ def _entry_command_tokens(entry: dict[str, Any]) -> list[str] | None:
 def _is_generated_server_entry(entry: Any) -> bool:
     """Return True when ``entry`` is an MCP registration this project wrote.
 
-    Recognition is by shape, not by equality with the entry the running version
-    would write: an older release pinned an absolute interpreter path and a
-    checkout that no longer exists, and exactly that entry has to be replaced
-    rather than kept. Anything carrying a field this project never writes, or a
-    command that does not launch this server, counts as the user's own and is
-    left alone.
+    Recognition is by the exact shapes this project emits, not by equality with
+    the entry the running version would write: an older release pinned an
+    absolute interpreter path and a checkout that no longer exists, and exactly
+    that entry has to be replaced rather than kept. Everything else under our
+    name -- a field this project never writes, a transport it never uses, a
+    command line someone tuned by hand -- counts as the user's own and is left
+    alone. Mentioning ``code-review-graph`` somewhere on the command line is
+    not enough; the whole argument vector has to be one this project wrote.
     """
     if not isinstance(entry, dict):
         return False
     if not set(entry) <= _GENERATED_ENTRY_FIELDS:
         return False
+    if "type" in entry and entry["type"] not in _GENERATED_ENTRY_TYPES:
+        return False
+    if "tools" in entry and entry["tools"] != ["*"]:
+        return False
+    if "env" in entry and entry["env"] not in ([], {}):
+        # Releases before #616 wrote ``env: []`` for OpenCode; anything else in
+        # ``env`` is a value the user put there.
+        return False
     tokens = _entry_command_tokens(entry)
-    if not tokens or "serve" not in tokens:
+    if not tokens:
         return False
-    if not _SERVER_LAUNCH_TOKENS.intersection(tokens):
+    launcher, rest = tokens[0], tuple(tokens[1:])
+    # The only tail any release has appended is the repo pin (OpenCode folds
+    # the whole command line into ``command``).
+    if len(rest) >= 2 and rest[-2] == "--repo":
+        rest = rest[:-2]
+    launchers = _GENERATED_SERVE_ARGV.get(rest)
+    if launchers is None:
         return False
-    # Only the repo pin has ever followed ``serve`` (OpenCode folds it in).
-    trailing = tokens[tokens.index("serve") + 1 :]
-    return not trailing or (len(trailing) == 2 and trailing[0] == "--repo")
+    name = _launcher_basename(launcher)
+    if "python" in launchers:
+        return bool(_PYTHON_LAUNCHER_RE.match(name))
+    return name in launchers
 
 
 def _report_user_owned_entry(config_path: Path, label: str = "") -> None:
@@ -512,8 +562,14 @@ def _toml_header_matches(line: str, table_path: tuple[str, ...]) -> bool:
 def _toml_table_span(lines: list[str], table_path: tuple[str, ...]) -> tuple[int, int] | None:
     """Return the ``(start, end)`` line span of a TOML table, or None.
 
-    ``end`` stops just past the table's last non-blank line so blank separators
-    between tables survive a replacement.
+    ``end`` stops just past the table's last key line. The trailing run of
+    comment and blank lines before the next table header is deliberately left
+    outside the span: in TOML a comment sitting above ``[next.table]`` belongs
+    to that table, and swallowing it into the replaced region silently deletes
+    something the user wrote (``# DO NOT REMOVE`` above an unrelated server,
+    or a free-standing note at the end of the file). This project never writes
+    a comment inside its own table, so nothing of ours is stranded by stopping
+    early.
     """
     start = None
     for index, line in enumerate(lines):
@@ -525,9 +581,10 @@ def _toml_table_span(lines: list[str], table_path: tuple[str, ...]) -> tuple[int
     end = start + 1
     last_content = end
     while end < len(lines):
-        if lines[end].lstrip().startswith("["):
+        stripped = lines[end].strip()
+        if stripped.startswith("["):
             break
-        if lines[end].strip():
+        if stripped and not stripped.startswith("#"):
             last_content = end + 1
         end += 1
     return start, last_content
@@ -546,7 +603,8 @@ def _merge_toml_mcp_server(
     not survive a reinstall. A hand-written entry is never rewritten.
 
     Returns True when the file was (or would be) modified, False when no edit
-    is needed, and None when the edit was refused to avoid data loss.
+    is needed, and None when the edit was refused -- because it would lose
+    data, or because the table belongs to the user and only they can change it.
     """
     table_path = ("mcp_servers", server_name)
     section_lines = [f"[mcp_servers.{server_name}]"]
@@ -582,8 +640,9 @@ def _merge_toml_mcp_server(
             if current == server_entry:
                 return False
             if not _is_generated_server_entry(current):
+                # Not ours to rewrite, and not something to claim as installed.
                 _report_user_owned_entry(config_path)
-                return False
+                return None
             if span is None:
                 print(
                     f"  {config_path}: the existing [mcp_servers.{server_name}] table "
@@ -704,8 +763,9 @@ def _merge_yaml_mcp_server(
     result is re-parsed before writing so a malformed edit is never saved.
 
     Returns True when the file was (or would be) modified, False when the
-    entry is already present, and None when the edit was refused to avoid
-    data loss (the reason is printed).
+    entry is already present, and None when the edit was refused -- to avoid
+    data loss, or because the entry belongs to the user (the reason is
+    printed).
     """
     import yaml  # type: ignore[import-untyped]
 
@@ -741,8 +801,9 @@ def _merge_yaml_mcp_server(
             if current == server_entry:
                 return False
             if not _is_generated_server_entry(current):
+                # Not ours to rewrite, and not something to claim as installed.
                 _report_user_owned_entry(config_path)
-                return False
+                return None
             replacing = True
 
     lines = raw.splitlines(keepends=True)
@@ -897,6 +958,47 @@ def _strip_jsonc(text: str) -> str:
     return "".join(out)
 
 
+def _splice_commented_config(
+    raw: str,
+    server_key: str,
+    server_entry: dict[str, Any] | None,
+    removals: list[tuple[str, ...]],
+    *,
+    array_format: bool,
+    document: dict[str, Any],
+) -> str | None:
+    """Apply this install's edits to a JSONC file without losing its comments.
+
+    Parsing a commented config, mutating the dict and dumping it back deletes
+    every comment and every hand-made formatting choice in the file, which is a
+    silent loss of something the user wrote. Only the members this install
+    actually touches are spliced into the original text; everything else is
+    copied through byte for byte.
+
+    Returns None when the edit cannot be expressed as a splice, so the caller
+    can leave the file alone instead of flattening it. Array-shaped configs
+    (Continue) are refused for the same reason: this project has no positional
+    splice for them.
+    """
+    try:
+        if not jsonc.tokenize(raw):
+            # Comments but no JSON document yet (#344). A JSONC file may open
+            # with comments, so keep them above the config we write.
+            body = json.dumps(document, indent=2, ensure_ascii=False)
+            return raw.rstrip("\n") + "\n" + body + "\n"
+        if array_format:
+            return None
+        text = jsonc.remove_paths(raw, removals) if removals else raw
+        if server_entry is None:
+            return text
+        try:
+            return jsonc.set_member(text, (server_key, "code-review-graph"), server_entry)
+        except KeyError:
+            return jsonc.set_member(text, (server_key,), {"code-review-graph": server_entry})
+    except (ValueError, KeyError, IndexError, RecursionError):
+        return None
+
+
 def install_platform_configs(
     repo_root: Path,
     target: str = "all",
@@ -987,6 +1089,7 @@ def install_platform_configs(
 
         # Read existing config
         existing: dict[str, Any] = {}
+        raw = ""
         if config_path.exists():
             raw = config_path.read_text(encoding="utf-8", errors="replace")
             # Strip comments and trailing commas (JSONC compat for editors like
@@ -1031,6 +1134,11 @@ def install_platform_configs(
             )
             continue
 
+        # Paths this write removes, recorded so a commented file can be
+        # spliced instead of re-serialised.
+        removals: list[tuple[str, ...]] = []
+        wrote_entry = False
+
         if plat["format"] == "array":
             arr = existing.get(server_key, [])
             arr_entry = {"name": "code-review-graph", **server_entry}
@@ -1042,8 +1150,8 @@ def install_platform_configs(
             if ours:
                 current = arr[ours[0]]
                 if not _is_generated_server_entry(current):
+                    # Not ours to rewrite, so not ours to claim as installed.
                     _report_user_owned_entry(config_path, plat["name"])
-                    _record_configured(key, plat)
                     continue
                 if len(ours) == 1 and current == arr_entry:
                     print(f"  {plat['name']}: already configured in {config_path}")
@@ -1060,6 +1168,7 @@ def install_platform_configs(
             else:
                 arr = [*arr, arr_entry]
             existing[server_key] = arr
+            wrote_entry = True
         else:
             # Remove entries written under keys the client never read, then
             # install the validated entry under the current key.
@@ -1071,16 +1180,18 @@ def install_platform_configs(
                     and "code-review-graph" in legacy
                 ):
                     del legacy["code-review-graph"]
+                    removals.append((legacy_key, "code-review-graph"))
                     if not legacy:
                         del existing[legacy_key]
+                        removals[-1] = (legacy_key,)
                     migrated = True
             servers = existing.get(server_key, {})
             current = servers.get("code-review-graph")
-            if current is not None and not _is_generated_server_entry(current):
+            user_owned = current is not None and not _is_generated_server_entry(current)
+            if user_owned:
                 # Someone wrote this entry themselves; it is not ours to rewrite.
                 _report_user_owned_entry(config_path, plat["name"])
                 if not migrated:
-                    _record_configured(key, plat)
                     continue
             elif current == server_entry and not migrated:
                 print(f"  {plat['name']}: already configured in {config_path}")
@@ -1089,17 +1200,43 @@ def install_platform_configs(
             else:
                 servers["code-review-graph"] = server_entry
                 existing[server_key] = servers
+                wrote_entry = True
+
+        # Re-serialising a commented config deletes every comment in it, so a
+        # commented file is spliced instead. Computed before the dry-run branch
+        # so a dry run reports the same refusal a real run would.
+        spliced: str | None = None
+        if jsonc.has_comments(raw):
+            spliced = _splice_commented_config(
+                raw,
+                server_key,
+                server_entry if wrote_entry else None,
+                removals,
+                array_format=plat["format"] == "array",
+                document=existing,
+            )
+            if spliced is None:
+                print(
+                    f"  {plat['name']}: {config_path} keeps comments that this "
+                    f"installer cannot preserve through an edit — left "
+                    f"unchanged. Please add the MCP config manually."
+                )
+                continue
 
         if dry_run:
             print(f"  [dry-run] {plat['name']}: would write {config_path}")
         else:
             config_path.parent.mkdir(parents=True, exist_ok=True)
             config_path.write_text(
-                json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+                spliced
+                if spliced is not None
+                else json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
             )
             print(f"  {plat['name']}: configured {config_path}")
 
-        _record_configured(key, plat)
+        if wrote_entry:
+            _record_configured(key, plat)
 
     return configured
 
@@ -1402,7 +1539,13 @@ _GIT_HOOK_BLOCK = (
 # no longer be upgraded or removed cleanly. Each is matched by its full text,
 # which is the only boundary an unmarked block has.
 _LEGACY_GIT_HOOK_BLOCKS: tuple[str, ...] = (
-    # The first released hook, before the linked-worktree guard (#313).
+    # v2.2.3 - v2.3.2: detect-changes only, before the hook also ran an update.
+    f"{_GIT_HOOK_NOTE}\n"
+    "if command -v code-review-graph >/dev/null 2>&1; then\n"
+    "    code-review-graph detect-changes --brief || true\n"
+    "fi\n",
+    # v2.3.3 - v2.3.8: update plus detect-changes, before the linked-worktree
+    # guard (#313).
     f"{_GIT_HOOK_NOTE}\n"
     "if command -v code-review-graph >/dev/null 2>&1; then\n"
     "    code-review-graph update || true\n"
@@ -1420,6 +1563,30 @@ def _known_git_hook_blocks() -> tuple[str, ...]:
     never win the match and strand the tail.
     """
     return tuple(sorted(set(_LEGACY_GIT_HOOK_BLOCKS), key=len, reverse=True))
+
+
+def _git_hook_markers_balanced(text: str) -> bool:
+    """Return whether every begin marker in ``text`` has its own end marker.
+
+    A begin marker with no end marker after it, or a second begin marker
+    opening before the first one closes, means the block was hand-edited. There
+    is then no trustworthy boundary, so callers must refuse rather than guess
+    where the block stops.
+    """
+    begins = text.count(_GIT_HOOK_BEGIN_MARKER)
+    if begins != text.count(_GIT_HOOK_END_MARKER):
+        return False
+    cursor = 0
+    for _ in range(begins):
+        begin = text.find(_GIT_HOOK_BEGIN_MARKER, cursor)
+        closing = text.find(_GIT_HOOK_END_MARKER, begin)
+        if closing < 0:
+            return False
+        nested = text.find(_GIT_HOOK_BEGIN_MARKER, begin + len(_GIT_HOOK_BEGIN_MARKER))
+        if 0 <= nested < closing:
+            return False
+        cursor = closing + len(_GIT_HOOK_END_MARKER)
+    return True
 
 
 def _git_hook_block_span(text: str, start: int = 0) -> tuple[int, int] | None:
@@ -1446,8 +1613,13 @@ def _upgrade_git_hook_block(existing: str) -> str | None:
     """Return ``existing`` with a block we wrote replaced by the current one.
 
     Returns None when the hook carries our marker but no block this project
-    recognises, meaning it was hand-edited and must be left alone.
+    recognises, meaning it was hand-edited and must be left alone. An
+    unbalanced marker pair is one such case: falling through to the unmarked
+    matcher there would strip the body and leave the orphan marker line
+    sitting in the user's hook.
     """
+    if _GIT_HOOK_BEGIN_MARKER in existing and not _git_hook_markers_balanced(existing):
+        return None
     span = _git_hook_block_span(existing)
     if span is not None:
         begin, end = span
@@ -1512,6 +1684,13 @@ def install_git_hook(repo_root: Path) -> Path | None:
 
     if hook_path.exists():
         existing = hook_path.read_text(encoding="utf-8")
+        if _GIT_HOOK_BEGIN_MARKER in existing and not _git_hook_markers_balanced(existing):
+            logger.warning(
+                "%s has a code-review-graph begin marker with no matching end "
+                "marker; leaving it alone.",
+                hook_path,
+            )
+            return hook_path
         if _GIT_HOOK_BEGIN_MARKER in existing or _GIT_HOOK_NOTE in existing:
             # Upgrade only a block this project generated; custom hook logic
             # and surrounding user commands remain intact.
@@ -1538,32 +1717,158 @@ def install_git_hook(repo_root: Path) -> Path | None:
     return hook_path
 
 
-# Every spelling this project has used inside a hook command: the console
-# script, the module, and the ``crg-`` prefix of the shell scripts it writes.
-_HOOK_COMMAND_MARKERS = ("code-review-graph", "code_review_graph", "crg-")
+# --- Hook ownership --------------------------------------------------------
+#
+# A hook entry is this project's to replace only when the command is one this
+# project writes. Ownership must never be claimed by an unbounded substring
+# search: ``bash /opt/acrg-tools/run.sh`` contains ``crg-`` inside a directory
+# name and has nothing to do with this project, and a user's own
+# ``code-review-graph build --repo /srv/mono && notify-team`` is their hook,
+# not ours. Both survived before this file started merging by command, and both
+# have to keep surviving. Where a command cannot be recognised with certainty
+# it is kept, and the user is told.
+
+# Shell scripts this project installs. Ownership of a script command is decided
+# by the script's own file name, never by a substring of the path around it.
+_GENERATED_HOOK_SCRIPTS = frozenset(
+    {"crg-update.sh", "crg-session-start.sh", "crg-pre-commit.sh"}
+)
+
+_HOOK_SCRIPT_RUNNERS = frozenset({"bash", "sh"})
+
+# Exactly the subcommand-and-flag combinations a released hook has run.
+# Anything else after ``code-review-graph`` -- another subcommand, another
+# flag, no flag at all -- was written by someone else.
+_GENERATED_HOOK_BODIES = (
+    "update --quiet --skip-flows",
+    "update --quiet",
+    "update --skip-flows",
+    "status --json",
+    "status",
+    "detect-changes --brief",
+)
 
 
-def _is_generated_hook_command(command: Any) -> bool:
-    """Return whether ``command`` runs code-review-graph in some past shape."""
-    return isinstance(command, str) and any(
-        marker in command for marker in _HOOK_COMMAND_MARKERS
+def _hook_body_pattern() -> str:
+    """Alternate the released bodies, longest first, spaces relaxed."""
+    return "|".join(
+        r"\s+".join(re.escape(token) for token in body.split())
+        for body in sorted(_GENERATED_HOOK_BODIES, key=len, reverse=True)
     )
 
 
-def _merge_hook_entries(existing: Any, new_entries: list[Any]) -> list[Any]:
+# The CLI one-liners every release has written, as one anchored pattern. Each
+# optional piece is a prelude some release added around the body.
+_GENERATED_HOOK_COMMAND_RE = re.compile(
+    r"\A"
+    r"(?:cat\s*>\s*/dev/null\s*\|\|\s*true;\s*)?"
+    r"(?:command\s+-v\s+code-review-graph\s*>/dev/null\s+2>&1\s*\|\|\s*exit\s+0;\s*)?"
+    r"(?:git\s+rev-parse\s+--git-dir\s*>/dev/null\s+2>&1\s*&&\s*)?"
+    r"code-review-graph\s+(?:" + _hook_body_pattern() + r")"
+    r"(?:\s+--repo\s+(?:\"[^\"]*\"|'[^']*'|[^\s\"'|&;<>]+))?"
+    r"(?:\s*\|\|\s*(?:true|echo\s+'Not a git repo, skipping'))?"
+    r"\Z"
+)
+
+# Loose spellings that merely *mention* this project. Used only to tell the
+# user about a hook that was kept because it could not be recognised; never to
+# claim one.
+_HOOK_MENTION_MARKERS = ("code-review-graph", "code_review_graph", "crg-")
+
+# Matchers this project has written, per hook event. A group filed under any
+# other matcher belongs to whoever wrote it, even when a command inside it
+# resembles ours -- a user's PostToolUse hook on matcher ``Write`` is theirs.
+_GENERATED_HOOK_MATCHERS: dict[str, frozenset[str | None]] = {
+    "PostToolUse": frozenset({"Edit|Write", "Edit|Write|Bash", "Write|Edit|Bash"}),
+    "SessionStart": frozenset({"", None, "startup|resume"}),
+    "AfterTool": frozenset({"write_file|replace"}),
+}
+
+
+def _is_generated_hook_script(command: str) -> bool:
+    """Return whether ``command`` just runs a hook script this project writes."""
+    parts = command.split()
+    if not parts or len(parts) > 2:
+        return False
+    if len(parts) == 2 and _launcher_basename(parts[0]) not in _HOOK_SCRIPT_RUNNERS:
+        return False
+    return _launcher_basename(parts[-1]) in _GENERATED_HOOK_SCRIPTS
+
+
+def _is_generated_hook_command(command: Any) -> bool:
+    """Return whether ``command`` is a hook command this project writes.
+
+    Only the exact command shapes released versions emit count. Anything else
+    that merely mentions this project -- a different subcommand, extra flags, a
+    second command chained on with ``&&``, an unrelated path that happens to
+    contain ``crg-`` -- belongs to the user and is left in place.
+    """
+    if not isinstance(command, str):
+        return False
+    stripped = command.strip()
+    if not stripped:
+        return False
+    return bool(_GENERATED_HOOK_COMMAND_RE.match(stripped)) or _is_generated_hook_script(
+        stripped
+    )
+
+
+def _report_kept_hook(command: Any) -> None:
+    """Say that a hook mentioning this project was deliberately left alone.
+
+    Certainty is the condition for touching someone's configuration. When a
+    command mentions this project but is not a shape it writes, the hook stays
+    and the user is told, rather than being deleted on a guess.
+    """
+    if not isinstance(command, str):
+        return
+    if not any(marker in command for marker in _HOOK_MENTION_MARKERS):
+        return
+    safe = "".join(char for char in command if char.isprintable())[:160]
+    print(f"  kept a hook command this installer did not write: {safe}")
+
+
+def _allowed_hook_matchers(event_name: str, new_entries: Sequence[Any]) -> frozenset[Any]:
+    """Return the matchers under which a group may be claimed for this event."""
+    allowed: set[Any] = set(_GENERATED_HOOK_MATCHERS.get(event_name, frozenset()))
+    for entry in new_entries:
+        if isinstance(entry, dict):
+            matcher = entry.get("matcher")
+            if isinstance(matcher, str) or matcher is None:
+                allowed.add(matcher)
+    return frozenset(allowed)
+
+
+def _merge_hook_entries(
+    existing: Any, new_entries: list[Any], event_name: str = ""
+) -> list[Any]:
     """Return ``existing`` with our own hook groups replaced by ``new_entries``.
 
     Comparing whole entries (or exact command strings) only ever recognises the
     hook the running version would write, so any change to the command left the
     previous release's hook in place and appended a second one beside it, and
-    the repository then ran two code-review-graph hooks on one event. Ownership
-    is decided by the command instead, and a group that also holds a hook
-    someone else wrote keeps that hook.
+    the repository then ran two code-review-graph hooks on one event.
+
+    Ownership is therefore decided by the command, bounded twice over: the
+    command has to be one of the shapes this project emits, and the group has
+    to sit under a matcher this project has written for this event. A group
+    that also holds a hook someone else wrote keeps that hook, and the
+    replacement lands where the old group sat rather than at the end, so a hook
+    that ran first goes on running first.
     """
+    allowed = _allowed_hook_matchers(event_name, new_entries)
     kept: list[Any] = []
+    insert_at: int | None = None
     for group in existing if isinstance(existing, list) else []:
         if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
             kept.append(group)
+            continue
+        matcher = group.get("matcher")
+        if not (isinstance(matcher, str) or matcher is None) or matcher not in allowed:
+            kept.append(group)
+            for hook in group["hooks"]:
+                if isinstance(hook, dict):
+                    _report_kept_hook(hook.get("command"))
             continue
         nested = group["hooks"]
         survivors = [
@@ -1573,22 +1878,39 @@ def _merge_hook_entries(existing: Any, new_entries: list[Any]) -> list[Any]:
                 isinstance(hook, dict) and _is_generated_hook_command(hook.get("command"))
             )
         ]
+        for hook in survivors:
+            if isinstance(hook, dict):
+                _report_kept_hook(hook.get("command"))
+        if len(survivors) == len(nested):
+            kept.append(group)
+            continue
         if not survivors:
-            continue  # the whole group was ours
-        if len(survivors) != len(nested):
-            group = {**group, "hooks": survivors}
-        kept.append(group)
-    return kept + list(new_entries)
+            if insert_at is None:
+                insert_at = len(kept)  # the whole group was ours
+            continue
+        kept.append({**group, "hooks": survivors})
+        if insert_at is None:
+            insert_at = len(kept)
+    if insert_at is None:
+        insert_at = len(kept)
+    return kept[:insert_at] + list(new_entries) + kept[insert_at:]
 
 
 def _merge_flat_hook_entries(existing: Any, new_entries: list[Any]) -> list[Any]:
     """The same replacement rule for a flat, one-level hook list (Cursor)."""
-    kept = [
-        hook
-        for hook in (existing if isinstance(existing, list) else [])
-        if not (isinstance(hook, dict) and _is_generated_hook_command(hook.get("command")))
-    ]
-    return kept + list(new_entries)
+    kept: list[Any] = []
+    insert_at: int | None = None
+    for hook in existing if isinstance(existing, list) else []:
+        if isinstance(hook, dict) and _is_generated_hook_command(hook.get("command")):
+            if insert_at is None:
+                insert_at = len(kept)
+            continue
+        if isinstance(hook, dict):
+            _report_kept_hook(hook.get("command"))
+        kept.append(hook)
+    if insert_at is None:
+        insert_at = len(kept)
+    return kept[:insert_at] + list(new_entries) + kept[insert_at:]
 
 
 def _merge_hooks_into_settings(
@@ -1618,7 +1940,7 @@ def _merge_hooks_into_settings(
     for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
         if isinstance(merged_hooks.get(hook_name), list):
             merged_hooks[hook_name] = _merge_hook_entries(
-                merged_hooks[hook_name], hook_entries
+                merged_hooks[hook_name], hook_entries, hook_name
             )
         else:
             merged_hooks[hook_name] = hook_entries
@@ -1700,7 +2022,7 @@ def install_codex_hooks(repo_root: Path) -> Path:
     for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
         if isinstance(merged_hooks.get(hook_name), list):
             merged_hooks[hook_name] = _merge_hook_entries(
-                merged_hooks[hook_name], hook_entries
+                merged_hooks[hook_name], hook_entries, hook_name
             )
         else:
             merged_hooks[hook_name] = hook_entries
@@ -2065,6 +2387,7 @@ exit 0
                     ],
                 }
             ],
+            event_name,
         )
 
     _ensure_group(

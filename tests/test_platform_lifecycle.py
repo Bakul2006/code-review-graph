@@ -1019,23 +1019,36 @@ def test_step5_stale_config_entry_is_replaced(sandbox: Sandbox, key: str) -> Non
     _record("step5_stale_config", key, checks)
 
 
-# Platforms whose install writes a hooks file the previous release could have
-# written differently, mapped to the file and the command substring involved.
 # Platforms whose install writes a hooks file, mapped to the file, the event,
-# and a hook command in the shape an older release left behind. The old shapes
-# are taken from this project's own history: an absolute interpreter path for
-# the settings-based hooks, an absolute script path for Gemini CLI's.
-_OLD_PYTHON_HOOK = (
-    f"{STALE_ABSOLUTE} -m code_review_graph update --skip-flows --repo {STALE_CWD}"
+# the matcher an older release filed its group under, and the hook command that
+# release wrote. Every shape below is a real one, read back out of this
+# project's released tags: v2.2.0 wrote ``--quiet --skip-flows`` under matcher
+# ``Edit|Write|Bash``, v2.3.3 wrote the Codex one-liner without the ``cat``
+# prelude, and Gemini CLI's hook has always pointed at a ``crg-*.sh`` script
+# (here under a checkout that no longer exists).
+_OLD_SETTINGS_HOOK = "code-review-graph update --quiet --skip-flows"
+_OLD_CODEX_HOOK = (
+    "git rev-parse --git-dir >/dev/null 2>&1"
+    " && code-review-graph update --skip-flows || true"
 )
-HOOK_PLATFORMS: dict[str, tuple[str, str, str]] = {
-    "claude": ("repo:.claude/settings.json", "PostToolUse", _OLD_PYTHON_HOOK),
-    "qoder": ("repo:.qoder/settings.json", "PostToolUse", _OLD_PYTHON_HOOK),
-    "codebuddy": ("repo:.codebuddy/settings.json", "PostToolUse", _OLD_PYTHON_HOOK),
-    "codex": ("home:.codex/hooks.json", "PostToolUse", _OLD_PYTHON_HOOK),
+HOOK_PLATFORMS: dict[str, tuple[str, str, str, str]] = {
+    "claude": (
+        "repo:.claude/settings.json", "PostToolUse", "Edit|Write|Bash", _OLD_SETTINGS_HOOK,
+    ),
+    "qoder": (
+        "repo:.qoder/settings.json", "PostToolUse", "Edit|Write|Bash", _OLD_SETTINGS_HOOK,
+    ),
+    "codebuddy": (
+        "repo:.codebuddy/settings.json", "PostToolUse", "Edit|Write|Bash",
+        _OLD_SETTINGS_HOOK,
+    ),
+    "codex": (
+        "home:.codex/hooks.json", "PostToolUse", "Write|Edit|Bash", _OLD_CODEX_HOOK,
+    ),
     "gemini-cli": (
         "repo:.gemini/settings.json",
         "AfterTool",
+        "write_file|replace",
         f"bash {STALE_CWD}/.gemini/hooks/crg-update.sh",
     ),
 }
@@ -1054,7 +1067,7 @@ def test_step5b_stale_hook_shape_is_replaced(sandbox: Sandbox, key: str) -> None
     beside it, and the repository then ran two code-review-graph hooks on the
     same event.
     """
-    marker, event, stale_command = HOOK_PLATFORMS[key]
+    marker, event, stale_matcher, stale_command = HOOK_PLATFORMS[key]
     settings_path = sandbox.resolve(marker)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(
@@ -1063,7 +1076,7 @@ def test_step5b_stale_hook_shape_is_replaced(sandbox: Sandbox, key: str) -> None
                 "hooks": {
                     event: [
                         {
-                            "matcher": "Edit|Write",
+                            "matcher": stale_matcher,
                             "hooks": [
                                 {"type": "command", "command": stale_command, "timeout": 30}
                             ],
@@ -1083,17 +1096,17 @@ def test_step5b_stale_hook_shape_is_replaced(sandbox: Sandbox, key: str) -> None
     body = settings_path.read_text(encoding="utf-8")
     data = json.loads(body)
     groups = data["hooks"][event]
-    crg_hooks = [
-        hook
-        for group in groups
-        for hook in group.get("hooks", [])
-        if _is_crg_hook_command(hook.get("command", ""))
+    commands = [
+        hook.get("command", "") for group in groups for hook in group.get("hooks", [])
     ]
+    crg_hooks = [command for command in commands if _is_crg_hook_command(command)]
 
     checks = 0
     assert crg_hooks, f"{key}: reinstall wrote no hook at all into {settings_path}"
     checks += 1
-    assert stale_command not in body, (
+    # Compared exactly, not by substring: one released Codex command is a
+    # prefix of the one that replaced it.
+    assert stale_command not in commands, (
         f"{key}: the older release's hook command survives in {settings_path}"
     )
     checks += 1
