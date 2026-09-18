@@ -14,7 +14,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -33,6 +33,9 @@ from .constants import (
     IMPACT_EDGE_DIRECTIONS,
     IMPACT_EDGE_WEIGHTS,
     IMPACT_SCORE_FLOOR,
+    IMPORT_SCOPE_KEY,
+    IMPORT_SCOPE_PACKAGE,
+    IMPORT_SCOPE_TREE,
     MAX_IMPACT_DEPTH,
     MAX_IMPACT_NODES,
 )
@@ -345,6 +348,127 @@ class GraphStats:
     last_updated: Optional[str]
 
 
+#: How far above a file an ancestor directory may still be the target of a
+#: tree-scoped import. A ``require_all`` names a subsystem, not a whole
+#: repository, and the walk has to stop somewhere that is not the filesystem
+#: root.
+IMPORT_SCOPE_MAX_ANCESTORS = 12
+
+
+def _edge_import_scope(extra: Optional[str]) -> Optional[str]:
+    """The ``import_scope`` recorded on one raw ``edges.extra`` value."""
+    if not extra or IMPORT_SCOPE_KEY not in extra:
+        return None
+    try:
+        payload = json.loads(extra)
+    except (TypeError, ValueError):
+        return None
+    scope = payload.get(IMPORT_SCOPE_KEY) if isinstance(payload, dict) else None
+    return scope if isinstance(scope, str) else None
+
+
+def _parent_dir(path: Optional[str]) -> Optional[str]:
+    """The directory holding *path*, as a directory-scoped edge spells it.
+
+    Registered as the SQLite function ``crg_parent_dir``. Returns ``None``
+    for anything that is not an absolute POSIX-ish path, so a qualified name
+    that is not a file path can never join a directory target by accident.
+    """
+    if not isinstance(path, str) or "/" not in path:
+        return None
+    head = path.rsplit("/", 1)[0]
+    return head or None
+
+
+def import_scope_ancestors(file_path: str) -> list[tuple[str, tuple[str, ...]]]:
+    """Directory targets that could name *file_path*, nearest first.
+
+    Each entry pairs a directory with the import scopes for which that
+    directory legitimately stands for the file. The file's own directory
+    qualifies under both scopes; anything higher only under
+    :data:`IMPORT_SCOPE_TREE`, because a Go package is exactly one directory
+    deep and a subdirectory of it is a different package.
+    """
+    parent = _parent_dir(file_path)
+    if parent is None:
+        return []
+    out: list[tuple[str, tuple[str, ...]]] = [
+        (parent, (IMPORT_SCOPE_PACKAGE, IMPORT_SCOPE_TREE)),
+    ]
+    current = parent
+    for _ in range(IMPORT_SCOPE_MAX_ANCESTORS):
+        current = _parent_dir(current) or ""
+        if not current:
+            break
+        out.append((current, (IMPORT_SCOPE_TREE,)))
+    return out
+
+
+#: Fills ``_impact_frontier_dirs`` with the package directory of every File
+#: node on the frontier, once per hop. CROSS JOIN drives it from the frontier,
+#: which is small, rather than from every File node in the graph.
+IMPACT_FRONTIER_DIRS_SQL = """
+INSERT INTO _impact_frontier_dirs (dir, score)
+SELECT dir, MAX(score) FROM (
+    SELECT crg_parent_dir(n.file_path) AS dir, f.score AS score
+    FROM _impact_frontier f
+    CROSS JOIN nodes n
+      ON n.qualified_name = f.node_qn AND n.kind = 'File'
+)
+WHERE dir IS NOT NULL
+GROUP BY dir
+"""
+
+
+def _impact_candidate_sql(resolution_guard: str) -> str:
+    """One hop of the impact relaxation.
+
+    *resolution_guard* is either the empty string or a fixed predicate chosen
+    by a validated enum; no caller value reaches the SQL text.
+
+    The third branch is the directory-scoped one. A Go import names a
+    package, so its edge targets the file's DIRECTORY rather than the file,
+    and expanding it here -- at every hop, without spending one -- is what
+    one edge per import buys: the alternative is one edge per file in the
+    package, which on kubernetes is 73,507 edges for a single directory.
+
+    ``CROSS JOIN`` and ``INDEXED BY`` pin that branch to one index seek per
+    frontier package. Left to itself SQLite drove it from the covering index
+    on ``kind`` alone and rescanned every IMPORTS_FROM row once per
+    directory: 18 seconds of a 19-second kubernetes traversal, against 1.5
+    with the plan pinned. ``tests/test_import_scope.py`` asserts the plan.
+    """
+    return f"""
+    INSERT INTO _impact_next (node_qn, score)
+    SELECT node_qn, MAX(score)
+    FROM (
+        SELECT e.target_qualified AS node_qn,
+               f.score * COALESCE(p.weight, ?) * ? AS score
+        FROM _impact_frontier f
+        JOIN edges e ON e.source_qualified = f.node_qn
+        LEFT JOIN _impact_policies p ON p.kind = e.kind
+        WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
+        UNION ALL
+        SELECT e.source_qualified AS node_qn,
+               f.score * COALESCE(p.weight, ?) * ? AS score
+        FROM _impact_frontier f
+        JOIN edges e ON e.target_qualified = f.node_qn
+        LEFT JOIN _impact_policies p ON p.kind = e.kind
+        WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
+        UNION ALL
+        SELECT e.source_qualified AS node_qn,
+               d.score * COALESCE(p.weight, ?) * ? AS score
+        FROM _impact_frontier_dirs d
+        CROSS JOIN edges e INDEXED BY idx_edges_target_kind
+          ON e.target_qualified = d.dir AND e.kind = 'IMPORTS_FROM'
+        LEFT JOIN _impact_policies p ON p.kind = e.kind
+        WHERE COALESCE(p.direction, ?) = ?
+    ) candidates
+    WHERE score > ?
+    GROUP BY node_qn
+    """  # noqa: S608
+
+
 # ---------------------------------------------------------------------------
 # GraphStore
 # ---------------------------------------------------------------------------
@@ -507,6 +631,21 @@ class GraphStore:
             ):
                 raise CorruptGraphDatabaseError(self.db_path, exc) from exc
             raise
+        # Directory-scoped IMPORTS_FROM targets (a Go package, a Ruby
+        # ``require_all`` tree) are expanded on the read path, so the impact
+        # traversal needs a file's own directory as a join key. Deterministic
+        # so SQLite evaluates it once per row and seeks idx_edges_target_kind
+        # rather than scanning. See IMPORT_SCOPE_KEY in constants.py.
+        #
+        # Registered outside the open/migrate guard above: a failure here is
+        # not a corrupt file, and the guard must keep deleting databases only
+        # for the two shapes it recognises.
+        try:
+            self._conn.create_function(
+                "crg_parent_dir", 1, _parent_dir, deterministic=True,
+            )
+        except (sqlite3.NotSupportedError, TypeError):  # pragma: no cover
+            self._conn.create_function("crg_parent_dir", 1, _parent_dir)
         self._nxg_cache: nx.DiGraph | None = None
         self._cache_lock = threading.Lock()
         # Identifies the read transaction currently open on this connection,
@@ -1639,6 +1778,27 @@ class GraphStore:
         """
         return self._resolve_bare_endpoints("TESTED_BY", "source_qualified")
 
+    @staticmethod
+    def _directory_member_files(
+        conn: sqlite3.Connection, scoped_dirs: dict[str, str],
+    ) -> dict[str, set[str]]:
+        """Member files of each directory-scoped import target.
+
+        One pass over the File nodes, walking each file's ancestors against
+        the directories that are actually import targets. A ``package``
+        directory owns only the files directly in it; a ``tree`` directory
+        owns every file below it.
+        """
+        members: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT file_path FROM nodes WHERE kind = 'File'"
+        ):
+            file_path = row["file_path"]
+            for directory, scopes in import_scope_ancestors(file_path):
+                if scoped_dirs.get(directory) in scopes:
+                    members.setdefault(directory, set()).add(file_path)
+        return members
+
     def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
         """Resolve a bare edge endpoint only when one candidate has evidence."""
         if endpoint == "target_qualified":
@@ -1707,6 +1867,10 @@ class GraphStore:
         # first built in the ambiguous state cannot fall back to a name-only
         # caller match for every candidate.
         ambiguous_import_targets: dict[str, set[str]] = {}
+        # Directory-scoped targets: a Go import names a package, not a file.
+        # The edge stays one row; the member files are expanded here, once
+        # per post-processing pass, rather than stored one edge per member.
+        scoped_dirs: dict[str, str] = {}
         for row in conn.execute(
             "SELECT DISTINCT file_path, target_qualified, extra FROM edges "
             "WHERE kind = 'IMPORTS_FROM'"
@@ -1714,6 +1878,9 @@ class GraphStore:
             target = row["target_qualified"]
             target_file = target.split("::", 1)[0] if "::" in target else target
             import_targets.setdefault(row["file_path"], set()).add(target_file)
+            scope = _edge_import_scope(row["extra"])
+            if scope is not None:
+                scoped_dirs[target] = scope
             try:
                 import_extra = json.loads(row["extra"] or "{}")
             except (TypeError, json.JSONDecodeError):
@@ -1761,6 +1928,14 @@ class GraphStore:
                 for target in imported:
                     expanded |= namespace_files.get(target, set())
                 imported |= expanded
+
+        if scoped_dirs:
+            members = self._directory_member_files(conn, scoped_dirs)
+            for imported in import_targets.values():
+                grown: set[str] = set()
+                for target in imported:
+                    grown |= members.get(target, set())
+                imported |= grown
 
         # Python imports the repository-suffix resolver could not map to a file
         # keep their raw dotted module as the IMPORTS_FROM target — the standard
@@ -2099,16 +2274,126 @@ class GraphStore:
         reach importers of a changed .cs file. The namespace strings have
         no node rows, so they act purely as bridges and never surface in
         results. See: #310
+
+        Tree-scoped import targets are bridged the same way. A Ruby
+        ``require_all "jekyll/converters"`` names a DIRECTORY, and a file
+        two levels below it is still one of the files it loads, so the
+        directory is seeded for the changed file. The one-level case -- a Go
+        package, which is exactly one directory -- is not seeded here: the
+        traversal expands it at every hop, so it also works for a file
+        reached indirectly rather than only for a changed one.
         """
         seeds: set[str] = set()
+        files: list[str] = []
         for f in changed_files:
             for n in self.get_nodes_by_file(f):
                 seeds.add(n.qualified_name)
-                if n.kind == "File" and n.language == "csharp":
-                    for ns in n.extra.get("csharp_namespaces") or []:
-                        if isinstance(ns, str) and ns:
-                            seeds.add(ns)
+                if n.kind == "File":
+                    files.append(n.file_path)
+                    if n.language == "csharp":
+                        for ns in n.extra.get("csharp_namespaces") or []:
+                            if isinstance(ns, str) and ns:
+                                seeds.add(ns)
+        seeds.update(self.tree_scope_bridges(files))
         return seeds
+
+    def tree_scope_bridges(self, file_paths: Iterable[str]) -> set[str]:
+        """Ancestor directories that a tree-scoped import target names.
+
+        Only ancestors ABOVE each file's own directory: the own-directory
+        case is handled by the traversal itself, which is what keeps it
+        working at every hop instead of only for a seed.
+        """
+        wanted: dict[str, str] = {}
+        for file_path in file_paths:
+            for directory, scopes in import_scope_ancestors(file_path)[1:]:
+                if IMPORT_SCOPE_TREE in scopes:
+                    wanted[directory] = IMPORT_SCOPE_TREE
+        if not wanted:
+            return set()
+        found: set[str] = set()
+        directories = list(wanted)
+        for start in range(0, len(directories), 450):
+            batch = directories[start:start + 450]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT DISTINCT target_qualified, extra FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' "
+                f"AND target_qualified IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                if _edge_import_scope(row["extra"]) == IMPORT_SCOPE_TREE:
+                    found.add(row["target_qualified"])
+        return found
+
+    def import_scope_edges(
+        self, file_paths: Iterable[str], source_qns: set[str],
+    ) -> list[GraphEdge]:
+        """Directory-scoped IMPORTS_FROM edges that connect the given files.
+
+        ``get_edges_among`` matches source and target against the same set of
+        qualified names, and a directory target is in no such set, so these
+        edges would otherwise be missing from the answer that rests on them.
+        """
+        wanted: dict[str, tuple[str, ...]] = {}
+        for file_path in file_paths:
+            for directory, scopes in import_scope_ancestors(file_path):
+                wanted[directory] = tuple(
+                    sorted(set(wanted.get(directory, ())) | set(scopes)),
+                )
+        if not wanted or not source_qns:
+            return []
+        out: list[GraphEdge] = []
+        directories = list(wanted)
+        for start in range(0, len(directories), 450):
+            batch = directories[start:start + 450]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT * FROM edges WHERE kind = 'IMPORTS_FROM' "
+                f"AND target_qualified IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                edge = self._row_to_edge(row)
+                if edge.source_qualified not in source_qns:
+                    continue
+                scope = edge.extra.get(IMPORT_SCOPE_KEY)
+                if scope in wanted.get(edge.target_qualified, ()):
+                    out.append(edge)
+        return out
+
+    def _import_scope_importer_index(self) -> dict[str, list[str]]:
+        """Directory target -> the qualified names that import it.
+
+        Only the NetworkX engine needs this materialised. The SQL engine
+        seeks the same rows one directory at a time through
+        ``idx_edges_target_kind``.
+        """
+        index: dict[str, list[str]] = {}
+        rows = self._conn.execute(
+            "SELECT source_qualified, target_qualified, extra FROM edges "
+            "WHERE kind = 'IMPORTS_FROM' AND extra LIKE ?",
+            (f"%{IMPORT_SCOPE_KEY}%",),
+        ).fetchall()
+        for row in rows:
+            if _edge_import_scope(row["extra"]) is None:
+                continue
+            index.setdefault(row["target_qualified"], []).append(
+                row["source_qualified"],
+            )
+        return index
+
+    def _file_node_directories(self) -> dict[str, str]:
+        """File node qualified name -> the directory that holds it."""
+        out: dict[str, str] = {}
+        for row in self._conn.execute(
+            "SELECT qualified_name, file_path FROM nodes WHERE kind = 'File'"
+        ):
+            directory = _parent_dir(row["file_path"])
+            if directory:
+                out[row["qualified_name"]] = directory
+        return out
 
     def count_unresolved_call_sites(self, names: set[str]) -> int:
         """Count call sites that name *names* but were never bound to a node.
@@ -2278,6 +2563,16 @@ class GraphStore:
                 "(node_qn TEXT PRIMARY KEY, score REAL NOT NULL)"
             )
             self._conn.execute(f"DELETE FROM {table}")  # nosec B608
+        # The frontier's package directories, refilled once per hop. Keeping
+        # them in a table rather than computing crg_parent_dir inside the
+        # candidate query is what keeps the directory branch an index seek:
+        # inlined, SQLite drove the join from nodes-by-kind and scanned every
+        # IMPORTS_FROM row on every hop (82s on kubernetes, against 6s here).
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_frontier_dirs "
+            "(dir TEXT PRIMARY KEY, score REAL NOT NULL)"
+        )
+        self._conn.execute("DELETE FROM _impact_frontier_dirs")
 
         self._conn.execute(
             "INSERT INTO _impact_best (node_qn, score) "
@@ -2288,29 +2583,7 @@ class GraphStore:
             "SELECT qn, 1.0 FROM _impact_seeds"
         )
 
-        # ``resolution_guard`` is either the empty string or a fixed predicate
-        # chosen by a validated enum; no caller value reaches the SQL text.
-        candidate_sql = f"""
-        INSERT INTO _impact_next (node_qn, score)
-        SELECT node_qn, MAX(score)
-        FROM (
-            SELECT e.target_qualified AS node_qn,
-                   f.score * COALESCE(p.weight, ?) * ? AS score
-            FROM _impact_frontier f
-            JOIN edges e ON e.source_qualified = f.node_qn
-            LEFT JOIN _impact_policies p ON p.kind = e.kind
-            WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
-            UNION ALL
-            SELECT e.source_qualified AS node_qn,
-                   f.score * COALESCE(p.weight, ?) * ? AS score
-            FROM _impact_frontier f
-            JOIN edges e ON e.target_qualified = f.node_qn
-            LEFT JOIN _impact_policies p ON p.kind = e.kind
-            WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
-        ) candidates
-        WHERE score > ?
-        GROUP BY node_qn
-        """  # noqa: S608
+        candidate_sql = _impact_candidate_sql(resolution_guard)
         candidate_params = (
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
@@ -2320,10 +2593,16 @@ class GraphStore:
             IMPACT_DEPTH_DECAY,
             IMPACT_DEFAULT_EDGE_DIRECTION,
             IMPACT_DIRECTION_INCOMING,
+            IMPACT_DEFAULT_EDGE_WEIGHT,
+            IMPACT_DEPTH_DECAY,
+            IMPACT_DEFAULT_EDGE_DIRECTION,
+            IMPACT_DIRECTION_INCOMING,
             IMPACT_SCORE_FLOOR,
         )
         for _ in range(max_depth):
             self._conn.execute("DELETE FROM _impact_next")
+            self._conn.execute("DELETE FROM _impact_frontier_dirs")
+            self._conn.execute(IMPACT_FRONTIER_DIRS_SQL)
             self._conn.execute(candidate_sql, candidate_params)
             self._conn.execute(
                 "DELETE FROM _impact_next "
@@ -2390,6 +2669,13 @@ class GraphStore:
         all_qns = seeds | {n.qualified_name for n in impacted_nodes}
         if all_qns:
             relevant_edges = self.get_edges_among(all_qns)
+            # A directory-scoped import edge connects two files in the answer
+            # without either endpoint naming the other, so it is invisible to
+            # the set-membership match above.
+            relevant_edges.extend(self.import_scope_edges(
+                {n.file_path for n in changed_nodes + impacted_nodes},
+                all_qns,
+            ))
             if resolution == RESOLUTION_DIRECT:
                 relevant_edges = [
                     edge for edge in relevant_edges
@@ -2433,6 +2719,17 @@ class GraphStore:
 
         seeds = self._impact_seed_qns(changed_files)
 
+        # Parity with the SQL engine's directory-scoped branch: a Go import
+        # edge targets the package directory, so a file is reached through
+        # its own directory rather than by name.
+        scope_importers = self._import_scope_importer_index()
+        file_directories = (
+            self._file_node_directories() if scope_importers else {}
+        )
+        scope_weight = IMPACT_EDGE_WEIGHTS.get(
+            "IMPORTS_FROM", IMPACT_DEFAULT_EDGE_WEIGHT,
+        )
+
         best: dict[str, float] = dict.fromkeys(seeds, 1.0)
         frontier = dict(best)
 
@@ -2441,19 +2738,27 @@ class GraphStore:
                 break
             next_frontier: dict[str, float] = {}
             for qn, score in frontier.items():
-                if qn not in nxg:
-                    continue
-                neighbors = [
-                    (target, data["impact_outgoing_weight"])
-                    for _, target, data in nxg.out_edges(qn, data=True)
-                    if "impact_outgoing_weight" in data
-                    and not (direct_only and data.get("unresolved_target"))
-                ] + [
-                    (source, data["impact_incoming_weight"])
-                    for source, _, data in nxg.in_edges(qn, data=True)
-                    if "impact_incoming_weight" in data
-                    and not (direct_only and data.get("unresolved_target"))
+                directory = file_directories.get(qn)
+                scoped = [
+                    (importer, scope_weight)
+                    for importer in scope_importers.get(directory or "", ())
                 ]
+                if qn not in nxg:
+                    if not scoped:
+                        continue
+                    neighbors = scoped
+                else:
+                    neighbors = [
+                        (target, data["impact_outgoing_weight"])
+                        for _, target, data in nxg.out_edges(qn, data=True)
+                        if "impact_outgoing_weight" in data
+                        and not (direct_only and data.get("unresolved_target"))
+                    ] + [
+                        (source, data["impact_incoming_weight"])
+                        for source, _, data in nxg.in_edges(qn, data=True)
+                        if "impact_incoming_weight" in data
+                        and not (direct_only and data.get("unresolved_target"))
+                    ] + scoped
                 for other_qn, weight in neighbors:
                     new_score = score * weight * IMPACT_DEPTH_DECAY
                     if new_score <= IMPACT_SCORE_FLOOR:
@@ -2488,6 +2793,13 @@ class GraphStore:
         all_qns = seeds | {n.qualified_name for n in impacted_nodes}
         if all_qns:
             relevant_edges = self.get_edges_among(all_qns)
+            # A directory-scoped import edge connects two files in the answer
+            # without either endpoint naming the other, so it is invisible to
+            # the set-membership match above.
+            relevant_edges.extend(self.import_scope_edges(
+                {n.file_path for n in changed_nodes + impacted_nodes},
+                all_qns,
+            ))
             if resolution == RESOLUTION_DIRECT:
                 relevant_edges = [
                     edge for edge in relevant_edges
