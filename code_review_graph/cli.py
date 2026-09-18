@@ -696,6 +696,45 @@ def _warn_failed_files(result: dict) -> None:
     )
 
 
+def _open_graph_store(db_path: Path, command: str):
+    """Open the graph store, recovering from an unusable database file.
+
+    A restored CI cache can hold a truncated or half-written ``graph.db``,
+    and it can just as easily hold a valid SQLite file whose tables are the
+    wrong shape. SQLite refuses either one and the command used to die with a
+    traceback, which is why ``action.yml``'s ``update || build`` fallback
+    could not recover: the full build failed for exactly the same reason.
+    ``build`` rewrites the graph from scratch, so there the bad file is
+    discarded and the build proceeds.
+
+    Every other command re-raises, and ``main`` prints the one actionable
+    line the error already carries. That is the whole difference between the
+    two paths, and it is worth stating why the reporting is not duplicated
+    here: a second message would compete with the first, and one of them
+    would drift.
+
+    ``build`` discards only what ``CorruptGraphDatabaseError`` names, and
+    that class is deliberately narrow. A contended database, a read-only
+    checkout, a foreign SQLite file and a graph from a newer release all
+    reach ``main`` as themselves, because deleting any of those would destroy
+    a graph, or data, that is not broken.
+    """
+    from .graph import CorruptGraphDatabaseError, GraphStore, discard_corrupt_database
+
+    try:
+        return GraphStore(db_path)
+    except CorruptGraphDatabaseError as exc:
+        if command != "build":
+            raise
+        logger.warning(
+            "Graph database at %s is unusable (%s); discarding it and "
+            "building from scratch.",
+            db_path, exc.reason,
+        )
+        discard_corrupt_database(db_path)
+        return GraphStore(db_path)
+
+
 def main() -> None:
     """Main CLI entry point.
 
@@ -707,6 +746,10 @@ def main() -> None:
     foreign graph, a data directory it may not write to, a VCS it could not
     run) and printed in the house style the rest of the CLI already uses:
     one ``Error: ...`` line on stderr, exit 1, no traceback to decode.
+
+    One of those is reported here only because nothing could be done about
+    it earlier: an unreadable graph reaches ``build`` as a rebuild (see
+    ``_open_graph_store``) and only every other command as a line.
 
     A contended graph is separate, and stays separate: it is reported, not
     raised, and never described as damage. The choice is deliberate:
@@ -1879,7 +1922,6 @@ def _dispatch() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    from .graph import GraphStore
     from .incremental import (
         assert_graph_serves_root,
         find_project_root,
@@ -1892,7 +1934,7 @@ def _dispatch() -> None:
         repo_root = Path(args.repo) if args.repo else find_project_root()
         _handle_data_dir_option(args, repo_root)
         db_path = get_db_path(repo_root)
-        store = GraphStore(db_path)
+        store = _open_graph_store(db_path, args.command)
         try:
             from .tools.build import run_postprocess
 
@@ -2012,7 +2054,7 @@ def _dispatch() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
-    store = GraphStore(db_path)
+    store = _open_graph_store(db_path, args.command)
 
     try:
         # A graph.db copied or cached from another checkout answers every

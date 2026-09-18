@@ -36,7 +36,7 @@ from code_review_graph.errors import (
     GraphStoreError,
     is_lock_error,
 )
-from code_review_graph.graph import GraphStore
+from code_review_graph.graph import CorruptGraphDatabaseError, GraphStore
 from code_review_graph.incremental import (
     assert_graph_serves_root,
     full_build,
@@ -516,3 +516,112 @@ def test_an_unwritable_directory_is_still_a_graph_store_error(tmp_path):
         locked_dir.chmod(0o700)
     assert not is_lock_error(caught.value)
     assert str(locked_dir / "graph.db") in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# 5. Where the two rounds of work meet: reporting and recovery
+# ---------------------------------------------------------------------------
+#
+# Reporting an unusable graph and rebuilding one are the same decision seen
+# from two sides, and they are made in one place. ``cli._open_graph_store``
+# discards exactly what ``CorruptGraphDatabaseError`` names, for exactly the
+# one command that was going to rewrite the graph anyway. Everything else --
+# contention, a read-only checkout, somebody else's SQLite file, a graph from
+# a newer release -- is reported and left untouched, because discarding any of
+# those destroys something that was never broken.
+
+
+def _unreadable(tmp_path: Path) -> Path:
+    db = _built_db(tmp_path)
+    db.write_bytes(os.urandom(64 * 1024))
+    return db
+
+
+def test_build_discards_an_unreadable_database_and_rebuilds_it(tmp_path):
+    db = _unreadable(tmp_path)
+    store = cli._open_graph_store(db, "build")
+    try:
+        assert store.get_stats().total_nodes == 0
+    finally:
+        store.close()
+    assert db.read_bytes()[:16] == b"SQLite format 3\x00"
+
+
+def test_a_read_command_reports_the_unreadable_database_and_keeps_it(tmp_path):
+    """One line through ``main``'s house style, and the file is still there.
+
+    A read command has nothing to rebuild from, so discarding would only
+    trade a nameable failure for a silently empty graph.
+    """
+    db = _unreadable(tmp_path)
+    before = db.read_bytes()
+    with pytest.raises(GraphStoreError) as caught:
+        cli._open_graph_store(db, "status")
+    assert isinstance(caught.value, CorruptGraphDatabaseError)
+    assert str(db) in str(caught.value)
+    assert "build" in str(caught.value)
+    assert db.read_bytes() == before
+
+
+def test_build_does_not_discard_a_contended_database(tmp_path):
+    """The one that would be unrecoverable: a healthy graph, deleted."""
+    db = _built_db(tmp_path)
+    before = db.read_bytes()
+    with patch(
+        "code_review_graph.graph.run_migrations",
+        side_effect=sqlite3.OperationalError("database is locked"),
+    ):
+        with pytest.raises(sqlite3.OperationalError) as caught:
+            cli._open_graph_store(db, "build")
+    assert is_lock_error(caught.value)
+    assert not isinstance(caught.value, CorruptGraphDatabaseError)
+    assert db.read_bytes() == before
+
+
+def test_build_does_not_discard_somebody_elses_sqlite_file(tmp_path):
+    db = _built_db(tmp_path)
+    db.unlink()
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE invoices (id INTEGER PRIMARY KEY, total REAL)")
+    conn.execute("INSERT INTO invoices VALUES (1, 99.5)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(GraphStoreError) as caught:
+        cli._open_graph_store(db, "build")
+    assert not isinstance(caught.value, CorruptGraphDatabaseError)
+    conn = sqlite3.connect(str(db))
+    try:
+        assert list(conn.execute("SELECT * FROM invoices")) == [(1, 99.5)]
+    finally:
+        conn.close()
+
+
+def test_build_does_not_discard_a_graph_from_a_newer_release(tmp_path):
+    """Too old to read it is not the same as it is broken."""
+    db = _built_db(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+        (str(LATEST_VERSION + 5),),
+    )
+    conn.commit()
+    conn.close()
+    before = db.read_bytes()
+
+    with pytest.raises(GraphStoreError) as caught:
+        cli._open_graph_store(db, "build")
+    assert not isinstance(caught.value, CorruptGraphDatabaseError)
+    assert db.read_bytes() == before
+
+
+def test_the_discarded_database_takes_its_wal_sidecars_with_it(tmp_path):
+    """A stale -wal beside a fresh database is its own corruption."""
+    db = _unreadable(tmp_path)
+    for suffix in ("-wal", "-shm"):
+        db.with_name(db.name + suffix).write_bytes(b"stale")
+    store = cli._open_graph_store(db, "build")
+    store.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = db.with_name(db.name + suffix)
+        assert not sidecar.exists() or sidecar.read_bytes() != b"stale", suffix

@@ -256,7 +256,7 @@ Every command that opens the graph reports an unusable database in one line
 and exits 1, instead of raising a SQLite traceback:
 
 ```
-Error: the graph database at <path> is unreadable (file is not a database). Delete it and run `code-review-graph build` to rebuild the graph.
+Error: the graph database at <path> is unreadable (file is not a database). Run `code-review-graph build` to rebuild it from scratch.
 Error: <path> is a SQLite database but not a code-review-graph graph (it holds invoices). Point --data-dir somewhere else, or delete the file and run `code-review-graph build`.
 Error: the graph database at <path> was written by a newer code-review-graph (schema v99; this build understands v10). Upgrade code-review-graph, or delete the file and run `code-review-graph build`.
 Error: the graph at <path> was built for a different repository root: none of its 12 file(s), such as /other/repo/lib.py, are under /this/repo. Run `code-review-graph build` here, or point --repo at the root it was built for.
@@ -266,9 +266,18 @@ The last one is the case that used to be silent: a `graph.db` copied between
 checkouts, or a CI cache restored into the wrong repository, answered every
 question with the other repository's symbols and paths.
 
-**Fix.** Delete `.code-review-graph/graph.db` (with its `-wal` and `-shm`
-files) and run `code-review-graph build`, or point `--repo` / `--data-dir` at
-the pair that belongs together.
+**Fix.** Run `code-review-graph build`. For the first case (an unreadable
+file, including a valid SQLite file whose tables are the wrong shape) `build`
+discards the unusable database and its `-wal`/`-shm` sidecars itself, and
+logs one warning saying so; this is what lets the GitHub Action recover from
+a restored cache without anyone clearing it by hand. The others are never
+discarded for you, because deleting somebody else's SQLite file, or a graph
+this build is merely too old to read, is not a recovery: delete the file
+yourself, or point `--repo` / `--data-dir` at the pair that belongs together.
+
+A database another process is writing is not in this list at all. Contention
+is reported as contention (see *Database lock errors* above) and never
+discarded: the graph is healthy and the answer is to try again.
 
 ## Unwritable data directory
 

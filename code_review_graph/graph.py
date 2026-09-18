@@ -414,6 +414,138 @@ def _assert_usable_database(conn: sqlite3.Connection, db_path: Path) -> None:
         )
 
 
+class CorruptGraphDatabaseError(GraphStoreError):
+    """The graph database file exists but cannot be opened as this graph.
+
+    A named subclass of :class:`GraphStoreError`, rather than a bare one, so
+    a caller that is about to rebuild the graph from scratch anyway
+    (``build``) can discard the unusable file and carry on, and every other
+    caller reports the single actionable line every ``GraphStoreError``
+    carries instead of a traceback. A restored CI cache is the
+    common source: an unusable ``graph.db`` turns every later run red until
+    someone clears the cache by hand.
+
+    Deliberately not a ``sqlite3.Error``. Nothing this package can explain
+    about itself may reach a caller as a raw SQLite exception; what the
+    subclass records is the one shape of unusable that a rebuild fixes by
+    itself. A foreign SQLite file and a database written by a newer release
+    are excluded for the same reason they are refused up front in
+    :func:`_assert_usable_database`: deleting somebody else's data, or a
+    graph this build is merely too old to read, is not a recovery.
+
+    Two shapes of unusable reach here, and both are unrecoverable in place:
+    a file SQLite cannot read at all (truncated, half-written, not a
+    database), and a perfectly valid SQLite file whose tables are the wrong
+    shape, which ``CREATE TABLE IF NOT EXISTS`` will not repair.
+    """
+
+    def __init__(self, db_path: str | Path, reason: object) -> None:
+        self.db_path = Path(db_path)
+        self.reason = str(reason)
+        super().__init__(
+            f"the graph database at {self.db_path} is unreadable "
+            f"({self.reason}). Run `code-review-graph build` to rebuild it "
+            "from scratch."
+        )
+
+
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+_CORRUPTION_MESSAGES = (
+    "file is not a database",
+    "database disk image is malformed",
+    "file is encrypted",
+    "malformed database schema",
+)
+
+#: SQLite's wording when a statement names a table or column that is not
+#: shaped the way this schema expects. A file can be perfectly readable and
+#: still answer this way: ``_init_schema`` uses ``CREATE TABLE IF NOT
+#: EXISTS``, so a ``nodes`` table left behind by something else is never
+#: replaced, and the first index or migration that mentions a column it does
+#: not have fails.
+#:
+#: Deliberately narrow, because everything listed here ends in the file being
+#: deleted. "database is locked", "attempt to write a readonly database" and
+#: "disk I/O error" are environment problems and must never cost anyone their
+#: database. "already exists" and "duplicate column name" are excluded for the
+#: same reason: every migration guards its DDL with a check first, so those
+#: two mean two processes migrated the same healthy database at once, not that
+#: the database is wrong.
+_INCOMPATIBLE_SCHEMA_MESSAGES = (
+    "no such column",
+    "no such table",
+    "has no column named",
+)
+
+
+def _is_unreadable_database(db_path: Path, exc: sqlite3.DatabaseError) -> bool:
+    """Distinguish a corrupt database file from an environment problem.
+
+    A missing directory or a permission error also raises
+    ``sqlite3.DatabaseError``; deleting the file would be wrong there, so
+    only SQLite's own corruption messages, or a file that does not carry the
+    SQLite header, count as corruption.
+    """
+    message = str(exc).lower()
+    if any(known in message for known in _CORRUPTION_MESSAGES):
+        return True
+    try:
+        with open(db_path, "rb") as handle:
+            header = handle.read(len(_SQLITE_HEADER))
+    except OSError:
+        return False
+    return bool(header) and not header.startswith(_SQLITE_HEADER)
+
+
+def _has_incompatible_schema(db_path: Path, exc: sqlite3.DatabaseError) -> bool:
+    """True when *db_path* is readable SQLite holding the wrong tables.
+
+    Both halves are required. The message has to name a schema object, which
+    rules out locks, read-only filesystems and I/O errors; and the file has
+    to still answer a read of ``sqlite_master``, which rules out reporting a
+    genuinely broken file as merely mis-shaped.
+    """
+    message = str(exc).lower()
+    if not any(known in message for known in _INCOMPATIBLE_SCHEMA_MESSAGES):
+        return False
+    if not db_path.is_file():
+        # Never let the probe below be the thing that creates the file.
+        return False
+    try:
+        probe = sqlite3.connect(str(db_path), timeout=5)
+    except sqlite3.DatabaseError:
+        return False
+    try:
+        probe.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def discard_corrupt_database(db_path: str | Path) -> bool:
+    """Delete an unusable graph database and its WAL sidecars.
+
+    Returns True when at least one file was removed. Only ever call this
+    where the graph is about to be rebuilt from scratch: the data is gone.
+    """
+    path = Path(db_path)
+    removed = False
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        candidate = path.with_name(path.name + suffix) if suffix else path
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Could not remove %s: %s", candidate, exc)
+            continue
+        removed = True
+    return removed
+
+
 class GraphStore:
     """SQLite-backed code knowledge graph."""
 
@@ -421,6 +553,8 @@ class GraphStore:
         self.db_path = Path(db_path)
         conn: sqlite3.Connection | None = None
         try:
+            # Inside the try on purpose: an unwritable data directory raises
+            # here, and it is one of the failures this constructor explains.
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(
                 str(self.db_path), timeout=30, check_same_thread=False,
@@ -448,18 +582,32 @@ class GraphStore:
             if conn is not None:
                 try:
                     conn.close()
-                except sqlite3.Error:  # pragma: no cover - best-effort cleanup
-                    pass
+                except sqlite3.Error:  # pragma: no cover - dead handle
+                    logger.debug("Could not close %s after a failed open",
+                                 self.db_path)
             if isinstance(exc, GraphStoreError):
+                # Already classified, and already carries its own line:
+                # a foreign SQLite file, a newer schema, or (from a nested
+                # open) an unusable one.
                 raise
             if is_lock_error(exc):
                 # Contention, not damage. Another process holds the write
                 # lock (migrations retry it, so reaching here means it held
                 # on past that); the graph is intact and the answer is to try
                 # again in a moment. Describing it as an unreadable database
-                # would tell the user to delete a healthy graph, and would
-                # hide it from the contention report in ``cli.main``.
+                # would tell the user to delete a healthy graph, would hide it
+                # from the contention report in ``cli.main``, and would send
+                # ``build`` to discard a graph that was never broken.
                 raise
+            if isinstance(exc, sqlite3.DatabaseError) and (
+                _is_unreadable_database(self.db_path, exc)
+                or _has_incompatible_schema(self.db_path, exc)
+            ):
+                # Unusable *and* unrecoverable in place, which is the one
+                # shape a rebuild can fix by itself. Both classifiers are
+                # deliberately narrow: everything they decline keeps the
+                # generic message below and nobody's database is deleted.
+                raise CorruptGraphDatabaseError(self.db_path, exc) from exc
             raise GraphStoreError(
                 _describe_open_failure(self.db_path, exc)
             ) from exc

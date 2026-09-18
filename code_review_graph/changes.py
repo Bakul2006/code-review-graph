@@ -184,6 +184,81 @@ def parse_diff_ranges(
     return parse_git_diff_ranges(repo_root, base, require_vcs=require_vcs)
 
 
+_C_QUOTE_ESCAPES = {
+    "a": "\a", "b": "\b", "f": "\f", "n": "\n",
+    "r": "\r", "t": "\t", "v": "\v", "\\": "\\", '"': '"',
+}
+
+
+def _unquote_c_path(quoted: str) -> str:
+    """Decode git's C-style quoted path back to text.
+
+    With ``core.quotePath`` (the default) git writes a path containing a
+    non-ASCII or control byte as ``"src/caf\\303\\251.py"``: double-quoted,
+    with backslash escapes and three-digit octal escapes for raw bytes. The
+    octal escapes are UTF-8 bytes, so they are reassembled before decoding.
+    """
+    raw = bytearray()
+    index, end = 1, len(quoted) - 1
+    while index < end:
+        char = quoted[index]
+        if char != "\\":
+            raw.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        nxt = quoted[index + 1] if index + 1 < end else ""
+        if nxt in _C_QUOTE_ESCAPES:
+            raw.extend(_C_QUOTE_ESCAPES[nxt].encode("utf-8"))
+            index += 2
+            continue
+        octal = ""
+        while len(octal) < 3 and index + 1 + len(octal) < end:
+            digit = quoted[index + 1 + len(octal)]
+            if digit not in "01234567":
+                break
+            octal += digit
+        if octal:
+            raw.append(int(octal, 8) & 0xFF)
+            index += 1 + len(octal)
+            continue
+        raw.extend(b"\\")
+        index += 1
+    return raw.decode("utf-8", "replace")
+
+
+def _diff_header_path(rest: str) -> str | None:
+    """Extract the post-image path from the text after ``+++ ``.
+
+    Git writes the path three ways, and only the plainest one is a bare
+    ``b/path``: it appends a TAB when the path contains a space, and
+    C-quotes the whole ``"b/path"`` when it contains a non-ASCII or control
+    byte. Returns None for ``/dev/null``, the post-image of a deleted file.
+    """
+    rest = rest.rstrip("\r")
+    if rest.startswith('"'):
+        closing = rest.rfind('"')
+        path = _unquote_c_path(rest[: closing + 1])
+    else:
+        # The trailing TAB is a separator, never part of the path: git emits
+        # one only when the path itself contains a space.
+        path = rest.split("\t", 1)[0]
+    if path.startswith("b/"):
+        path = path[2:]
+        return path or None
+    return None
+
+
+# The post-image header, in every spelling git writes it: a bare ``b/path``,
+# the same with the TAB git appends when the path contains a space, the
+# C-quoted ``"b/path"`` it uses when the path contains a non-ASCII or
+# control byte, and ``/dev/null`` for a deleted file. Anchored on those
+# three shapes so an added line that merely starts with "+++ " is not read
+# as a header.
+_POST_IMAGE_HEADER = re.compile(
+    r'^\+\+\+ (/dev/null|"b/(?:[^"\\]|\\.)*"|b/.*)$'
+)
+
+
 def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     """Parse unified diff output into file -> line-range mappings.
 
@@ -192,15 +267,13 @@ def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     ranges: dict[str, list[tuple[int, int]]] = {}
     current_file: str | None = None
 
-    # Match "+++ b/path/to/file"
-    file_pattern = re.compile(r"^\+\+\+ b/(.+)$")
     # Match "@@ ... +start,count @@" or "@@ ... +start @@"
     hunk_pattern = re.compile(r"^@@ .+? \+(\d+)(?:,(\d+))? @@")
 
     for line in diff_text.splitlines():
-        file_match = file_pattern.match(line)
+        file_match = _POST_IMAGE_HEADER.match(line)
         if file_match:
-            current_file = file_match.group(1)
+            current_file = _diff_header_path(file_match.group(1))
             continue
 
         hunk_match = hunk_pattern.match(line)
