@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | 变量 | 说明 | 默认值 |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Git 操作的超时秒数 | `30` |
+| `CRG_GIT_TIMEOUT` | Git 操作的超时秒数（build / update / watch） | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | 未显式给出文件清单时，用于识别变更的每个 Git 命令的超时秒数 | `5`（不会超过 `CRG_GIT_TIMEOUT`） |
 | `CRG_DATA_DIR` | 存放图谱数据库和生成产物的目录 | - |
 | `CRG_HOOK_WORKTREES` | 设为 `1` 时允许 pre-commit 钩子在链接的 git worktree 中运行 | - |
 | `CRG_EMBEDDING_MODEL` | 本地向量嵌入的默认模型 | `all-MiniLM-L6-v2` |

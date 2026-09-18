@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | चर | विवरण | डिफ़ॉल्ट |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Git संक्रियाओं की समय सीमा (सेकंड में) | `30` |
+| `CRG_GIT_TIMEOUT` | Git संक्रियाओं की समय सीमा (सेकंड में; build / update / watch) | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | जब फ़ाइल सूची स्पष्ट रूप से नहीं दी गई हो, तब बदलाव पता करने वाली प्रत्येक Git कमांड की समय सीमा (सेकंड में) | `5` (`CRG_GIT_TIMEOUT` से अधिक कभी नहीं) |
 | `CRG_DATA_DIR` | ग्राफ़ डेटाबेस और बनी हुई फ़ाइलों की डायरेक्टरी | - |
 | `CRG_HOOK_WORKTREES` | `1` करने पर pre-commit हुक जुड़े हुए git worktree में भी चलता है | - |
 | `CRG_EMBEDDING_MODEL` | स्थानीय वेक्टर एम्बेडिंग का डिफ़ॉल्ट मॉडल | `all-MiniLM-L6-v2` |

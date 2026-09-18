@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Timeout in seconds for Git operations | `30` |
+| `CRG_GIT_TIMEOUT` | Timeout in seconds for Git operations (build, update, watch) | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | Timeout in seconds for each Git command that discovers what changed, when a review tool or command was not given an explicit file list | `5` (never above `CRG_GIT_TIMEOUT`) |
 | `CRG_DATA_DIR` | Directory for graph databases and generated artefacts | - |
 | `CRG_HOOK_WORKTREES` | Set to `1` to let the pre-commit hook run in linked git worktrees | - |
 | `CRG_EMBEDDING_MODEL` | Default model for local vector embeddings | `all-MiniLM-L6-v2` |

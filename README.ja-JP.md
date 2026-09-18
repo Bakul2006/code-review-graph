@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | 変数 | 内容 | 既定値 |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Git 操作のタイムアウト（秒） | `30` |
+| `CRG_GIT_TIMEOUT` | Git 操作のタイムアウト（秒。build / update / watch） | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | ファイル一覧が明示されなかったとき、変更内容を特定する各 Git コマンドのタイムアウト（秒） | `5`（`CRG_GIT_TIMEOUT` を超えない） |
 | `CRG_DATA_DIR` | グラフのデータベースと生成物を置くディレクトリ | - |
 | `CRG_HOOK_WORKTREES` | `1` にすると pre-commit フックをリンク済みの git worktree でも動かす | - |
 | `CRG_EMBEDDING_MODEL` | ローカルのベクトル埋め込みの既定モデル | `all-MiniLM-L6-v2` |

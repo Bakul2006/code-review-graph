@@ -494,12 +494,14 @@ class TestChanges:
         """detect_changes_func returns clean result when no changes detected."""
         from code_review_graph.tools import detect_changes_func
 
-        # Patch _get_store to use our test store,
-        # and get_changed_files/get_staged_and_unstaged to return empty.
+        # Patch _get_store to use our test store, and change discovery to
+        # come back empty.
         with (
             patch("code_review_graph.tools.review._get_store") as mock_get_store,
-            patch("code_review_graph.tools.review.get_changed_files", return_value=[]),
-            patch("code_review_graph.tools.review.get_staged_and_unstaged", return_value=[]),
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=([], "HEAD~1"),
+            ),
             # Prevent the tool from closing our shared store, then restore the
             # real method so teardown releases the database handle on Windows.
             patch.object(self.store, "close"),
@@ -521,7 +523,10 @@ class TestChanges:
 
         with (
             patch("code_review_graph.tools.review._get_store") as mock_get_store,
-            patch("code_review_graph.tools.review.get_changed_files", return_value=["app.py"]),
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=(["app.py"], "HEAD~1"),
+            ),
             patch(
                 "code_review_graph.tools.review.parse_git_diff_ranges",
                 return_value={"app.py": [(1, 10)]},
@@ -539,7 +544,14 @@ class TestChanges:
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
     def test_detect_changes_tool_uses_one_resolved_review_base(self):
-        """File discovery and line ranges must use the same merge base."""
+        """File discovery and line ranges must use the same merge base.
+
+        Discovery resolves the base itself and hands it back, so the line
+        ranges have to be read against the ref discovery actually used, not
+        against the raw ``origin/main`` the caller passed. The chain's own
+        end of this contract is covered by
+        ``test_incremental.TestDiscoverReviewChanges``.
+        """
         from code_review_graph.tools import detect_changes_func
 
         self._add_func("my_func", path="/fake/repo/app.py", line_start=1, line_end=10)
@@ -547,13 +559,12 @@ class TestChanges:
         with (
             patch("code_review_graph.tools.review._get_store") as mock_get_store,
             patch(
-                "code_review_graph.tools.review.resolve_review_base",
-                return_value="merge-base-sha",
-            ) as resolve,
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=(["app.py"], "merge-base-sha"),
+            ) as discover,
             patch(
-                "code_review_graph.tools.review.get_changed_files",
-                return_value=["app.py"],
-            ) as get_changed,
+                "code_review_graph.tools.review.resolve_review_base",
+            ) as resolve,
             patch(
                 "code_review_graph.tools.review.parse_diff_ranges",
                 return_value={"app.py": [(1, 10)]},
@@ -566,8 +577,10 @@ class TestChanges:
             result = detect_changes_func(base="origin/main", repo_root=str(root))
 
         assert result["status"] == "ok"
-        resolve.assert_called_once_with(root, "origin/main")
-        get_changed.assert_called_once_with(root, "merge-base-sha")
+        discover.assert_called_once_with(root, "origin/main")
+        # Resolving again outside the chain would spend the discovery budget
+        # a second time and could pick a different ref.
+        resolve.assert_not_called()
         parse_ranges.assert_called_once_with(str(root), "merge-base-sha")
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 

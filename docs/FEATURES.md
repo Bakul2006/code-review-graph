@@ -74,7 +74,8 @@ Release highlights by version. The full changelog is in [CHANGELOG.md](../CHANGE
 - **Embeddings retry**: exponential backoff for Google Gemini API calls.
 - **Visualisation XSS hardening**: `</` escaped to `<\/` in JSON serialisation.
 - **CLI error handling**: broad `except` split into specific handlers.
-- **Git timeout**: configurable through `CRG_GIT_TIMEOUT`.
+- **Git timeout**: configurable through `CRG_GIT_TIMEOUT` (build, update, watch).
+- **Change-discovery timeout**: `CRG_DISCOVERY_TIMEOUT` bounds each Git command run to work out what changed when no file list was supplied; 5 seconds by default, never above `CRG_GIT_TIMEOUT`.
 - **Governance files**: CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md.
 
 ## v1.8.2

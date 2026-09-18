@@ -372,9 +372,19 @@ class TestDetectChangesCommand:
                     ):
                         cli.main()
 
+        from code_review_graph.constants import discovery_timeout
+
+        budget = discovery_timeout()
         assert json.loads(capsys.readouterr().out)["summary"] == "resolved"
-        resolve.assert_called_once_with(repo.resolve(), "origin/main")
-        get_changed.assert_called_once_with(repo.resolve(), "merge-base-sha")
+        # Discovery runs on its own short budget, not the 30s CRG_GIT_TIMEOUT
+        # that build and update need (#262).
+        resolve.assert_called_once_with(
+            repo.resolve(), "origin/main", timeout=budget,
+        )
+        get_changed.assert_called_once_with(
+            repo.resolve(), "merge-base-sha", timeout=budget,
+        )
+        assert budget <= 5.0
         assert analyze.call_args.kwargs["base"] == "merge-base-sha"
 
     def test_brief_output_includes_token_savings_panel(self, tmp_path, capsys):

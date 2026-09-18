@@ -18,8 +18,7 @@ from ..flows import get_affected_flows as _get_affected_flows
 from ..graph import GraphNode, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import (
-    get_changed_files,
-    get_staged_and_unstaged,
+    discover_review_changes,
     resolve_review_base,
 )
 from ..parser import is_test_file, normalize_file_path
@@ -472,16 +471,15 @@ def get_review_context(
 
     store, root = _get_store(repo_root)
     try:
-        # Resolved once, for both the file list and the hunk lookup below:
-        # an explicit ``changed_files`` list still needs a usable base,
-        # because the snippets are cut to the regions that base changed.
-        base = resolve_review_base(root, base)
-
-        # Get impact radius first
+        # The base is resolved on both branches, for the file list and for the
+        # hunk lookup below: an explicit ``changed_files`` list still needs a
+        # usable base, because the snippets are cut to the regions that base
+        # changed. Discovery resolves it as part of the chain, on the short
+        # discovery budget, so it is never resolved twice.
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
+        else:
+            base = resolve_review_base(root, base)
 
         if not changed_files:
             return {
@@ -830,10 +828,7 @@ def get_affected_flows_func(
     store, root = _get_store(repo_root)
     try:
         if changed_files is None:
-            base = resolve_review_base(root, base)
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
 
         if not changed_files:
             return {
@@ -937,12 +932,11 @@ def detect_changes_func(
 
     store, root = _get_store(repo_root)
     try:
-        base = resolve_review_base(root, base)
         # Detect changed files if not provided.
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
+        else:
+            base = resolve_review_base(root, base)
 
         if not changed_files:
             return {

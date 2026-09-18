@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | 변수 | 내용 | 기본값 |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Git 작업의 제한 시간(초) | `30` |
+| `CRG_GIT_TIMEOUT` | Git 작업의 제한 시간(초, build / update / watch) | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | 파일 목록이 주어지지 않았을 때 변경 내용을 찾는 각 Git 명령의 제한 시간(초) | `5`(`CRG_GIT_TIMEOUT`을 넘지 않음) |
 | `CRG_DATA_DIR` | 그래프 데이터베이스와 생성물이 놓이는 디렉터리 | - |
 | `CRG_HOOK_WORKTREES` | `1`로 두면 pre-commit 훅이 연결된 git worktree에서도 실행 | - |
 | `CRG_EMBEDDING_MODEL` | 로컬 벡터 임베딩의 기본 모델 | `all-MiniLM-L6-v2` |

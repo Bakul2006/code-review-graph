@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, call, patch  # noqa: F401 – used in tests
 
 import pytest
 
+import code_review_graph.constants as constants_module
 import code_review_graph.incremental as incremental_module
+from code_review_graph.constants import discovery_timeout
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
     _create_watch_handler,
@@ -18,6 +20,7 @@ from code_review_graph.incremental import (
     _parse_single_file,
     _should_ignore,
     _single_hop_dependents,
+    discover_review_changes,
     ensure_repo_gitignore_excludes_crg,
     find_dependents,
     find_project_root,
@@ -2001,3 +2004,209 @@ class TestGraphExtraCorruption:
             assert str(tmp_path / "virtual.py") not in files, "virtual=true stays resolver-managed"
         finally:
             store.close()
+
+
+# ---------------------------------------------------------------------------
+# Change discovery: its own budget (#262 cause 2) and a scoped untracked walk
+# (#262 cause 3).
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoveryTimeout:
+    """``discovery_timeout`` is the budget for read-only change discovery."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("CRG_DISCOVERY_TIMEOUT", raising=False)
+
+    def test_default_is_far_below_the_general_git_budget(self):
+        """The point of the variable: discovery cannot inherit 30 seconds.
+
+        Four serial subprocesses at ``CRG_GIT_TIMEOUT`` is a two-minute worst
+        case, which is longer than an MCP client will wait (#262).
+        """
+        assert discovery_timeout() == 5.0
+        assert discovery_timeout() < incremental_module._GIT_TIMEOUT
+
+    def test_env_var_is_read_at_call_time_not_import_time(self, monkeypatch):
+        """``CRG_GIT_TIMEOUT`` is frozen at import; this one must not be.
+
+        A long-lived MCP server, and any test that sets the variable after
+        the module is imported, only sees a value that is read per call.
+        """
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "1.25")
+        assert discovery_timeout() == 1.25
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "0.5")
+        assert discovery_timeout() == 0.5
+
+    def test_explicit_override_may_exceed_the_git_budget(self, monkeypatch):
+        """An explicit value is an instruction, not a hint; it is not clamped."""
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "120")
+        assert discovery_timeout() == 120.0
+
+    def test_zero_is_honoured_so_a_forced_timeout_stays_testable(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "0")
+        assert discovery_timeout() == 0.0
+
+    @pytest.mark.parametrize("bad", ["", "   ", "abc", "1.5.2", "-3", "nan"])
+    def test_invalid_values_fall_back_instead_of_raising(self, bad, monkeypatch):
+        """A bad value inside an MCP tool call must not surface as a crash."""
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", bad)
+        assert discovery_timeout() == 5.0
+
+    def test_default_never_exceeds_a_lowered_git_budget(self, monkeypatch):
+        """Lowering ``CRG_GIT_TIMEOUT`` still lowers discovery."""
+        monkeypatch.setattr(constants_module, "GIT_TIMEOUT", 2)
+        assert discovery_timeout() == 2.0
+
+
+class TestDiscoverReviewChanges:
+    """The chain a review tool runs when it was not given ``changed_files``."""
+
+    def test_every_step_runs_on_the_discovery_budget(self, tmp_path):
+        seen: dict[str, object] = {}
+
+        def fake_resolve(root, base, *, timeout=None):
+            seen["resolve"] = timeout
+            return "merge-base-sha"
+
+        def fake_changed(root, base, *, timeout=None, strict=False):
+            seen["changed"] = (base, timeout)
+            return []
+
+        def fake_staged(root, *, untracked="all", timeout=None):
+            seen["staged"] = (untracked, timeout)
+            return ["a.py"]
+
+        with (
+            patch.object(incremental_module, "resolve_review_base", fake_resolve),
+            patch.object(incremental_module, "get_changed_files", fake_changed),
+            patch.object(incremental_module, "get_staged_and_unstaged", fake_staged),
+        ):
+            files, base = discover_review_changes(tmp_path, "origin/main")
+
+        budget = discovery_timeout()
+        assert files == ["a.py"]
+        assert base == "merge-base-sha"
+        assert seen["resolve"] == budget
+        # The diff runs against the ref discovery resolved, not the raw input.
+        assert seen["changed"] == ("merge-base-sha", budget)
+        assert seen["staged"] == ("normal", budget)
+
+    def test_working_tree_fallback_is_skipped_when_the_diff_answered(
+        self, tmp_path,
+    ):
+        """The expensive ``git status`` only runs when the diff is empty."""
+        with (
+            patch.object(
+                incremental_module, "resolve_review_base",
+                lambda root, base, **kw: base,
+            ),
+            patch.object(
+                incremental_module, "get_changed_files",
+                lambda root, base, **kw: ["app.py"],
+            ),
+            patch.object(incremental_module, "get_staged_and_unstaged") as staged,
+        ):
+            files, _ = discover_review_changes(tmp_path, "HEAD~1")
+
+        assert files == ["app.py"]
+        staged.assert_not_called()
+
+
+class TestVcsBudgetsDefaultToTheGitTimeout:
+    """Build, update and watch must keep the generous per-command budget."""
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_changed_files_defaults_to_git_timeout(self, mock_run, tmp_path):
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_changed_files(tmp_path, "HEAD~1")
+        assert mock_run.call_args.kwargs["timeout"] == incremental_module._GIT_TIMEOUT
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_staged_and_unstaged_defaults_to_git_timeout(
+        self, mock_run, tmp_path,
+    ):
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_staged_and_unstaged(tmp_path)
+        assert mock_run.call_args.kwargs["timeout"] == incremental_module._GIT_TIMEOUT
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_explicit_timeout_is_forwarded(self, mock_run, tmp_path):
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_changed_files(tmp_path, "HEAD~1", timeout=1.5)
+        assert mock_run.call_args.kwargs["timeout"] == 1.5
+
+    def test_incremental_update_never_uses_the_discovery_budget(self, tmp_path):
+        """A build-side update legitimately takes longer than a review.
+
+        It also never reaches the working-tree fallback at all, which is why
+        scoping that fallback's untracked walk cannot affect it.
+        """
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        try:
+            with (
+                patch.object(
+                    incremental_module, "get_changed_files", return_value=[],
+                ) as changed,
+                patch.object(incremental_module, "get_staged_and_unstaged") as staged,
+            ):
+                incremental_update(tmp_path, store, base="HEAD~1")
+        finally:
+            store.close()
+
+        assert changed.called
+        assert "timeout" not in changed.call_args.kwargs
+        staged.assert_not_called()
+
+
+class TestUntrackedScope:
+    """``get_staged_and_unstaged(untracked=...)`` bounds the working-tree walk."""
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_default_still_walks_every_untracked_file(self, mock_run, tmp_path):
+        """Unchanged for every caller that does not opt in."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_staged_and_unstaged(tmp_path)
+        assert "--untracked-files=all" in mock_run.call_args.args[0]
+
+    @pytest.mark.parametrize("mode", ["all", "normal", "no"])
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_mode_reaches_git(self, mock_run, mode, tmp_path):
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_staged_and_unstaged(tmp_path, untracked=mode)
+        assert f"--untracked-files={mode}" in mock_run.call_args.args[0]
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_collapsed_directories_are_not_returned_as_files(
+        self, mock_run, tmp_path,
+    ):
+        """Outside ``all``, git summarises a new directory as one ``dir/``
+        record. Callers treat every string here as a file path, so a
+        directory must not reach them."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=b"?? brandnew/\0?? pkg/newmod.py\0 M src/a.py\0",
+        )
+        assert get_staged_and_unstaged(tmp_path, untracked="normal") == [
+            "pkg/newmod.py", "src/a.py",
+        ]
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_all_keeps_a_path_that_really_ends_in_a_slash(
+        self, mock_run, tmp_path,
+    ):
+        """The drop is scoped to the modes that can produce the placeholder."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"?? weird/\0")
+        assert get_staged_and_unstaged(tmp_path, untracked="all") == ["weird/"]
+
+    def test_unknown_mode_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="untracked must be one of"):
+            get_staged_and_unstaged(tmp_path, untracked="sometimes")

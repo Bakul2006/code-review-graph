@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+import time
 
 import pytest
 
@@ -155,13 +156,45 @@ class TestLongRunningToolsAreAsync:
     ``embed_graph_tool`` — see #46, #136.
     """
 
+    #: Every tool that can reach Git discovery, a graph traversal, FTS,
+    #: an embedding provider or the filesystem, i.e. everything that can
+    #: hold the stdio loop for seconds. Only ``get_docs_section_tool``
+    #: (one bundled Markdown read) and ``list_repos_tool`` (one small
+    #: JSON read) are allowed to stay synchronous; ``test_no_new_sync_tool``
+    #: below fails if that list ever grows.
     HEAVY_TOOLS = {
         "build_or_update_graph_tool",
         "run_postprocess_tool",
         "embed_graph_tool",
         "detect_changes_tool",
         "generate_wiki_tool",
+        "get_minimal_context_tool",
+        "get_impact_radius_tool",
+        "query_graph_tool",
+        "get_review_context_tool",
+        "semantic_search_nodes_tool",
+        "list_graph_stats_tool",
+        "find_large_functions_tool",
+        "list_flows_tool",
+        "get_flow_tool",
+        "get_affected_flows_tool",
+        "list_communities_tool",
+        "get_community_tool",
+        "get_architecture_overview_tool",
+        "refactor_tool",
+        "apply_refactor_tool",
+        "get_wiki_page_tool",
+        "get_hub_nodes_tool",
+        "get_bridge_nodes_tool",
+        "get_knowledge_gaps_tool",
+        "get_surprising_connections_tool",
+        "get_suggested_questions_tool",
+        "traverse_graph_tool",
+        "cross_repo_search_tool",
     }
+
+    #: The only tools allowed to run inline on the event loop.
+    SYNC_TOOLS = {"get_docs_section_tool", "list_repos_tool"}
 
     HEAVY_TOOL_IMPLS = {
         "build_or_update_graph_tool": "build_or_update_graph",
@@ -207,9 +240,19 @@ class TestLongRunningToolsAreAsync:
         )
 
     def test_heavy_tool_source_uses_to_thread(self):
-        """Defense in depth: the source of every heavy tool wrapper must
-        literally call asyncio.to_thread so we don't accidentally turn
-        a tool async without offloading the blocking work."""
+        """Defense in depth: every heavy tool must hand its blocking work
+        to ``_offload``, and ``_offload`` must really run it off the loop.
+
+        The offload used to be copy-pasted into each wrapper, so this
+        checked each wrapper for a literal ``asyncio.to_thread``. There is
+        one implementation now (#262), so the check is in two halves:
+        every wrapper delegates, and the thing they delegate to threads."""
+        offload_source = inspect.getsource(crg_main._offload)
+        assert "asyncio.to_thread" in offload_source, (
+            "_offload must call asyncio.to_thread; it is the single place "
+            "every heavy tool relies on to stay off the stdio event loop. "
+            "See #46, #136, #262."
+        )
         for tool_name in self.HEAVY_TOOLS:
             fn = getattr(crg_main, tool_name, None)
             assert fn is not None, f"{tool_name} not found on module"
@@ -217,11 +260,36 @@ class TestLongRunningToolsAreAsync:
             # through the wrapper to find the underlying source.
             underlying = getattr(fn, "fn", None) or fn
             source = inspect.getsource(underlying)
-            assert "asyncio.to_thread" in source, (
-                f"{tool_name} must call asyncio.to_thread to offload its "
-                f"blocking work; otherwise Windows MCP clients will hang. "
-                f"See #46, #136."
+            assert "_offload(" in source, (
+                f"{tool_name} must hand its blocking work to _offload; "
+                f"otherwise it runs inline and MCP clients see a hang. "
+                f"See #46, #136, #262."
             )
+
+    def test_no_new_sync_tool(self):
+        """A newly added tool is async unless it is deliberately trivial.
+
+        The failure this guards is silent: a tool added as a plain ``def``
+        works in every test that calls it directly and only misbehaves as
+        an unbounded, inline MCP call. Adding one fails here instead."""
+        registered = {
+            name for name in dir(crg_main)
+            if name.endswith("_tool") and not name.startswith("_")
+        }
+        sync = {
+            name for name in registered
+            if not asyncio.iscoroutinefunction(
+                getattr(getattr(crg_main, name), "fn", None) or getattr(crg_main, name)
+            )
+        }
+        assert sync == self.SYNC_TOOLS, (
+            "tools running inline on the event loop changed; either offload "
+            f"the new one via _offload or justify it in SYNC_TOOLS: {sorted(sync)}"
+        )
+        assert registered == self.HEAVY_TOOLS | self.SYNC_TOOLS, (
+            "the registered tool set changed; update HEAVY_TOOLS/SYNC_TOOLS: "
+            f"{sorted(registered ^ (self.HEAVY_TOOLS | self.SYNC_TOOLS))}"
+        )
 
     @pytest.mark.parametrize("tool_name,impl_name", HEAVY_TOOL_IMPLS.items())
     @pytest.mark.asyncio
@@ -271,6 +339,171 @@ class TestLongRunningToolsAreAsync:
         assert result["status"] == "error"
         assert "timed out after 1s" in result["error"]
         assert result["summary"] == result["error"]
+
+    @pytest.mark.parametrize("tool_name,impl_name", [
+        ("get_impact_radius_tool", "get_impact_radius"),
+        ("get_review_context_tool", "get_review_context"),
+        ("get_minimal_context_tool", "get_minimal_context"),
+        ("semantic_search_nodes_tool", "semantic_search_nodes"),
+        ("query_graph_tool", "query_graph"),
+        ("get_affected_flows_tool", "get_affected_flows_func"),
+    ])
+    @pytest.mark.asyncio
+    async def test_offloaded_tool_runs_its_body_off_the_event_loop(
+        self, tool_name, impl_name, monkeypatch,
+    ):
+        """The work itself, not just the wrapper, must leave the loop thread."""
+        loop_thread = threading.get_ident()
+        body_threads: list[int] = []
+
+        def fake_impl(*args, **kwargs):
+            body_threads.append(threading.get_ident())
+            return {"status": "ok"}
+
+        monkeypatch.delenv("CRG_TOOL_TIMEOUT", raising=False)
+        monkeypatch.setattr(crg_main, impl_name, fake_impl)
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = getattr(crg_main, tool_name)
+        underlying = getattr(tool, "fn", None) or tool
+        kwargs = {}
+        if tool_name == "query_graph_tool":
+            kwargs = {"pattern": "callers_of", "target": "x"}
+        elif tool_name == "semantic_search_nodes_tool":
+            kwargs = {"query": "x"}
+
+        result = await underlying(**kwargs)
+
+        assert result == {"status": "ok"}
+        assert body_threads and all(tid != loop_thread for tid in body_threads)
+
+    @pytest.mark.asyncio
+    async def test_a_slow_tool_leaves_the_event_loop_answerable(self, monkeypatch):
+        """The whole point of #262, asserted against a running event loop.
+
+        A tool body that blocks for seconds must not stop the loop from
+        making progress: that is the difference between a slow answer and a
+        client-side MCP -32001 on every other request in flight. A test that
+        only checks ``iscoroutinefunction`` would pass on a wrapper that
+        awaited its blocking work inline.
+        """
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_impl(*args, **kwargs):
+            started.set()
+            release.wait(30)
+            return {"status": "ok"}
+
+        monkeypatch.delenv("CRG_TOOL_TIMEOUT", raising=False)
+        monkeypatch.setattr(crg_main, "get_impact_radius", blocking_impl)
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = crg_main.get_impact_radius_tool
+        underlying = getattr(tool, "fn", None) or tool
+
+        slow = asyncio.create_task(underlying())
+        try:
+            assert await asyncio.to_thread(started.wait, 10)
+            # The loop is free: this sleep resolves on schedule while the
+            # tool is still outstanding.
+            began = time.monotonic()
+            await asyncio.sleep(0.05)
+            elapsed = time.monotonic() - began
+            assert elapsed < 2.0, (
+                f"the event loop was blocked for {elapsed:.2f}s while a tool "
+                "body ran; it must be offloaded via _offload"
+            )
+            assert not slow.done()
+        finally:
+            release.set()
+        assert (await slow)["status"] == "ok"
+
+    @pytest.mark.parametrize("tool_name", [
+        "get_impact_radius_tool",
+        "get_review_context_tool",
+        "get_affected_flows_tool",
+        "get_minimal_context_tool",
+        "detect_changes_tool",
+    ])
+    @pytest.mark.asyncio
+    async def test_tool_timeout_returns_a_named_error_not_an_exception(
+        self, tool_name, monkeypatch,
+    ):
+        """Every offloaded tool answers on timeout, and names itself.
+
+        An MCP client that gets a structured error can say what happened; one
+        that gets nothing reports -32001 and the user has no idea which tool
+        or which budget was involved (#262).
+        """
+        async def fake_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "7")
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = getattr(crg_main, tool_name)
+        underlying = getattr(tool, "fn", None) or tool
+
+        result = await underlying()
+
+        assert result["status"] == "error"
+        assert result["error"] == result["summary"]
+        assert f"{tool_name} timed out after 7s" in result["error"]
+        assert "CRG_TOOL_TIMEOUT" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_detect_changes_keeps_its_own_timeout_advice(self, monkeypatch):
+        """Folding seven copies into one helper must not lose the specifics."""
+        async def fake_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "1")
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+
+        underlying = (
+            getattr(crg_main.detect_changes_tool, "fn", None)
+            or crg_main.detect_changes_tool
+        )
+        result = await underlying()
+
+        assert "CRG_MAX_CHANGED_FUNCS" in result["error"]
+        assert "CRG_MAX_TRANSITIVE_FRONTIER" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_unset_tool_timeout_leaves_the_call_unbounded(self, monkeypatch):
+        """Historical default: no ceiling unless one was asked for."""
+        waited: list[float] = []
+
+        async def fake_wait_for(coro, timeout):
+            waited.append(timeout)
+            return await coro
+
+        monkeypatch.delenv("CRG_TOOL_TIMEOUT", raising=False)
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+        monkeypatch.setattr(
+            crg_main, "get_impact_radius", lambda **kw: {"status": "ok"},
+        )
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        underlying = (
+            getattr(crg_main.get_impact_radius_tool, "fn", None)
+            or crg_main.get_impact_radius_tool
+        )
+
+        assert (await underlying())["status"] == "ok"
+        assert waited == [], "no timeout must be applied when the budget is 0"
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "0")
+        assert (await underlying())["status"] == "ok"
+        assert waited == []
 
     def test_regression_guard_does_not_depend_on_fastmcp_internals(self):
         """Regression guard for #239 bug 3: ensure the async guards above
@@ -361,11 +594,19 @@ class TestGraphBackedToolProvenanceCoverage:
         self, category, tool_names,
     ):
         assert tool_names, f"{category} must name at least one tool"
+        # ``_offload`` stamps provenance for every tool that routes through
+        # it, so a wrapper attaches provenance either directly or by
+        # delegating without opting out. See #262.
+        assert "with_provenance" in inspect.getsource(crg_main._offload)
         for tool_name in tool_names:
             tool = getattr(crg_main, tool_name, None)
             assert tool is not None, f"{category}: missing {tool_name}"
             underlying = getattr(tool, "fn", None) or tool
-            assert "with_provenance" in inspect.getsource(underlying), (
+            source = inspect.getsource(underlying)
+            attaches = "with_provenance" in source or (
+                "_offload(" in source and "provenance=False" not in source
+            )
+            assert attaches, (
                 f"{category}: {tool_name} does not attach graph provenance"
             )
 
@@ -375,7 +616,13 @@ class TestGraphBackedToolProvenanceCoverage:
     def test_non_single_repository_tools_do_not_claim_one_graph(self, tool_name):
         tool = getattr(crg_main, tool_name)
         underlying = getattr(tool, "fn", None) or tool
-        assert "with_provenance" not in inspect.getsource(underlying)
+        source = inspect.getsource(underlying)
+        assert "with_provenance" not in source
+        # Offloading must not smuggle provenance in through the back door:
+        # a tool that spans several repositories, or none, has no single
+        # graph whose freshness it could report.
+        if "_offload(" in source:
+            assert "provenance=False" in source
 
 class TestApplyToolFilter:
     """Tests for _apply_tool_filter (``serve --tools`` / ``CRG_TOOLS``).

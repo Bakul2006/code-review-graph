@@ -2473,13 +2473,20 @@ class TestGetMinimalContext:
         assert not db_path.parent.exists()
 
     def test_mcp_wrapper_reports_missing_graph_without_creating_state(self, tmp_path):
+        import asyncio
+
         from code_review_graph.main import get_minimal_context_tool
 
         repo = tmp_path / "cold-worktree"
         repo.mkdir()
         (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
 
-        result = get_minimal_context_tool(repo_root=str(repo))
+        # The wrapper is a coroutine: it hands the blocking work to a worker
+        # thread so the stdio event loop stays answerable (#262).
+        underlying = (
+            getattr(get_minimal_context_tool, "fn", None) or get_minimal_context_tool
+        )
+        result = asyncio.run(underlying(repo_root=str(repo)))
 
         assert result["status"] == "not_ready"
         assert result["reason"] == "missing_graph"
@@ -2784,7 +2791,9 @@ class TestGraphProvenance:
         assert common_module.with_provenance(existing, str(repo)) is existing
         assert existing["_graph"] == {"updated_at": "existing"}
 
-    def test_registered_sync_tool_preserves_existing_fields(self, tmp_path):
+    def test_registered_tool_preserves_existing_fields(self, tmp_path):
+        import asyncio
+
         from code_review_graph.main import list_graph_stats_tool
 
         repo = self._make_repo(tmp_path, {
@@ -2793,7 +2802,7 @@ class TestGraphProvenance:
         })
         expected = list_graph_stats(repo_root=str(repo))
         underlying = getattr(list_graph_stats_tool, "fn", None) or list_graph_stats_tool
-        result = underlying(repo_root=str(repo))
+        result = asyncio.run(underlying(repo_root=str(repo)))
 
         envelope = result.pop("_graph")
         assert result == expected

@@ -23,6 +23,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
 from .build_state import advance_to_postprocess_pending
+from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
+from .constants import discovery_timeout
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
 
@@ -728,8 +730,6 @@ def _is_binary(path: Path) -> bool:
         return True
 
 
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
-
 # When True, `git ls-files --recurse-submodules` is used so that files
 # inside git submodules are included in the graph.  Opt-in via env var;
 # can also be overridden per-call through function parameters.
@@ -902,7 +902,12 @@ def resolve_incremental_base(repo_root: Path, store: "GraphStore") -> str | None
     return None
 
 
-def resolve_review_base(repo_root: Path, base: str) -> str:
+def resolve_review_base(
+    repo_root: Path,
+    base: str,
+    *,
+    timeout: float | None = None,
+) -> str:
     """Resolve a branch-like Git review base to its common ancestor with HEAD.
 
     ``git diff <branch>`` compares the two tips and therefore includes commits
@@ -914,7 +919,16 @@ def resolve_review_base(repo_root: Path, base: str) -> str:
     If ref detection or merge-base resolution fails (for example in a shallow
     clone), return *base* unchanged so callers retain the existing diff
     behaviour rather than silently reporting no changes.
+
+    Args:
+        repo_root: Repository root directory.
+        base: Git ref to resolve.
+        timeout: Seconds allowed for each Git subprocess. ``None`` (default)
+            uses the general ``CRG_GIT_TIMEOUT`` budget; the change-discovery
+            chain passes the shorter :func:`discovery_timeout` instead.
     """
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     if (
         detect_vcs(repo_root) != "git"
         or not base
@@ -931,7 +945,7 @@ def resolve_review_base(repo_root: Path, base: str) -> str:
             encoding="utf-8",
             errors="replace",
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         symbolic_ref = symbolic.stdout.strip()
@@ -947,7 +961,7 @@ def resolve_review_base(repo_root: Path, base: str) -> str:
             encoding="utf-8",
             errors="replace",
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         resolved = result.stdout.strip()
@@ -965,6 +979,7 @@ def get_changed_files(
     base: str = "HEAD~1",
     *,
     strict: bool = False,
+    timeout: float | None = None,
 ) -> list[str]:
     """Get list of changed files via git diff or svn status.
 
@@ -973,9 +988,24 @@ def get_changed_files(
     range (e.g. ``"r100:HEAD"``) as *base* to compare against a specific
     revision instead.  When *strict* is true, Git discovery failures raise
     instead of being reported as an empty change list.
+
+    Args:
+        repo_root: Repository root directory.
+        base: Git ref (or SVN revision range) to diff against.
+        strict: Raise instead of returning ``[]`` when Git discovery fails.
+        timeout: Seconds allowed for each subprocess. ``None`` (default) uses
+            the general ``CRG_GIT_TIMEOUT`` budget, which is what build,
+            incremental update and watch want; the read-only change-discovery
+            chain passes the shorter :func:`discovery_timeout` instead.
     """
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     if detect_vcs(repo_root) == "svn":
-        return _get_svn_changed_files(repo_root, base if _SAFE_SVN_REV.match(base) else None)
+        return _get_svn_changed_files(
+            repo_root,
+            base if _SAFE_SVN_REV.match(base) else None,
+            timeout=timeout,
+        )
     # Git path
     if base.startswith("-") or not _SAFE_GIT_REF.fullmatch(base):
         logger.warning("Invalid git ref rejected: %s", base)
@@ -989,7 +1019,7 @@ def get_changed_files(
             ["git", "diff", "--name-status", "-z", base, "--"],
             capture_output=True,
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
@@ -1002,7 +1032,7 @@ def get_changed_files(
                 ["git", "diff", "--name-status", "-z", "--cached"],
                 capture_output=True,
                 cwd=str(repo_root),
-                timeout=_GIT_TIMEOUT,
+                timeout=timeout,
                 stdin=subprocess.DEVNULL,
             )
         if result.returncode != 0:
@@ -1058,19 +1088,28 @@ def _find_content_mismatches(
     return mismatched_files, current_hashes, text_files
 
 
-def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> list[str]:
+def _get_svn_changed_files(
+    repo_root: Path,
+    rev_range: str | None = None,
+    *,
+    timeout: float | None = None,
+) -> list[str]:
     """Return changed files in an SVN working copy.
 
     When *rev_range* is given (e.g. ``"r100:HEAD"``), ``svn diff --summarize``
     is used to list files changed between those revisions.  Otherwise
     ``svn status`` reports working-copy modifications.
+
+    *timeout* is the per-subprocess budget; ``None`` uses ``CRG_GIT_TIMEOUT``.
     """
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     try:
         if rev_range:
             result = subprocess.run(
                 ["svn", "diff", "--summarize", "--non-interactive", "-r", rev_range],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                cwd=str(repo_root), timeout=timeout,
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
@@ -1087,7 +1126,7 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
             result = subprocess.run(
                 ["svn", "status", "--non-interactive"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                cwd=str(repo_root), timeout=timeout,
                 stdin=subprocess.DEVNULL,
             )
             files = []
@@ -1104,10 +1143,56 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
     except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return []
 
-def get_staged_and_unstaged(repo_root: Path) -> list[str]:
-    """Get all modified files (staged + unstaged + untracked)."""
+#: Accepted values for ``get_staged_and_unstaged(untracked=...)``, mapping
+#: straight onto ``git status --untracked-files=``.
+UNTRACKED_MODES = ("all", "normal", "no")
+
+
+def get_staged_and_unstaged(
+    repo_root: Path,
+    *,
+    untracked: str = "all",
+    timeout: float | None = None,
+) -> list[str]:
+    """Get all modified files (staged + unstaged + untracked).
+
+    Args:
+        repo_root: Repository root directory.
+        untracked: How far ``git status`` walks untracked paths.
+
+            ``"all"`` (default, unchanged behaviour) lists every untracked
+            file individually, which means ``git status`` stats the entire
+            untracked portion of the working tree -- every file under an
+            un-ignored ``node_modules``, ``build`` or virtualenv directory.
+            On a large tree that walk alone is seconds to minutes, and it is
+            the branch a review tool hits whenever ``git diff <base>`` comes
+            back empty (#262).
+
+            ``"normal"`` reports files in tracked directories individually but
+            collapses a wholly-untracked directory to one entry, so the walk
+            stops at its top. A brand-new module inside an existing package is
+            still seen; only a brand-new *directory* is summarised.
+
+            ``"no"`` skips untracked paths entirely.
+
+            For ``"normal"`` and ``"no"``, collapsed directory entries (the
+            ones Git reports with a trailing ``/``) are dropped from the
+            result, because every caller treats these strings as file paths.
+        timeout: Seconds allowed for the subprocess. ``None`` (default) uses
+            the general ``CRG_GIT_TIMEOUT`` budget; the change-discovery chain
+            passes the shorter :func:`discovery_timeout` instead.
+
+    Raises:
+        ValueError: if *untracked* is not one of :data:`UNTRACKED_MODES`.
+    """
+    if untracked not in UNTRACKED_MODES:
+        raise ValueError(
+            f"untracked must be one of {list(UNTRACKED_MODES)}, got {untracked!r}"
+        )
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     if detect_vcs(repo_root) == "svn":
-        return _get_svn_changed_files(repo_root)
+        return _get_svn_changed_files(repo_root, timeout=timeout)
     try:
         result = subprocess.run(
             [
@@ -1115,11 +1200,11 @@ def get_staged_and_unstaged(repo_root: Path) -> list[str]:
                 "status",
                 "--porcelain=v1",
                 "-z",
-                "--untracked-files=all",
+                f"--untracked-files={untracked}",
             ],
             capture_output=True,
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
@@ -1132,7 +1217,12 @@ def get_staged_and_unstaged(repo_root: Path) -> list[str]:
             record = records[index]
             if len(record) > 3:
                 status = record[:2]
-                files.append(os.fsdecode(record[3:]))
+                path = os.fsdecode(record[3:])
+                # Outside "all", git summarises a wholly-untracked directory as
+                # a single "dir/" record. That is not a file and no caller can
+                # use it, so it is dropped rather than passed on as one.
+                if untracked == "all" or not path.endswith("/"):
+                    files.append(path)
                 # With porcelain -z, a rename/copy record stores the
                 # destination first and its source in the following record.
                 if b"R" in status or b"C" in status:
@@ -1141,6 +1231,42 @@ def get_staged_and_unstaged(repo_root: Path) -> list[str]:
         return files
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
+
+
+def discover_review_changes(
+    repo_root: Path,
+    base: str = "HEAD~1",
+) -> tuple[list[str], str]:
+    """Discover the files under review, on the short discovery budget.
+
+    This is the chain every review-shaped tool and command runs when the
+    caller did not name ``changed_files`` itself: resolve the base, diff
+    against it, and fall back to the working tree when that diff is empty.
+
+    Two things make it different from calling the three functions directly,
+    and both exist because this chain runs inside an MCP tool call that a
+    client will abandon at its own request ceiling (#262):
+
+    * every subprocess gets :func:`discovery_timeout` -- a few seconds -- not
+      the 30-second ``CRG_GIT_TIMEOUT`` that build, update and watch need, so
+      the worst case for the whole chain is seconds rather than two minutes;
+    * the working-tree fallback uses ``untracked="normal"``, which stops
+      ``git status`` from stat-ing every file under every untracked directory.
+
+    Returns:
+        ``(changed_files, resolved_base)``. The resolved base is returned
+        because callers need the same ref afterwards, for diff hunks and risk
+        scoring, and resolving it twice would spend the budget twice.
+    """
+    budget = discovery_timeout()
+    resolved_base = resolve_review_base(repo_root, base, timeout=budget)
+    changed = get_changed_files(repo_root, resolved_base, timeout=budget)
+    if not changed:
+        changed = get_staged_and_unstaged(
+            repo_root, untracked="normal", timeout=budget,
+        )
+    return changed, resolved_base
+
 
 def get_all_tracked_files(
     repo_root: Path,

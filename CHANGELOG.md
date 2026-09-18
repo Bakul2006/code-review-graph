@@ -18,6 +18,11 @@
   (#952).
 - `CRG_HOOK_WORKTREES=1` keeps the generated pre-commit hook active inside
   a linked Git worktree (#953).
+- `CRG_DISCOVERY_TIMEOUT` bounds each Git command that discovers what
+  changed when a review tool or command was not handed an explicit file
+  list. It defaults to 5 seconds, never exceeds `CRG_GIT_TIMEOUT`, and is
+  read on every call rather than frozen at import. `CRG_GIT_TIMEOUT` keeps
+  its 30-second default and still governs build, update and watch (#262).
 
 ### Changed
 
@@ -40,6 +45,22 @@
   another branch. Detection uses the git directory's `commondir` file and
   needs only `git rev-parse --absolute-git-dir` (Git 2.13). Reinstall
   upgrades the exact hook block written by earlier releases (#953).
+- Every MCP tool that can reach Git discovery, a graph traversal, FTS, an
+  embedding provider or the filesystem now runs its work on a worker thread
+  through one shared helper, and `CRG_TOOL_TIMEOUT` bounds all of them
+  rather than `detect_changes_tool` alone. A tool that exceeds the budget
+  answers with `status: error` naming itself and the budget, instead of
+  leaving the client to time the request out itself as MCP error -32001.
+  Only `get_docs_section_tool` and `list_repos_tool` still run inline; they
+  read one small file each (#262, #46, #136).
+- Change discovery no longer asks `git status` for every untracked file.
+  The working-tree fallback passes `--untracked-files=normal`, so a new
+  module in an existing package is still reported by name but a
+  wholly-untracked directory is not walked. On a repository with an empty
+  `git diff HEAD~1` and 250,000 untracked files, `get_impact_radius_tool`
+  goes from 16.8s (reporting all 250,000 as "changed") to 0.02s.
+  `get_staged_and_unstaged` keeps `untracked="all"` as its default, so
+  every other caller is unchanged (#262).
 
 ### Fixed
 
