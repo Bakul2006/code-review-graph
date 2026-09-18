@@ -153,7 +153,8 @@ class TestGoImportForms:
         assert _scopes(edges) == [None]
 
     def test_internal_package_resolves(self, repo):
-        """`internal/` is the bulk of the loss: 3493 of cli/cli's 8687 edges."""
+        """3495 of cli/cli's 8689 go import edges name an in-repo package,
+        1317 of them under `internal/`."""
         edges = _parse(
             repo, "pkg/sub/user.go",
             "package sub\n\n"

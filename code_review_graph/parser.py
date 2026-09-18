@@ -18074,7 +18074,7 @@ class CodeParser:
 
         Dispatches on the call's METHOD, not on whether the node's text
         happens to contain the letters "require". The substring test made
-        15% of jekyll's ruby import edges false positives, with targets
+        14% of jekyll's ruby import edges false positives, with targets
         like ``Missing --ssl_cert or --ssl_key. Both are required.`` from a
         ``raise``, and it never saw ``autoload``, which is how jekyll
         declares its entire internal module graph (49 statements).
