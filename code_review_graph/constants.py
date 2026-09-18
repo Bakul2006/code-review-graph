@@ -188,3 +188,29 @@ def crg_home() -> Path:
     if override:
         return Path(override).expanduser()
     return _DEFAULT_CRG_HOME
+
+
+# ---------------------------------------------------------------------------
+# Directory-scoped import targets
+# ---------------------------------------------------------------------------
+
+#: ``edges.extra`` key that marks an ``IMPORTS_FROM`` target as a DIRECTORY
+#: rather than a file. Two import forms name a directory: a Go import names a
+#: package, and Ruby's ``require_all`` names a tree. Fanning either one out to
+#: one edge per member file makes the edge count grow with imports times
+#: package size -- 73,507 of kubernetes' import edges came from a single such
+#: fan-out -- and makes an incremental update disagree with a rebuild, because
+#: the edge's target set then depends on which files were in the package when
+#: the importing file happened to be parsed. One edge names the directory and
+#: the read path expands it; see ``expand_import_scope`` in graph.py.
+IMPORT_SCOPE_KEY = "import_scope"
+
+#: The target directory's own files are the imported unit; subdirectories are
+#: separate packages and are NOT members. This is Go's rule.
+IMPORT_SCOPE_PACKAGE = "package"
+
+#: Every file below the target directory is a member, at any depth. This is
+#: what the ``require_all`` gem loads.
+IMPORT_SCOPE_TREE = "tree"
+
+IMPORT_SCOPES = (IMPORT_SCOPE_PACKAGE, IMPORT_SCOPE_TREE)
