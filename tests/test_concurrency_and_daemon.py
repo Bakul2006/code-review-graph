@@ -779,14 +779,19 @@ class TestConcurrentAccess:
         """
         db = tmp_path / "graph.db"
         # A v1 database: schema in place, every migration still pending.
+        # parent_name and extra are in the base CREATE TABLE and no migration
+        # adds them, so a real v1 database carries both; the backfills from v13
+        # on read them, and a seed without them would fail for that reason
+        # rather than for the race this test is about.
         seed = sqlite3.connect(str(db))
         seed.executescript(
             "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
             "CREATE TABLE nodes (id INTEGER PRIMARY KEY, kind TEXT, name TEXT,"
-            " qualified_name TEXT UNIQUE, file_path TEXT, updated_at REAL);"
+            " qualified_name TEXT UNIQUE, file_path TEXT, parent_name TEXT,"
+            " extra TEXT DEFAULT '{}', updated_at REAL);"
             "CREATE TABLE edges (id INTEGER PRIMARY KEY, kind TEXT,"
             " source_qualified TEXT, target_qualified TEXT, file_path TEXT,"
-            " updated_at REAL);"
+            " extra TEXT DEFAULT '{}', updated_at REAL);"
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '1');"
         )
         seed.commit()
