@@ -131,8 +131,12 @@ bd close <id>         # Complete work
 
 Three long-lived branches, one direction: feature PR → `staging` (default) → `testing` → `main` → tag → PyPI.
 Open every PR against `staging`. Never push to or open PRs against `testing` or `main`; those only
-receive promotion PRs, which the maintainer merges by hand with a merge commit. Full rules in
-CONTRIBUTING.md "Branching and promotion".
+receive promotion PRs, always merged with a merge commit.
+
+`staging` → `testing` is automatic: `.github/workflows/auto-promote.yml` runs once a day and merges
+the promotion PR when `staging` is ahead and every required check is green. The decision lives in
+`scripts/auto_promote.py`. **Promotion to `main` is never automatic** — the maintainer opens and
+merges that PR by hand. Full rules in CONTRIBUTING.md "Branching and promotion".
 
 ## Session Completion
 

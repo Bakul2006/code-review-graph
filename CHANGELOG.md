@@ -18,6 +18,14 @@
   (#952).
 - `CRG_HOOK_WORKTREES=1` keeps the generated pre-commit hook active inside
   a linked Git worktree (#953).
+- `staging` is promoted to `testing` automatically, once a day, when it has
+  commits `testing` lacks and every required status check is green on its
+  tip. `.github/workflows/auto-promote.yml` opens the promotion pull request
+  and merges it with a merge commit, so contributor authorship survives; the
+  decision lives in `scripts/auto_promote.py` and reads the required
+  contexts from the `testing` ruleset at run time. A hand-started run
+  defaults to a dry run. Promotion to `main` is never automatic and the
+  workflow cannot target it.
 
 ### Changed
 
