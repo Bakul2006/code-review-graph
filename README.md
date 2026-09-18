@@ -662,7 +662,9 @@ pytest
 ```
 
 Pull requests target `staging` (the default branch). Changes are promoted
-`staging` → `testing` → `main`, and releases are tagged from `main`. See
+`staging` → `testing` → `main`, and releases are tagged from `main`. The first
+step runs once a day by itself when `staging` is green; promotion to `main` is
+never automatic. See
 [CONTRIBUTING.md](CONTRIBUTING.md#branching-and-promotion) for the full flow.
 
 To add a built-in language, edit `code_review_graph/parser.py`: add the extension to `EXTENSION_TO_LANGUAGE` and node type mappings to `_CLASS_TYPES`, `_FUNCTION_TYPES`, `_IMPORT_TYPES` and `_CALL_TYPES`. Include a test fixture and open a PR. For a language you only need in one repository, use [`languages.toml`](docs/CUSTOM_LANGUAGES.md) instead.
