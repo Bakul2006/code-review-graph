@@ -18,10 +18,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
 
+import anyio.to_thread
 from fastmcp import FastMCP
 
 from . import __version__
 from . import incremental as _incremental
+from .constants import env_int
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
 from .prompts import (
@@ -91,14 +93,38 @@ def _resolve_repo_root(repo_root: Optional[str]) -> Optional[str]:
 #: Appended to the message a tool returns when ``CRG_TOOL_TIMEOUT`` cuts it
 #: short. ``detect_changes_tool`` keeps its own, which names the two knobs that
 #: actually bound change analysis.
+#:
+#: Deliberately hedged about argument names: this one message is shared by
+#: every bounded tool, and several of them (``list_graph_stats_tool``,
+#: ``get_architecture_overview_tool``) accept none of the three. Advice that
+#: names a parameter the caller cannot pass is worse than no advice.
 _TIMEOUT_HINT = (
-    "Narrow the request (pass changed_files, or lower max_depth / max_results), "
-    "or increase CRG_TOOL_TIMEOUT."
+    "Narrow the request with whichever of changed_files, max_depth or "
+    "max_results this tool accepts, or increase CRG_TOOL_TIMEOUT."
 )
 _DETECT_CHANGES_TIMEOUT_HINT = (
     "Reduce scope with CRG_MAX_CHANGED_FUNCS / CRG_MAX_TRANSITIVE_FRONTIER, "
     "or increase CRG_TOOL_TIMEOUT."
 )
+
+
+async def _run_off_loop(work: Callable[[], dict]) -> dict:
+    """Run *work* on a worker thread, on the same limiter FastMCP uses.
+
+    ``anyio.to_thread.run_sync``, not ``asyncio.to_thread``, and the
+    difference is not cosmetic. A plain ``def`` tool body is dispatched by
+    FastMCP through anyio's default thread limiter (40 slots). Rewriting these
+    tools as ``async def`` takes them off that limiter and onto
+    ``asyncio.to_thread``'s default executor, which is capped at
+    ``min(32, os.cpu_count() + 4)`` -- 8 slots on a 4-core Windows box. Making
+    the server *more* likely to queue was the opposite of the point, so the
+    offload stays on the limiter it came from.
+
+    ``abandon_on_cancel=True`` keeps the semantics ``asyncio.wait_for`` needs:
+    without it, cancelling the await blocks until the thread finishes anyway
+    and the timeout below could never fire.
+    """
+    return await anyio.to_thread.run_sync(work, abandon_on_cancel=True)
 
 
 async def _offload(
@@ -107,6 +133,7 @@ async def _offload(
     root: str | None,
     *,
     provenance: bool = True,
+    bounded: bool = True,
     timeout_hint: str = _TIMEOUT_HINT,
 ) -> dict:
     """Run one blocking tool body off the event loop, optionally bounded.
@@ -116,18 +143,18 @@ async def _offload(
     things happen, and both matter for #262, where a tool call that is quick
     from the CLI comes back to an MCP client as error -32001:
 
-    1. ``asyncio.to_thread`` keeps the work off the stdio event loop, so the
-       server can still answer other requests while it runs. FastMCP's own
-       ``run_in_thread`` default does this for sync tool functions today, but
-       that is a library default inside a ``>=3.2.4,<4`` range, and it is not
-       a promise this server's responsiveness should rest on. See #46, #136.
+    1. The work stays off the stdio event loop, so the server can still answer
+       other requests while it runs. FastMCP's own ``run_in_thread`` default
+       does this for sync tool functions today, but that is a library default
+       inside a ``>=3.2.4,<4`` range, and it is not a promise this server's
+       responsiveness should rest on. See #46, #136.
     2. ``CRG_TOOL_TIMEOUT``, when set above 0, bounds the call. A bounded call
        answers -- with ``status: error`` and a message naming the tool and the
        budget -- where an unbounded one just stops responding until the client
        gives up. That is the difference between a diagnosable result and
        -32001.
 
-    Unset or 0 leaves the call unbounded, which is the historical behaviour
+    Unset or 0 leaves every call unbounded, which is the historical behaviour
     and stays the default.
 
     Args:
@@ -138,28 +165,49 @@ async def _offload(
         provenance: Whether to stamp the result with graph provenance. The
             stamp reads SQLite and spawns ``git rev-parse``, so it runs on the
             worker thread too, never on the event loop.
+        bounded: Whether ``CRG_TOOL_TIMEOUT`` applies. **Default True, and the
+            four long-running tools plus ``apply_refactor_tool`` pass False.**
+
+            A timeout here cancels the *await*, never the thread: there is no
+            way to interrupt a running parse, embed, or file rewrite from
+            outside. For a read-only query that is harmless -- the abandoned
+            worker computes a result nobody reads. For a tool that writes, it
+            is not: ``build_or_update_graph_tool`` would report failure to the
+            client while its worker kept writing ``graph.db``, and the natural
+            retry would run a second concurrent update against the same
+            database. ``apply_refactor_tool`` would report failure with the
+            rename already applied to disk, and its retry would fail again
+            with "not found or expired", leaving a modified tree and two
+            errors.
+
+            These tools were also unbounded before this helper existed, and
+            ``CRG_TOOL_TIMEOUT`` is exactly what #262 tells a user to set to
+            keep review calls responsive. Letting that knob quietly abort
+            their builds would make the documented remedy a new bug.
         timeout_hint: Advice appended to the timeout message.
     """
     def _run() -> dict:
         result = work()
         return with_provenance(result, root) if provenance else result
 
-    coro = asyncio.to_thread(_run)
-    tool_timeout = int(os.environ.get("CRG_TOOL_TIMEOUT", "0"))
-    if tool_timeout > 0:
-        try:
-            return await asyncio.wait_for(coro, timeout=tool_timeout)
-        except asyncio.TimeoutError:
-            message = f"{tool_name} timed out after {tool_timeout}s. {timeout_hint}"
-            error_response = {
-                "status": "error",
-                "error": message,
-                "summary": message,
-            }
-            if not provenance:
-                return error_response
-            return await asyncio.to_thread(with_provenance, error_response, root)
-    return await coro
+    tool_timeout = env_int("CRG_TOOL_TIMEOUT", 0)
+    if not bounded or tool_timeout <= 0:
+        return await _run_off_loop(_run)
+
+    try:
+        return await asyncio.wait_for(_run_off_loop(_run), timeout=tool_timeout)
+    except asyncio.TimeoutError:
+        message = f"{tool_name} timed out after {tool_timeout}s. {timeout_hint}"
+        error_response = {
+            "status": "error",
+            "error": message,
+            "summary": message,
+        }
+        if not provenance:
+            return error_response
+        return await _run_off_loop(
+            lambda: with_provenance(error_response, root)
+        )
 
 
 mcp = FastMCP(
@@ -222,6 +270,9 @@ async def build_or_update_graph_tool(
             embedding_model=embedding_model,
         ),
         root,
+        # Writes graph.db for as long as the repository takes. A timeout
+        # cannot stop the worker, only stop waiting for it. See _offload.
+        bounded=False,
     )
 
 
@@ -261,6 +312,9 @@ async def run_postprocess_tool(
             embedding_model=embedding_model,
         ),
         root,
+        # Writes graph.db for as long as the repository takes. A timeout
+        # cannot stop the worker, only stop waiting for it. See _offload.
+        bounded=False,
     )
 
 
@@ -526,6 +580,7 @@ async def embed_graph_tool(
             repo_root=root, model=model, provider=provider,
         ),
         root,
+        bounded=False,  # writes embeddings; minutes is normal. See _offload.
     )
 
 
@@ -964,6 +1019,10 @@ async def apply_refactor_tool(
             dry_run=dry_run, max_diff_files=max_diff_files,
         ),
         root,
+        # Rewrites source files. Reporting a timeout while the rename lands
+        # anyway leaves the caller a modified tree and a retry that cannot
+        # work: the refactor id is consumed. See _offload.
+        bounded=False,
     )
 
 
@@ -993,6 +1052,7 @@ async def generate_wiki_tool(
             repo_root=root, force=force,
         ),
         root,
+        bounded=False,  # writes the wiki tree; minutes is normal. See _offload.
     )
 
 
@@ -1327,7 +1387,6 @@ def _apply_tool_filter(tools: str | None = None) -> None:
         CRG_TOOLS=query_graph_tool,semantic_search_nodes_tool
     """
     import asyncio
-    import os
 
     raw = tools or os.environ.get("CRG_TOOLS")
     if not raw:

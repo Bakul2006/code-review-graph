@@ -34,6 +34,7 @@ from code_review_graph.incremental import (
     start_watch_thread,
     watch,
 )
+from code_review_graph.errors import ChangeDiscoveryError
 
 
 class TestParseExecutorSelection:
@@ -2018,6 +2019,9 @@ class TestDiscoveryTimeout:
     @pytest.fixture(autouse=True)
     def _clean_env(self, monkeypatch):
         monkeypatch.delenv("CRG_DISCOVERY_TIMEOUT", raising=False)
+        # Both variables matter to the precedence below, so neither may leak
+        # in from the environment the suite happens to run in.
+        monkeypatch.delenv("CRG_GIT_TIMEOUT", raising=False)
 
     def test_default_is_far_below_the_general_git_budget(self):
         """The point of the variable: discovery cannot inherit 30 seconds.
@@ -2061,6 +2065,29 @@ class TestDiscoveryTimeout:
         monkeypatch.setattr(constants_module, "GIT_TIMEOUT", 2)
         assert discovery_timeout() == 2.0
 
+    def test_an_explicitly_raised_git_budget_raises_discovery_too(
+        self, monkeypatch,
+    ):
+        """The documented escape hatch for slow Git must keep working.
+
+        ``CRG_GIT_TIMEOUT`` predates this variable and is what the #262
+        reporters were already told to raise. Capping discovery at 5s
+        regardless would silently ignore an operator who asked for 120 --
+        a knob that stops working is worse than one that never existed.
+        """
+        monkeypatch.setenv("CRG_GIT_TIMEOUT", "120")
+        monkeypatch.setattr(constants_module, "GIT_TIMEOUT", 120)
+        assert discovery_timeout() == 120.0
+
+    def test_discovery_variable_still_wins_over_an_explicit_git_budget(
+        self, monkeypatch,
+    ):
+        """The more specific instruction is the one that applies."""
+        monkeypatch.setenv("CRG_GIT_TIMEOUT", "120")
+        monkeypatch.setattr(constants_module, "GIT_TIMEOUT", 120)
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "3")
+        assert discovery_timeout() == 3.0
+
 
 class TestDiscoverReviewChanges:
     """The chain a review tool runs when it was not given ``changed_files``."""
@@ -2068,16 +2095,18 @@ class TestDiscoverReviewChanges:
     def test_every_step_runs_on_the_discovery_budget(self, tmp_path):
         seen: dict[str, object] = {}
 
-        def fake_resolve(root, base, *, timeout=None):
-            seen["resolve"] = timeout
+        def fake_resolve(root, base, *, timeout=None, require_vcs=False):
+            seen["resolve"] = (timeout, require_vcs)
             return "merge-base-sha"
 
-        def fake_changed(root, base, *, timeout=None, strict=False):
-            seen["changed"] = (base, timeout)
+        def fake_changed(
+            root, base, *, timeout=None, strict=False, require_vcs=False,
+        ):
+            seen["changed"] = (base, timeout, require_vcs)
             return []
 
-        def fake_staged(root, *, untracked="all", timeout=None):
-            seen["staged"] = (untracked, timeout)
+        def fake_staged(root, *, timeout=None, require_vcs=False):
+            seen["staged"] = (timeout, require_vcs)
             return ["a.py"]
 
         with (
@@ -2090,10 +2119,89 @@ class TestDiscoverReviewChanges:
         budget = discovery_timeout()
         assert files == ["a.py"]
         assert base == "merge-base-sha"
-        assert seen["resolve"] == budget
+        # Every step: short budget AND require_vcs. The second is what makes
+        # the first safe -- a budget that runs out has to be reported, not
+        # rounded down to "nothing changed".
+        assert seen["resolve"] == (budget, True)
         # The diff runs against the ref discovery resolved, not the raw input.
-        assert seen["changed"] == ("merge-base-sha", budget)
-        assert seen["staged"] == ("normal", budget)
+        assert seen["changed"] == ("merge-base-sha", budget, True)
+        assert seen["staged"] == (budget, True)
+
+    @pytest.mark.parametrize(
+        "failing_step",
+        ["resolve_review_base", "get_changed_files", "get_staged_and_unstaged"],
+    )
+    def test_a_step_that_runs_out_of_budget_is_raised_not_swallowed(
+        self, failing_step, tmp_path,
+    ):
+        """The whole reason the budget may be short (#262).
+
+        Shortening a budget whose timeout path returns ``[]`` would only make
+        #913's false all-clear easier to hit, and would extend it to the base
+        resolution, where a timed-out merge base silently degrades a three-dot
+        diff into a two-dot one. Each step therefore reports instead.
+        """
+        def timing_out(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=5)
+
+        patches = {
+            "resolve_review_base": lambda root, base, **kw: base,
+            "get_changed_files": lambda root, base, **kw: [],
+            "get_staged_and_unstaged": lambda root, **kw: [],
+        }
+        patches[failing_step] = timing_out
+
+        with (
+            patch.object(
+                incremental_module, "resolve_review_base",
+                patches["resolve_review_base"],
+            ),
+            patch.object(
+                incremental_module, "get_changed_files",
+                patches["get_changed_files"],
+            ),
+            patch.object(
+                incremental_module, "get_staged_and_unstaged",
+                patches["get_staged_and_unstaged"],
+            ),
+            pytest.raises(subprocess.TimeoutExpired),
+        ):
+            discover_review_changes(tmp_path, "HEAD~1")
+
+    def test_a_real_timeout_names_the_budget_that_expired(self, tmp_path):
+        """And the knob that governs it, which is not CRG_GIT_TIMEOUT.
+
+        Advice pointing at a variable that does not control the call the user
+        just made is worse than none.
+        """
+        (tmp_path / ".git").mkdir()
+
+        def timing_out(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=5)
+
+        with (
+            patch("code_review_graph.incremental.subprocess.run", timing_out),
+            pytest.raises(ChangeDiscoveryError) as excinfo,
+        ):
+            discover_review_changes(tmp_path, "HEAD~1")
+
+        assert "CRG_DISCOVERY_TIMEOUT" in str(excinfo.value)
+        assert "CRG_GIT_TIMEOUT" not in str(excinfo.value)
+
+    def test_the_general_git_budget_still_names_its_own_knob(self, tmp_path):
+        """A build-side timeout is not a discovery timeout."""
+        (tmp_path / ".git").mkdir()
+
+        def timing_out(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+        with (
+            patch("code_review_graph.incremental.subprocess.run", timing_out),
+            pytest.raises(ChangeDiscoveryError) as excinfo,
+        ):
+            get_changed_files(tmp_path, "HEAD~1", require_vcs=True)
+
+        assert "CRG_GIT_TIMEOUT" in str(excinfo.value)
 
     def test_working_tree_fallback_is_skipped_when_the_diff_answered(
         self, tmp_path,
@@ -2168,45 +2276,38 @@ class TestVcsBudgetsDefaultToTheGitTimeout:
 
 
 class TestUntrackedScope:
-    """``get_staged_and_unstaged(untracked=...)`` bounds the working-tree walk."""
+    """The working-tree walk stays at ``--untracked-files=all``, on purpose.
+
+    Scoping it down to git's cheaper ``normal`` mode was tried, because that
+    mode does not stat every file under an un-ignored ``node_modules``. It was
+    reverted: ``normal`` collapses a wholly-untracked directory to a single
+    ``dir/`` record, which is not a path any caller can open, so the first
+    commit of every new package vanished from every review tool with
+    ``status: ok``. These tests exist so that trade is not made again by
+    accident.
+    """
 
     @patch("code_review_graph.incremental.subprocess.run")
-    def test_default_still_walks_every_untracked_file(self, mock_run, tmp_path):
-        """Unchanged for every caller that does not opt in."""
+    def test_the_walk_is_untracked_files_all(self, mock_run, tmp_path):
+        """Not a default nobody chose: the review tools depend on it."""
         mock_run.return_value = MagicMock(returncode=0, stdout=b"")
         get_staged_and_unstaged(tmp_path)
-        assert "--untracked-files=all" in mock_run.call_args.args[0]
-
-    @pytest.mark.parametrize("mode", ["all", "normal", "no"])
-    @patch("code_review_graph.incremental.subprocess.run")
-    def test_mode_reaches_git(self, mock_run, mode, tmp_path):
-        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
-        get_staged_and_unstaged(tmp_path, untracked=mode)
-        assert f"--untracked-files={mode}" in mock_run.call_args.args[0]
+        argv = mock_run.call_args.args[0]
+        assert "--untracked-files=all" in argv
+        assert "--untracked-files=normal" not in argv
 
     @patch("code_review_graph.incremental.subprocess.run")
-    def test_collapsed_directories_are_not_returned_as_files(
-        self, mock_run, tmp_path,
-    ):
-        """Outside ``all``, git summarises a new directory as one ``dir/``
-        record. Callers treat every string here as a file path, so a
-        directory must not reach them."""
+    def test_every_record_is_returned_as_a_path(self, mock_run, tmp_path):
+        """No record is filtered out on the way back.
+
+        Under ``all`` git never emits a ``dir/`` placeholder, so a path that
+        does end in a slash is a real path and is kept. Dropping trailing-slash
+        records was how the collapsed-directory bug erased new packages.
+        """
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout=b"?? brandnew/\0?? pkg/newmod.py\0 M src/a.py\0",
+            stdout=b"?? brandnew/a.py\0?? pkg/newmod.py\0 M src/a.py\0?? weird/\0",
         )
-        assert get_staged_and_unstaged(tmp_path, untracked="normal") == [
-            "pkg/newmod.py", "src/a.py",
+        assert get_staged_and_unstaged(tmp_path) == [
+            "brandnew/a.py", "pkg/newmod.py", "src/a.py", "weird/",
         ]
-
-    @patch("code_review_graph.incremental.subprocess.run")
-    def test_all_keeps_a_path_that_really_ends_in_a_slash(
-        self, mock_run, tmp_path,
-    ):
-        """The drop is scoped to the modes that can produce the placeholder."""
-        mock_run.return_value = MagicMock(returncode=0, stdout=b"?? weird/\0")
-        assert get_staged_and_unstaged(tmp_path, untracked="all") == ["weird/"]
-
-    def test_unknown_mode_is_rejected(self, tmp_path):
-        with pytest.raises(ValueError, match="untracked must be one of"):
-            get_staged_and_unstaged(tmp_path, untracked="sometimes")

@@ -24,11 +24,12 @@ from typing import Any, Callable, NamedTuple, Optional
 
 from .build_state import advance_to_postprocess_pending
 from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
-from .constants import discovery_timeout
+from .constants import discovery_timeout, env_float, env_int
+from .errors import ChangeDiscoveryError, GraphRootMismatchError, GraphStoreError
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
 
-_MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
+_MAX_PARSE_WORKERS = env_int("CRG_PARSE_WORKERS", min(os.cpu_count() or 4, 8))
 
 # Set only while the in-process FastMCP server is using stdio transport.
 # This is deliberately separate from ``sys.stdin.isatty()``: CI, cron, and
@@ -289,10 +290,10 @@ NESTED_OUTPUT_DIR_MARKERS: dict[str, frozenset[str]] = {
 # (no file stats), stops at ``CRG_MODULE_SCAN_DEPTH`` levels, never descends
 # into an already-ignored tree, and its result is cached per repository so
 # incremental updates never pay for it twice inside the TTL.
-_MODULE_SCAN_DEPTH = int(os.environ.get("CRG_MODULE_SCAN_DEPTH", "3"))
-_MODULE_SCAN_MAX_DIRS = int(os.environ.get("CRG_MODULE_SCAN_MAX_DIRS", "2000"))
+_MODULE_SCAN_DEPTH = env_int("CRG_MODULE_SCAN_DEPTH", 3)
+_MODULE_SCAN_MAX_DIRS = env_int("CRG_MODULE_SCAN_MAX_DIRS", 2000)
 _MAX_NESTED_OUTPUT_PATTERNS = 200
-_NESTED_IGNORE_TTL_SECONDS = float(os.environ.get("CRG_NESTED_IGNORE_TTL", "300"))
+_NESTED_IGNORE_TTL_SECONDS = env_float("CRG_NESTED_IGNORE_TTL", 300.0)
 
 _nested_ignore_cache: dict[tuple[str, tuple[str, ...]], tuple[float, list[str]]] = {}
 _nested_ignore_lock = threading.Lock()
@@ -414,6 +415,26 @@ def _write_data_dir_gitignore(data_dir: Path) -> None:
             pass
 
 
+def _create_data_dir(data_dir: Path) -> None:
+    """Create the data directory, or say why it could not be created.
+
+    ``GraphStore`` already reports a directory it cannot *write* to as one
+    ``Error: ...`` line naming ``CRG_DATA_DIR``. A directory that cannot be
+    *created* is the same failure one step earlier, and reached the user as a
+    ``PermissionError`` traceback out of ``pathlib.mkdir`` because it happens
+    while the path is still being resolved, before any store exists.
+    """
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise GraphStoreError(
+            f"cannot create the graph data directory at {data_dir} ({exc}). "
+            f"Check the permissions on {data_dir.parent}, or set CRG_DATA_DIR "
+            "to a writable directory."
+        ) from exc
+    _write_data_dir_gitignore(data_dir)
+
+
 def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     """Return the directory where this project's graph data lives.
 
@@ -443,8 +464,7 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
             if registry_data_dir:
                 data_dir = Path(registry_data_dir).resolve()
                 if create:
-                    data_dir.mkdir(parents=True, exist_ok=True)
-                    _write_data_dir_gitignore(data_dir)
+                    _create_data_dir(data_dir)
                 return data_dir
     except Exception as exc:
         # If registry lookup fails, log and fall through to other methods
@@ -458,8 +478,7 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
         data_dir = repo_root / ".code-review-graph"
 
     if create:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        _write_data_dir_gitignore(data_dir)
+        _create_data_dir(data_dir)
 
     return data_dir
 
@@ -907,6 +926,7 @@ def resolve_review_base(
     base: str,
     *,
     timeout: float | None = None,
+    require_vcs: bool = False,
 ) -> str:
     """Resolve a branch-like Git review base to its common ancestor with HEAD.
 
@@ -926,6 +946,17 @@ def resolve_review_base(
         timeout: Seconds allowed for each Git subprocess. ``None`` (default)
             uses the general ``CRG_GIT_TIMEOUT`` budget; the change-discovery
             chain passes the shorter :func:`discovery_timeout` instead.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when git
+            cannot be run or overruns *timeout*, instead of returning *base*
+            unresolved.
+
+            Falling back to the unresolved ref is right for a shallow clone,
+            where there genuinely is no merge base, and wrong for a timeout:
+            the caller then diffs two tips instead of the common ancestor and
+            silently scopes the review to the base branch's commits too. The
+            shorter the budget, the likelier that is, so the discovery chain
+            asks to be told.
     """
     if timeout is None:
         timeout = _GIT_TIMEOUT
@@ -967,11 +998,43 @@ def resolve_review_base(
         resolved = result.stdout.strip()
         if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved):
             return resolved
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if require_vcs:
+            raise _vcs_unavailable("git", exc, timeout=timeout) from exc
 
     logger.debug("Could not resolve review merge base for %s; using it directly", base)
     return base
+
+
+def _vcs_unavailable(
+    tool: str, exc: BaseException, *, timeout: float | None = None,
+) -> ChangeDiscoveryError:
+    """Describe a VCS command that could not be run at all.
+
+    Missing binary and timeout are the two failures that say nothing about
+    the working tree, so a caller must never read them as "nothing changed".
+
+    *timeout* is the budget that actually expired. It matters which one is
+    named: change discovery runs on :func:`~.constants.discovery_timeout`,
+    and telling that caller to raise ``CRG_GIT_TIMEOUT`` would send them to a
+    knob that does not govern the call they just made.
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        budget = _GIT_TIMEOUT if timeout is None else timeout
+        knob = (
+            "CRG_GIT_TIMEOUT"
+            if timeout is None or budget >= _GIT_TIMEOUT
+            else "CRG_DISCOVERY_TIMEOUT"
+        )
+        return ChangeDiscoveryError(
+            f"could not determine the changes: {tool} timed out after "
+            f"{budget:g}s. Raise {knob}, or re-run when the "
+            "repository is not busy."
+        )
+    return ChangeDiscoveryError(
+        f"could not determine the changes: {tool} could not be run ({exc}). "
+        f"Install {tool} and make sure it is on PATH."
+    )
 
 
 def get_changed_files(
@@ -980,6 +1043,7 @@ def get_changed_files(
     *,
     strict: bool = False,
     timeout: float | None = None,
+    require_vcs: bool = False,
 ) -> list[str]:
     """Get list of changed files via git diff or svn status.
 
@@ -997,6 +1061,18 @@ def get_changed_files(
             the general ``CRG_GIT_TIMEOUT`` budget, which is what build,
             incremental update and watch want; the read-only change-discovery
             chain passes the shorter :func:`discovery_timeout` instead.
+        require_vcs: The narrower half of *strict*, for callers whose whole
+            answer is "these files changed": it raises
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            VCS binary is missing or times out, but keeps the documented
+            fallback for a base ref that simply does not resolve (a repository
+            with no commits still has to work). Returning ``[]`` for a VCS that
+            could not be run is what let ``detect-changes`` report a clean tree
+            it never looked at.
+
+            It is also what makes the short *timeout* above safe to use: a
+            budget that is exhausted has to be reported, not rounded down to
+            "no changes".
     """
     if timeout is None:
         timeout = _GIT_TIMEOUT
@@ -1005,12 +1081,13 @@ def get_changed_files(
             repo_root,
             base if _SAFE_SVN_REV.match(base) else None,
             timeout=timeout,
+            require_vcs=require_vcs or strict,
         )
     # Git path
     if base.startswith("-") or not _SAFE_GIT_REF.fullmatch(base):
         logger.warning("Invalid git ref rejected: %s", base)
         if strict:
-            raise RuntimeError(f"invalid git diff base: {base}")
+            raise ChangeDiscoveryError(f"invalid git diff base: {base}")
         return []
     try:
         # --name-status (not --name-only): renames/copies must report BOTH
@@ -1024,7 +1101,7 @@ def get_changed_files(
         )
         if result.returncode != 0:
             if strict:
-                raise RuntimeError(
+                raise ChangeDiscoveryError(
                     f"git diff failed while discovering changed files (rc={result.returncode})"
                 )
             # Fallback: try diff against empty tree (initial commit)
@@ -1039,9 +1116,11 @@ def get_changed_files(
             logger.warning("git diff failed while discovering changed files")
             return []
         return _decode_name_status_paths(result.stdout)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         if strict:
-            raise RuntimeError("git change discovery failed") from exc
+            raise ChangeDiscoveryError("git change discovery failed") from exc
+        if require_vcs:
+            raise _vcs_unavailable("git", exc, timeout=timeout) from exc
         return []
 
 
@@ -1093,6 +1172,7 @@ def _get_svn_changed_files(
     rev_range: str | None = None,
     *,
     timeout: float | None = None,
+    require_vcs: bool = False,
 ) -> list[str]:
     """Return changed files in an SVN working copy.
 
@@ -1101,6 +1181,10 @@ def _get_svn_changed_files(
     ``svn status`` reports working-copy modifications.
 
     *timeout* is the per-subprocess budget; ``None`` uses ``CRG_GIT_TIMEOUT``.
+
+    *require_vcs* has the same meaning as in :func:`get_changed_files`: an
+    ``svn`` that cannot be run is raised rather than reported as "nothing
+    changed".
     """
     if timeout is None:
         timeout = _GIT_TIMEOUT
@@ -1140,59 +1224,46 @@ def _get_svn_changed_files(
                     path = line[8:].strip() if len(line) > 8 else line[1:].strip()
                     files.append(path)
             return files
-    except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if require_vcs:
+            raise _vcs_unavailable("svn", exc, timeout=timeout) from exc
         return []
-
-#: Accepted values for ``get_staged_and_unstaged(untracked=...)``, mapping
-#: straight onto ``git status --untracked-files=``.
-UNTRACKED_MODES = ("all", "normal", "no")
+    except UnicodeDecodeError:
+        return []
 
 
 def get_staged_and_unstaged(
     repo_root: Path,
     *,
-    untracked: str = "all",
     timeout: float | None = None,
+    require_vcs: bool = False,
 ) -> list[str]:
     """Get all modified files (staged + unstaged + untracked).
 
+    ``--untracked-files=all`` is deliberate and load-bearing, not a default
+    nobody chose. It is what makes a brand-new, never-committed directory
+    report the files inside it. Git's cheaper ``normal`` mode collapses such a
+    directory to a single ``dir/`` record, which is not a path any caller can
+    open, so scoping the walk down would delete the first commit of every new
+    feature package from every review. See the note in
+    :func:`discover_review_changes`.
+
     Args:
         repo_root: Repository root directory.
-        untracked: How far ``git status`` walks untracked paths.
-
-            ``"all"`` (default, unchanged behaviour) lists every untracked
-            file individually, which means ``git status`` stats the entire
-            untracked portion of the working tree -- every file under an
-            un-ignored ``node_modules``, ``build`` or virtualenv directory.
-            On a large tree that walk alone is seconds to minutes, and it is
-            the branch a review tool hits whenever ``git diff <base>`` comes
-            back empty (#262).
-
-            ``"normal"`` reports files in tracked directories individually but
-            collapses a wholly-untracked directory to one entry, so the walk
-            stops at its top. A brand-new module inside an existing package is
-            still seen; only a brand-new *directory* is summarised.
-
-            ``"no"`` skips untracked paths entirely.
-
-            For ``"normal"`` and ``"no"``, collapsed directory entries (the
-            ones Git reports with a trailing ``/``) are dropped from the
-            result, because every caller treats these strings as file paths.
         timeout: Seconds allowed for the subprocess. ``None`` (default) uses
             the general ``CRG_GIT_TIMEOUT`` budget; the change-discovery chain
             passes the shorter :func:`discovery_timeout` instead.
-
-    Raises:
-        ValueError: if *untracked* is not one of :data:`UNTRACKED_MODES`.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when git
+            cannot be run or overruns *timeout*, instead of returning ``[]``.
+            A caller whose answer is an all-clear must pass this.
     """
-    if untracked not in UNTRACKED_MODES:
-        raise ValueError(
-            f"untracked must be one of {list(UNTRACKED_MODES)}, got {untracked!r}"
-        )
     if timeout is None:
         timeout = _GIT_TIMEOUT
     if detect_vcs(repo_root) == "svn":
-        return _get_svn_changed_files(repo_root, timeout=timeout)
+        return _get_svn_changed_files(
+            repo_root, timeout=timeout, require_vcs=require_vcs,
+        )
     try:
         result = subprocess.run(
             [
@@ -1200,7 +1271,7 @@ def get_staged_and_unstaged(
                 "status",
                 "--porcelain=v1",
                 "-z",
-                f"--untracked-files={untracked}",
+                "--untracked-files=all",
             ],
             capture_output=True,
             cwd=str(repo_root),
@@ -1217,19 +1288,16 @@ def get_staged_and_unstaged(
             record = records[index]
             if len(record) > 3:
                 status = record[:2]
-                path = os.fsdecode(record[3:])
-                # Outside "all", git summarises a wholly-untracked directory as
-                # a single "dir/" record. That is not a file and no caller can
-                # use it, so it is dropped rather than passed on as one.
-                if untracked == "all" or not path.endswith("/"):
-                    files.append(path)
+                files.append(os.fsdecode(record[3:]))
                 # With porcelain -z, a rename/copy record stores the
                 # destination first and its source in the following record.
                 if b"R" in status or b"C" in status:
                     index += 1
             index += 1
         return files
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if require_vcs:
+            raise _vcs_unavailable("git", exc, timeout=timeout) from exc
         return []
 
 
@@ -1247,23 +1315,49 @@ def discover_review_changes(
     and both exist because this chain runs inside an MCP tool call that a
     client will abandon at its own request ceiling (#262):
 
-    * every subprocess gets :func:`discovery_timeout` -- a few seconds -- not
-      the 30-second ``CRG_GIT_TIMEOUT`` that build, update and watch need, so
-      the worst case for the whole chain is seconds rather than two minutes;
-    * the working-tree fallback uses ``untracked="normal"``, which stops
-      ``git status`` from stat-ing every file under every untracked directory.
+    * every subprocess gets :func:`discovery_timeout` rather than the
+      30-second ``CRG_GIT_TIMEOUT`` that build, update and watch need, so the
+      worst case for the whole chain is seconds rather than two minutes;
+    * every subprocess runs with ``require_vcs=True``, so exhausting that
+      budget raises :class:`~code_review_graph.errors.ChangeDiscoveryError`.
+
+    The second is what licenses the first. Shortening a budget whose timeout
+    path returns ``[]`` would not have made this chain safer -- it would have
+    made #913's false all-clear several times easier to hit, and extended it
+    to the base resolution, where a timed-out merge base silently degrades a
+    three-dot diff into a two-dot one and scopes the review to the wrong
+    commits. Timing out is a failure, and it is now reported as one: callers
+    turn the error into ``status: error`` naming
+    ``CRG_DISCOVERY_TIMEOUT``, which a user can act on, instead of an
+    all-clear they cannot tell from a clean tree.
+
+    Note what this chain deliberately does *not* do: scope down the untracked
+    walk. ``git status --untracked-files=normal`` is much cheaper on a large
+    tree, and it was tried, but it collapses a wholly-untracked directory to
+    one ``dir/`` record -- so the first commit of a new package disappears
+    from every review tool with ``status: ok`` and no warning. Being slow is a
+    bug; confidently reviewing nothing is a worse one. The budget above bounds
+    the walk instead, and reports it when it does.
 
     Returns:
         ``(changed_files, resolved_base)``. The resolved base is returned
         because callers need the same ref afterwards, for diff hunks and risk
         scoring, and resolving it twice would spend the budget twice.
+
+    Raises:
+        ChangeDiscoveryError: git could not be run, or overran the discovery
+            budget. Never raised for a repository that simply has no changes.
     """
     budget = discovery_timeout()
-    resolved_base = resolve_review_base(repo_root, base, timeout=budget)
-    changed = get_changed_files(repo_root, resolved_base, timeout=budget)
+    resolved_base = resolve_review_base(
+        repo_root, base, timeout=budget, require_vcs=True,
+    )
+    changed = get_changed_files(
+        repo_root, resolved_base, timeout=budget, require_vcs=True,
+    )
     if not changed:
         changed = get_staged_and_unstaged(
-            repo_root, untracked="normal", timeout=budget,
+            repo_root, timeout=budget, require_vcs=True,
         )
     return changed, resolved_base
 
@@ -1462,7 +1556,73 @@ def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
     )
 
 
-_MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
+#: How many markers the two filesystem probes below look at. They only have
+#: to establish which root the graph is anchored to, and every marker in one
+#: graph shares that root, so a handful is as conclusive as all of them.
+_ROOT_PROBE_LIMIT = 25
+
+
+def assert_graph_serves_root(repo_root: Path, store: GraphStore) -> None:
+    """Refuse to *answer* from a graph built for a different repository.
+
+    ``_assert_graph_matches_root`` guards the write side only: it runs during
+    incremental reconciliation, where a wrong root would purge files. Every
+    read-only consumer opened the same database without asking, so dropping
+    one repository's ``graph.db`` into another repository (a copied file, a
+    restored CI cache) served that repository's symbols and absolute paths
+    under this repository's name, and exited 0 while doing it.
+
+    Refusing to answer is not destructive the way purging is, so this check
+    is deliberately narrower than the write-side one: it fires only on an
+    unambiguously foreign graph. Four things are not that, and pass:
+
+    * a graph with no authoritative File markers at all;
+    * a graph of repo-relative paths, which carry no root identity;
+    * a different spelling of the same root (macOS ``/var`` against
+      ``/private/var``, a symlinked checkout) — resolved before comparing;
+    * a graph whose files are not on this machine at all, which is stale or
+      synthetic rather than another live checkout being served.
+    """
+    # Materialised, not consumed lazily: this runs on every command, so a
+    # store that answers with something other than a list of paths must skip
+    # the check rather than take the process down with it.
+    markers = [str(path) for path in store.get_file_marker_paths()]
+    absolute = [path for path in markers if Path(path).is_absolute()]
+    if not absolute:
+        return
+
+    prefix = normalize_file_path(_canonical_repo_root(repo_root))
+    prefix = prefix if prefix.endswith("/") else prefix + "/"
+    if any(normalize_file_path(path).startswith(prefix) for path in absolute):
+        return
+
+    probe = absolute[:_ROOT_PROBE_LIMIT]
+    if any(
+        normalize_file_path(os.path.realpath(path)).startswith(prefix)
+        for path in probe
+    ):
+        return
+
+    elsewhere = next((path for path in probe if Path(path).exists()), None)
+    if elsewhere is None:
+        logger.debug(
+            "Graph at %s holds no file under %s and none on this machine; "
+            "treating it as stale rather than as another repository's graph.",
+            store.db_path,
+            repo_root,
+        )
+        return
+
+    raise GraphRootMismatchError(
+        f"the graph at {store.db_path} was built for a different repository "
+        f"root: none of its {len(absolute)} file(s), such as "
+        f"{normalize_file_path(elsewhere)}, are under {repo_root}. Run "
+        "`code-review-graph build` here, or point --repo at the root it was "
+        "built for."
+    )
+
+
+_MAX_DEPENDENT_HOPS = env_int("CRG_DEPENDENT_HOPS", 2)
 _MAX_DEPENDENT_FILES = 500
 
 
@@ -2042,13 +2202,13 @@ def _raise_watch_postprocess_warnings(result: object) -> None:
 # watch per directory in the tree — including every temp directory a build tool
 # churns through inside ``target/`` or ``node_modules/``.  Planning the watches
 # ourselves keeps ignored trees off the OS watch list entirely.  See: #811.
-_WATCH_PLAN_DEPTH = int(os.environ.get("CRG_WATCH_PLAN_DEPTH", "3"))
-_MAX_WATCH_SCHEDULES = int(os.environ.get("CRG_MAX_WATCH_SCHEDULES", "24"))
+_WATCH_PLAN_DEPTH = env_int("CRG_WATCH_PLAN_DEPTH", 3)
+_MAX_WATCH_SCHEDULES = env_int("CRG_MAX_WATCH_SCHEDULES", 24)
 # Splitting a watch costs one watchdog emitter, so it has to buy more than it
 # costs: an ignored tree is only worth excluding once it holds this many
 # directories.  A lone ``__pycache__`` is not worth a thread; ``target/`` is.
-_WATCH_SPLIT_MIN_DIRS = int(os.environ.get("CRG_WATCH_SPLIT_MIN_DIRS", "4"))
-_WATCH_HEALTH_INTERVAL = float(os.environ.get("CRG_WATCH_HEALTH_INTERVAL", "10"))
+_WATCH_SPLIT_MIN_DIRS = env_int("CRG_WATCH_SPLIT_MIN_DIRS", 4)
+_WATCH_HEALTH_INTERVAL = env_float("CRG_WATCH_HEALTH_INTERVAL", 10.0)
 _WATCH_STOP_TIMEOUT = 10.0
 _WATCH_TICK_SECONDS = 1.0
 # A failed recursive promotion is retried no more often than this. Each attempt
@@ -2059,7 +2219,7 @@ _PROMOTION_RETRY_SECONDS = 30.0
 # longer exist on every reconciliation tick, so reaching this cap means a tree
 # that genuinely cannot be watched is larger than anyone will read; keeping the
 # most recent refusals is more useful than keeping the first ones.
-_MAX_UNWATCHED_TRACKED = int(os.environ.get("CRG_MAX_UNWATCHED_TRACKED", "256"))
+_MAX_UNWATCHED_TRACKED = env_int("CRG_MAX_UNWATCHED_TRACKED", 256)
 
 
 def _watch_child_dirs(

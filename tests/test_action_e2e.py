@@ -92,6 +92,9 @@ STEP_BUILD = "Build or update the graph"
 STEP_ANALYZE = "Run risk-scored change analysis"
 STEP_RENDER = "Render markdown report"
 STEP_COMMENT = "Upsert sticky PR comment"
+# Unconditional, and separate from the risk gate on purpose: "no analysis
+# happened" is not a risk level, so `fail-on-risk: none` cannot switch it off.
+STEP_ANALYSIS_RAN = "Fail when the analysis did not run"
 STEP_GATE = "Enforce risk gate"
 
 # Caps the privileged workflow enforces on the artifact it downloads.
@@ -798,6 +801,7 @@ def test_canary_action_steps_are_the_real_ones():
         STEP_ANALYZE,
         STEP_RENDER,
         STEP_COMMENT,
+        STEP_ANALYSIS_RAN,
         STEP_GATE,
     ], f"action.yml step list changed: {names}"
     build = action_steps()[STEP_BUILD]["run"]

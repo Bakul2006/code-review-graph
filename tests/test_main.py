@@ -8,8 +8,10 @@ stdio event loop stays responsive during long-running operations.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
+import textwrap
 import threading
 import time
 
@@ -247,10 +249,12 @@ class TestLongRunningToolsAreAsync:
         checked each wrapper for a literal ``asyncio.to_thread``. There is
         one implementation now (#262), so the check is in two halves:
         every wrapper delegates, and the thing they delegate to threads."""
-        offload_source = inspect.getsource(crg_main._offload)
-        assert "asyncio.to_thread" in offload_source, (
-            "_offload must call asyncio.to_thread; it is the single place "
-            "every heavy tool relies on to stay off the stdio event loop. "
+        offload_source = inspect.getsource(crg_main._run_off_loop)
+        assert "anyio.to_thread.run_sync" in offload_source, (
+            "_offload must thread its work through anyio.to_thread.run_sync; "
+            "it is the single place every heavy tool relies on to stay off "
+            "the stdio event loop. anyio and not asyncio.to_thread: see "
+            "test_the_offload_uses_the_same_limiter_fastmcp_does. "
             "See #46, #136, #262."
         )
         for tool_name in self.HEAVY_TOOLS:
@@ -504,6 +508,113 @@ class TestLongRunningToolsAreAsync:
         monkeypatch.setenv("CRG_TOOL_TIMEOUT", "0")
         assert (await underlying())["status"] == "ok"
         assert waited == []
+
+    #: Offloaded, but never bounded by ``CRG_TOOL_TIMEOUT``. Each either
+    #: writes (graph.db, embeddings, the wiki tree, the source tree itself)
+    #: or legitimately runs for minutes, and ``asyncio.wait_for`` cancels the
+    #: await rather than the worker thread -- so a "timeout" here reports
+    #: failure to the client while the write goes on regardless.
+    UNBOUNDED_TOOLS = {
+        "build_or_update_graph_tool": "build_or_update_graph",
+        "run_postprocess_tool": "run_postprocess",
+        "embed_graph_tool": "embed_graph",
+        "generate_wiki_tool": "generate_wiki_func",
+        "apply_refactor_tool": "apply_refactor_func",
+    }
+
+    @pytest.mark.parametrize("tool_name,impl_name", UNBOUNDED_TOOLS.items())
+    @pytest.mark.asyncio
+    async def test_writing_tools_are_never_cut_short_by_the_tool_timeout(
+        self, tool_name, impl_name, monkeypatch,
+    ):
+        """These were unbounded before the shared helper existed, and stay so.
+
+        ``CRG_TOOL_TIMEOUT`` is exactly what #262 tells a user to set to keep
+        review calls responsive. If that also aborted their build, the
+        documented remedy would be a new bug -- and the abandoned worker would
+        keep writing graph.db while the client was told the call failed, so a
+        retry would run a second update against the same database.
+        """
+        waited: list[float] = []
+
+        async def fake_wait_for(coro, timeout):
+            waited.append(timeout)
+            return await coro
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "1")
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+        monkeypatch.setattr(
+            crg_main, impl_name, lambda *a, **kw: {"status": "ok"},
+        )
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = getattr(crg_main, tool_name)
+        underlying = getattr(tool, "fn", None) or tool
+        kwargs = {"refactor_id": "x"} if tool_name == "apply_refactor_tool" else {}
+
+        assert (await underlying(**kwargs))["status"] == "ok"
+        assert waited == [], (
+            f"{tool_name} must not be bounded by CRG_TOOL_TIMEOUT: a timeout "
+            "cannot stop its worker, only stop waiting for it"
+        )
+
+    @pytest.mark.parametrize("bad", ["", "   ", "abc", "2.5", "30s", "-1"])
+    @pytest.mark.asyncio
+    async def test_an_unusable_tool_timeout_does_not_break_every_tool(
+        self, bad, monkeypatch,
+    ):
+        """One bad env var must not take the whole server down.
+
+        ``int(os.environ.get(...))`` here used to raise before any work ran.
+        The README calls this "Timeout in seconds", so "2.5" is a plausible
+        thing to write, and an MCP config with ``"env": {"...": ""}`` produces
+        the empty string for free. #912's env_int warns and falls back.
+        """
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", bad)
+        monkeypatch.setattr(
+            crg_main, "get_impact_radius", lambda **kw: {"status": "ok"},
+        )
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        underlying = (
+            getattr(crg_main.get_impact_radius_tool, "fn", None)
+            or crg_main.get_impact_radius_tool
+        )
+
+        assert (await underlying())["status"] == "ok"
+
+    def test_the_offload_uses_the_same_limiter_fastmcp_does(self):
+        """``asyncio.to_thread``'s executor is smaller than anyio's limiter.
+
+        A plain ``def`` tool body is dispatched by FastMCP through anyio's
+        default thread limiter (40 slots). Rewriting these tools as
+        ``async def`` and threading them with ``asyncio.to_thread`` moves them
+        onto its default executor, capped at ``min(32, cpu_count + 4)`` -- 8
+        slots on a 4-core Windows box. Queueing sooner than staging did would
+        be the opposite of the point of #262.
+        """
+        # The docstring explains the contrast, so read the code, not the prose.
+        tree = ast.parse(textwrap.dedent(inspect.getsource(crg_main._run_off_loop)))
+        func = tree.body[0]
+        statements = [
+            node for node in func.body
+            if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+        ]
+        body = "\n".join(ast.unparse(node) for node in statements)
+        assert "anyio.to_thread.run_sync" in body
+        assert "asyncio.to_thread" not in body
+        # abandon_on_cancel: without it, cancelling the await blocks until the
+        # thread finishes anyway and the timeout could never fire.
+        assert "abandon_on_cancel=True" in body
+
+    def test_the_shared_timeout_hint_names_no_argument_as_universal(self):
+        """Several bounded tools accept none of changed_files / max_depth /
+        max_results. Advice naming a parameter the caller cannot pass is
+        worse than no advice, so the shared message stays hedged."""
+        assert "whichever of" in crg_main._TIMEOUT_HINT
+        assert "CRG_TOOL_TIMEOUT" in crg_main._TIMEOUT_HINT
 
     def test_regression_guard_does_not_depend_on_fastmcp_internals(self):
         """Regression guard for #239 bug 3: ensure the async guards above

@@ -377,12 +377,15 @@ class TestDetectChangesCommand:
         budget = discovery_timeout()
         assert json.loads(capsys.readouterr().out)["summary"] == "resolved"
         # Discovery runs on its own short budget, not the 30s CRG_GIT_TIMEOUT
-        # that build and update need (#262).
+        # that build and update need (#262), and with require_vcs throughout:
+        # detect-changes' exit code is a review gate, so a git it could not
+        # run -- including one that overran that budget -- must not be
+        # reported as "no changes".
         resolve.assert_called_once_with(
-            repo.resolve(), "origin/main", timeout=budget,
+            repo.resolve(), "origin/main", timeout=budget, require_vcs=True,
         )
         get_changed.assert_called_once_with(
-            repo.resolve(), "merge-base-sha", timeout=budget,
+            repo.resolve(), "merge-base-sha", timeout=budget, require_vcs=True,
         )
         assert budget <= 5.0
         assert analyze.call_args.kwargs["base"] == "merge-base-sha"

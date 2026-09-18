@@ -9,6 +9,69 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Numeric environment overrides (#912)
+# ---------------------------------------------------------------------------
+#
+# Most of these are read at module scope, so a typo in a shell profile used to
+# abort the import with a bare ``ValueError: invalid literal for int()`` — a
+# traceback that never named the variable at fault and killed every command,
+# including the ones that do not use the setting. One helper, used by every
+# numeric override in the package, keeps that impossible: an unusable value
+# falls back to the documented default and says so once, by name.
+
+_warned_env_vars: set[str] = set()
+
+
+def _warn_invalid_env(name: str, raw: str, default: object) -> None:
+    """Warn once per variable that its value was ignored."""
+    if name in _warned_env_vars:
+        return
+    _warned_env_vars.add(name)
+    logger.warning(
+        "Ignoring invalid %s=%r (not a number); using the default %s.",
+        name,
+        raw,
+        default,
+    )
+
+
+def env_int(name: str, default: int) -> int:
+    """Read *name* as an int, falling back to *default* when it is unusable.
+
+    An unset variable is the default silently; a set-but-unparseable one
+    (empty string, word, version number) is the default *and* a warning
+    naming the variable, so the operator can find the typo.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        _warn_invalid_env(name, raw, default)
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    """Read *name* as a float. See :func:`env_int` for the fallback rules.
+
+    NaN and infinity are rejected alongside unparseable text: they are
+    accepted by ``float()`` but poison every comparison they reach.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+    except (TypeError, ValueError):
+        _warn_invalid_env(name, raw, default)
+        return default
+    if not math.isfinite(value):
+        _warn_invalid_env(name, raw, default)
+        return default
+    return value
+
 
 def _bounded_float_env(
     name: str,
@@ -57,11 +120,19 @@ SECURITY_KEYWORDS: frozenset[str] = frozenset({
 #: ``incremental.py:731``. Two definitions of one budget is one too many —
 #: they cannot be told apart at a call site and they drift. Both modules now
 #: alias this one.
-GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds
+GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30)  # seconds
 
 #: Seconds allowed for one subprocess in the change-discovery chain when
-#: ``CRG_DISCOVERY_TIMEOUT`` is unset.
+#: neither ``CRG_DISCOVERY_TIMEOUT`` nor ``CRG_GIT_TIMEOUT`` is set.
 DISCOVERY_TIMEOUT_DEFAULT = 5.0
+
+#: Name of the variable that sets :func:`discovery_timeout` directly.
+DISCOVERY_TIMEOUT_ENV = "CRG_DISCOVERY_TIMEOUT"
+
+#: Name of the general Git budget's variable. Read here as a *string* to tell
+#: "the operator set this" from "it defaulted to 30", which :data:`GIT_TIMEOUT`
+#: alone cannot express.
+GIT_TIMEOUT_ENV = "CRG_GIT_TIMEOUT"
 
 
 def discovery_timeout() -> float:
@@ -74,42 +145,50 @@ def discovery_timeout() -> float:
     worst case, which is how one MCP review call overruns a client's request
     ceiling and comes back as MCP error -32001 (#262). All discovery is ever
     answering is "what am I looking at?", so it gets its own, far shorter
-    budget, and build/update/watch keep the generous one.
+    budget by default, and build/update/watch keep the generous one.
+
+    A short budget is only safe because discovery runs with ``require_vcs``:
+    exhausting it raises
+    :class:`~code_review_graph.errors.ChangeDiscoveryError` rather than
+    returning an empty list. Shortening a budget that failed *silently* would
+    only make a wrong all-clear more likely; shortening one that fails *loudly*
+    trades a client-side -32001 for a message naming the knob.
 
     Resolved on **every call**, deliberately. ``CRG_GIT_TIMEOUT`` is parsed
     once at import into :data:`GIT_TIMEOUT`, so a test or a long-lived MCP
     server that sets that variable afterwards never sees the new value.
-    Whatever ``CRG_DISCOVERY_TIMEOUT`` says when a discovery call starts is
-    what that call uses.
+    Whatever these variables say when a discovery call starts is what that
+    call uses.
 
     Precedence:
 
     1. ``CRG_DISCOVERY_TIMEOUT``, when it parses as a number >= 0. Used as
        given, including values above :data:`GIT_TIMEOUT` -- an explicit
        override is an instruction, not a hint.
-    2. Otherwise ``min(5.0, GIT_TIMEOUT)``: short by default, but never longer
-       than the general Git budget, so lowering ``CRG_GIT_TIMEOUT`` still
-       lowers discovery.
+    2. Otherwise ``CRG_GIT_TIMEOUT`` when the operator set it, verbatim.
+       Raising that variable is the documented answer to slow Git, and it
+       predates this one; a new default must not quietly cap it. Someone who
+       asked for 120 seconds of Git gets 120 seconds of discovery.
+    3. Otherwise :data:`DISCOVERY_TIMEOUT_DEFAULT`, capped at
+       :data:`GIT_TIMEOUT` so an unset-but-lowered general budget still wins.
 
-    An unparseable or negative value logs a warning and falls back to (2)
-    rather than leaving discovery unbounded or raising inside a tool call.
+    An unparseable or negative value logs a warning and falls back to the next
+    rule rather than leaving discovery unbounded or raising inside a tool call.
     """
-    fallback = min(DISCOVERY_TIMEOUT_DEFAULT, float(GIT_TIMEOUT))
-    raw = os.environ.get("CRG_DISCOVERY_TIMEOUT")
+    explicit_git = os.environ.get(GIT_TIMEOUT_ENV)
+    if explicit_git is not None and explicit_git.strip():
+        fallback = float(GIT_TIMEOUT)
+    else:
+        fallback = min(DISCOVERY_TIMEOUT_DEFAULT, float(GIT_TIMEOUT))
+
+    raw = os.environ.get(DISCOVERY_TIMEOUT_ENV)
     if raw is None or not raw.strip():
         return fallback
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
+    value = env_float(DISCOVERY_TIMEOUT_ENV, fallback)
+    if value < 0:
         logger.warning(
-            "CRG_DISCOVERY_TIMEOUT=%r is not a number; using %.3gs for "
-            "change discovery", raw, fallback,
-        )
-        return fallback
-    if not math.isfinite(value) or value < 0:
-        logger.warning(
-            "CRG_DISCOVERY_TIMEOUT=%r must be a finite, non-negative number "
-            "of seconds; using %.3gs for change discovery", raw, fallback,
+            "Ignoring invalid %s=%r (negative); using %.3gs for change "
+            "discovery.", DISCOVERY_TIMEOUT_ENV, raw, fallback,
         )
         return fallback
     return value
@@ -118,10 +197,10 @@ def discovery_timeout() -> float:
 # ---------------------------------------------------------------------------
 # Configurable limits (override via environment variables)
 # ---------------------------------------------------------------------------
-MAX_IMPACT_NODES = int(os.environ.get("CRG_MAX_IMPACT_NODES", "500"))
-MAX_IMPACT_DEPTH = int(os.environ.get("CRG_MAX_IMPACT_DEPTH", "2"))
-MAX_BFS_DEPTH = int(os.environ.get("CRG_MAX_BFS_DEPTH", "15"))
-MAX_SEARCH_RESULTS = int(os.environ.get("CRG_MAX_SEARCH_RESULTS", "20"))
+MAX_IMPACT_NODES = env_int("CRG_MAX_IMPACT_NODES", 500)
+MAX_IMPACT_DEPTH = env_int("CRG_MAX_IMPACT_DEPTH", 2)
+MAX_BFS_DEPTH = env_int("CRG_MAX_BFS_DEPTH", 15)
+MAX_SEARCH_RESULTS = env_int("CRG_MAX_SEARCH_RESULTS", 20)
 
 # Impact traversal engine: "sql" (bounded SQLite relaxation) or "networkx".
 BFS_ENGINE = os.environ.get("CRG_BFS_ENGINE", "sql")

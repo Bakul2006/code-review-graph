@@ -47,20 +47,32 @@
   upgrades the exact hook block written by earlier releases (#953).
 - Every MCP tool that can reach Git discovery, a graph traversal, FTS, an
   embedding provider or the filesystem now runs its work on a worker thread
-  through one shared helper, and `CRG_TOOL_TIMEOUT` bounds all of them
-  rather than `detect_changes_tool` alone. A tool that exceeds the budget
-  answers with `status: error` naming itself and the budget, instead of
-  leaving the client to time the request out itself as MCP error -32001.
-  Only `get_docs_section_tool` and `list_repos_tool` still run inline; they
-  read one small file each (#262, #46, #136).
-- Change discovery no longer asks `git status` for every untracked file.
-  The working-tree fallback passes `--untracked-files=normal`, so a new
-  module in an existing package is still reported by name but a
-  wholly-untracked directory is not walked. On a repository with an empty
-  `git diff HEAD~1` and 250,000 untracked files, `get_impact_radius_tool`
-  goes from 16.8s (reporting all 250,000 as "changed") to 0.02s.
-  `get_staged_and_unstaged` keeps `untracked="all"` as its default, so
-  every other caller is unchanged (#262).
+  through one shared helper. A tool that exceeds `CRG_TOOL_TIMEOUT` answers
+  with `status: error` naming itself and the budget, instead of leaving the
+  client to time the request out itself as MCP error -32001. Only
+  `get_docs_section_tool` and `list_repos_tool` still run inline; they read
+  one small file each (#262, #46, #136).
+
+  `CRG_TOOL_TIMEOUT` keeps its meaning: it bounds read-only tools, and it
+  does **not** bound `build_or_update_graph_tool`, `run_postprocess_tool`,
+  `embed_graph_tool`, `generate_wiki_tool` or `apply_refactor_tool`. Those
+  write — to `graph.db`, to the wiki tree, to your source files — and a
+  timeout cancels the wait, not the worker, so bounding them would report
+  failure to the client while the write went on regardless.
+- Change discovery is bounded honestly. Each Git command in the chain that
+  works out what changed gets `CRG_DISCOVERY_TIMEOUT` (5 seconds) rather
+  than the 30-second `CRG_GIT_TIMEOUT`, and runs with `require_vcs`, so
+  exhausting that budget raises a `ChangeDiscoveryError` and the tool
+  answers `status: error`. Shortening a budget that failed *silently* would
+  only have made #913's false all-clear easier to hit, and would have
+  extended it to the base resolution, where a timed-out merge base
+  degrades a three-dot diff into a two-dot one. Raising `CRG_GIT_TIMEOUT`
+  still raises discovery with it, so the documented remedy for slow Git
+  keeps working (#262).
+- `get_minimal_context_tool` runs its change discovery on that same budget.
+  It previously spent up to ~130 seconds on five Git subprocesses of its
+  own — the tool agents are told to call first, and the one most likely to
+  hit a client's request ceiling (#262).
 
 ### Fixed
 

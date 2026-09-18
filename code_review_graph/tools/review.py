@@ -14,6 +14,7 @@ from ..changes import (  # noqa: F401
     parse_git_diff_ranges,
 )
 from ..context_savings import attach_context_savings, estimate_file_tokens
+from ..errors import ChangeDiscoveryError
 from ..flows import get_affected_flows as _get_affected_flows
 from ..graph import GraphNode, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
@@ -24,6 +25,7 @@ from ..incremental import (
 from ..parser import is_test_file, normalize_file_path
 from ._common import (
     _bounded,
+    _error_response,
     _get_store,
     _resolve_graph_file_paths,
     _shown_of,
@@ -712,6 +714,12 @@ def get_review_context(
         }
         attach_context_savings(result, original_tokens=original_tokens)
         return result
+    except ChangeDiscoveryError as exc:
+        # Distinct from the "no changed files" answer above, and deliberately
+        # so: that one is an all-clear a client will act on. Git that could
+        # not be run, or that overran the discovery budget, says nothing
+        # about the working tree (#262).
+        return _error_response(str(exc))
     finally:
         store.close()
 
@@ -934,6 +942,12 @@ def detect_changes_func(
     try:
         # Detect changed files if not provided.
         if changed_files is None:
+            # discover_review_changes carries require_vcs through the whole
+            # chain: the "no changed files" answer below is an all-clear, and
+            # a git that could not be run (or overran the discovery budget)
+            # must not produce it. The ChangeDiscoveryError becomes
+            # {"status": "error"} instead, so a client can tell "nothing to
+            # review" from "could not look".
             changed_files, base = discover_review_changes(root, base)
         else:
             base = resolve_review_base(root, base)
@@ -956,6 +970,9 @@ def detect_changes_func(
         abs_files = [normalize_file_path(root / f) for f in changed_files]
 
         # Parse diff ranges for line-level mapping.
+        # Lenient on purpose: the changed-file list above is already known
+        # to be non-empty, so an unreadable line-level diff costs precision,
+        # not honesty. analyze_changes records the degradation.
         diff_ranges = parse_diff_ranges(str(root), base)
         # Remap to absolute paths so they match graph file_paths.
         abs_ranges: dict[str, list[tuple[int, int]]] = {}
