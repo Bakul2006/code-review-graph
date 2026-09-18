@@ -34,12 +34,14 @@ from code_review_graph.errors import (
     CodeReviewGraphError,
     GraphRootMismatchError,
     GraphStoreError,
+    is_lock_error,
 )
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
     assert_graph_serves_root,
     full_build,
     get_changed_files,
+    get_db_path,
     get_staged_and_unstaged,
 )
 from code_review_graph.migrations import LATEST_VERSION
@@ -154,6 +156,35 @@ def test_unwritable_data_directory_names_the_directory(tmp_path):
         data_dir.chmod(original)
     message = str(caught.value)
     assert str(data_dir) in message
+    assert "CRG_DATA_DIR" in message
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores the read-only bit",
+)
+def test_a_data_directory_that_cannot_be_created_is_reported(tmp_path):
+    """The same failure one step earlier than the test above.
+
+    ``GraphStore`` never sees this one: ``get_data_dir`` creates the
+    directory while the path is still being resolved, so an unwritable parent
+    escaped as a ``PermissionError`` from ``pathlib.mkdir``.
+    """
+    parent = tmp_path / "ro"
+    parent.mkdir()
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    original = parent.stat().st_mode
+    parent.chmod(0o500)
+    try:
+        with patch.dict(os.environ, {"CRG_DATA_DIR": str(parent / "fresh")}):
+            with pytest.raises(GraphStoreError) as caught:
+                get_db_path(repo)
+    finally:
+        parent.chmod(original)
+    message = str(caught.value)
+    assert str(parent / "fresh") in message
     assert "CRG_DATA_DIR" in message
 
 
@@ -406,7 +437,7 @@ def test_analyze_changes_refuses_when_there_is_nothing_else_to_go_on(tmp_path):
 )
 def test_main_reports_a_self_explaining_failure_in_one_line(error, capsys):
     """One ``Error: ...`` line on stderr, exit 1, nothing on stdout."""
-    with patch.object(cli, "_run", side_effect=error):
+    with patch.object(cli, "_dispatch", side_effect=error):
         with patch.object(sys, "argv", ["code-review-graph", "status"]):
             with pytest.raises(SystemExit) as caught:
                 cli.main()
@@ -419,13 +450,69 @@ def test_main_reports_a_self_explaining_failure_in_one_line(error, capsys):
 
 def test_main_does_not_swallow_an_unforeseen_bug(capsys):
     """Only self-explaining failures lose their traceback."""
-    with patch.object(cli, "_run", side_effect=ZeroDivisionError("boom")):
+    with patch.object(cli, "_dispatch", side_effect=ZeroDivisionError("boom")):
         with patch.object(sys, "argv", ["code-review-graph", "status"]):
             with pytest.raises(ZeroDivisionError):
                 cli.main()
 
 
 def test_every_reported_failure_shares_one_base_class():
-    """``main`` catches exactly one thing; this is what has to be under it."""
+    """``main`` catches one family by class; this is what has to be under it."""
     for error_type in (GraphStoreError, GraphRootMismatchError, ChangeDiscoveryError):
         assert issubclass(error_type, CodeReviewGraphError)
+
+
+def test_contention_is_reported_as_contention_not_as_damage(capsys):
+    """The second family ``main`` handles, and it must stay the second one.
+
+    A graph another process is writing is healthy. Folding it into
+    ``GraphStoreError`` would print the rebuild advice that belongs to a
+    corrupt file, over a graph that needs nothing but a second try.
+    """
+    locked = sqlite3.OperationalError("database is locked")
+    assert not isinstance(locked, CodeReviewGraphError)
+    with patch.object(cli, "_dispatch", side_effect=locked):
+        with patch.object(sys, "argv", ["code-review-graph", "build"]):
+            with pytest.raises(SystemExit) as caught:
+                cli.main()
+    assert caught.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "another process" in captured.err
+    assert "database is locked" in captured.err
+    # The repair for a damaged graph, which this is not.
+    assert "delete" not in captured.err.lower()
+
+
+def test_a_contended_open_is_not_dressed_up_as_a_corrupt_graph(tmp_path):
+    """The two failures meet inside ``GraphStore.__init__``; they stay apart.
+
+    ``run_migrations`` retries a held write lock and re-raises the
+    ``OperationalError`` when it runs out of attempts. That lands in the same
+    handler that turns a corrupt file into a ``GraphStoreError``, and being
+    told to delete a healthy graph is the worst possible advice.
+    """
+    db_path = tmp_path / "graph.db"
+    with patch(
+        "code_review_graph.graph.run_migrations",
+        side_effect=sqlite3.OperationalError("database is locked"),
+    ):
+        with pytest.raises(sqlite3.OperationalError) as caught:
+            GraphStore(db_path)
+    assert not isinstance(caught.value, GraphStoreError)
+    assert is_lock_error(caught.value)
+
+
+def test_an_unwritable_directory_is_still_a_graph_store_error(tmp_path):
+    """The other half of the pair above: damage keeps its own message."""
+    locked_dir = tmp_path / "ro"
+    locked_dir.mkdir()
+    (locked_dir / "graph.db").write_bytes(b"not a database at all")
+    locked_dir.chmod(0o500)
+    try:
+        with pytest.raises(GraphStoreError) as caught:
+            GraphStore(locked_dir / "graph.db")
+    finally:
+        locked_dir.chmod(0o700)
+    assert not is_lock_error(caught.value)
+    assert str(locked_dir / "graph.db") in str(caught.value)

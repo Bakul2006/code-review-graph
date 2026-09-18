@@ -22,8 +22,9 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
+from .build_state import advance_to_postprocess_pending
 from .constants import env_float, env_int
-from .errors import ChangeDiscoveryError, GraphRootMismatchError
+from .errors import ChangeDiscoveryError, GraphRootMismatchError, GraphStoreError
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
 
@@ -413,6 +414,26 @@ def _write_data_dir_gitignore(data_dir: Path) -> None:
             pass
 
 
+def _create_data_dir(data_dir: Path) -> None:
+    """Create the data directory, or say why it could not be created.
+
+    ``GraphStore`` already reports a directory it cannot *write* to as one
+    ``Error: ...`` line naming ``CRG_DATA_DIR``. A directory that cannot be
+    *created* is the same failure one step earlier, and reached the user as a
+    ``PermissionError`` traceback out of ``pathlib.mkdir`` because it happens
+    while the path is still being resolved, before any store exists.
+    """
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise GraphStoreError(
+            f"cannot create the graph data directory at {data_dir} ({exc}). "
+            f"Check the permissions on {data_dir.parent}, or set CRG_DATA_DIR "
+            "to a writable directory."
+        ) from exc
+    _write_data_dir_gitignore(data_dir)
+
+
 def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     """Return the directory where this project's graph data lives.
 
@@ -442,8 +463,7 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
             if registry_data_dir:
                 data_dir = Path(registry_data_dir).resolve()
                 if create:
-                    data_dir.mkdir(parents=True, exist_ok=True)
-                    _write_data_dir_gitignore(data_dir)
+                    _create_data_dir(data_dir)
                 return data_dir
     except Exception as exc:
         # If registry lookup fails, log and fall through to other methods
@@ -457,8 +477,7 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
         data_dir = repo_root / ".code-review-graph"
 
     if create:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        _write_data_dir_gitignore(data_dir)
+        _create_data_dir(data_dir)
 
     return data_dir
 
@@ -1601,13 +1620,12 @@ def full_build(
         # Serial fallback (for debugging or tiny repos)
         for i, rel_path in enumerate(files, 1):
             full_path = repo_root / rel_path
+            parsed: tuple[list, list, str] | None = None
             try:
                 source = full_path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(full_path, source)
-                store.store_file_nodes_edges(str(full_path), nodes, edges, fhash)
-                total_nodes += len(nodes)
-                total_edges += len(edges)
+                parsed = (nodes, edges, fhash)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
                 if parser.detect_language(full_path) == "cpp":
@@ -1617,6 +1635,18 @@ def full_build(
                 errors.append({"file": rel_path, "error": str(e)})
                 if parser.detect_language(full_path) == "cpp":
                     cpp_errors.add(str(rel_path))
+            if parsed is not None:
+                # Deliberately outside the handlers above. A file this loop
+                # could not *parse* is reported and keeps no rows; a file it
+                # could not *write* is a different thing entirely — the usual
+                # cause is another process holding the SQLite write lock — and
+                # filing that as a parse error let the build carry on, write
+                # the VCS anchor and exit 0 while those files were missing
+                # from the graph for good. The build stops instead, so no
+                # anchor is written and the next run rebuilds.
+                store.store_file_nodes_edges(str(full_path), *parsed)
+                total_nodes += len(parsed[0])
+                total_edges += len(parsed[1])
             if i % 50 == 0 or i == file_count:
                 logger.info("Progress: %d/%d files parsed", i, file_count)
     else:
@@ -1652,6 +1682,11 @@ def full_build(
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     _store_cpp_identity_pending(store, cpp_errors)
+    # Storing is over: every file that could be parsed has its rows. Recorded
+    # before the anchor and before post-processing, so a process killed from
+    # here on leaves a graph that ``postprocess`` can genuinely finish, told
+    # apart from one killed mid-parse that only a build can repair.
+    advance_to_postprocess_pending(store)
     # Failed files are reported in ``errors`` and simply hold no rows; the
     # anchor still describes the commit the stored files were parsed at.
     _store_vcs_metadata(repo_root, store)
@@ -1860,16 +1895,22 @@ def incremental_update(
                 source = abs_path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(abs_path, source)
-                store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
-                remaining_identity.discard(rel_path)
-                parsed_files += 1
-                total_nodes += len(nodes)
-                total_edges += len(edges)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
+                continue
             except Exception as e:
                 logger.warning("Error parsing %s: %s", rel_path, e)
                 errors.append({"file": rel_path, "error": str(e)})
+                continue
+            # Same reasoning as the serial loop in full_build: a failed write
+            # is not a failed parse. Letting it propagate stops the update
+            # before the freshness anchor is advanced, so the next run still
+            # sees this file as changed.
+            store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
+            remaining_identity.discard(rel_path)
+            parsed_files += 1
+            total_nodes += len(nodes)
+            total_edges += len(edges)
     else:
         # See full-build comment above for executor kind rationale.
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
@@ -1947,6 +1988,9 @@ def incremental_update(
         store.set_metadata("last_build_type", "incremental")
         if not remaining_identity:
             store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+        # Same point as in ``full_build``: the changed files are stored, so a
+        # kill from here leaves only derived data to rebuild.
+        advance_to_postprocess_pending(store)
         freshness_advanced = _store_vcs_metadata(repo_root, store)
         store.commit()
 
@@ -2020,6 +2064,11 @@ _WATCH_TICK_SECONDS = 1.0
 # walks the parent subtree and, on Linux, can leave a partly built inotify
 # instance behind, so retrying every tick would consume the quota it waits for.
 _PROMOTION_RETRY_SECONDS = 30.0
+# Upper bound on the refused-watch record.  It is pruned of directories that no
+# longer exist on every reconciliation tick, so reaching this cap means a tree
+# that genuinely cannot be watched is larger than anyone will read; keeping the
+# most recent refusals is more useful than keeping the first ones.
+_MAX_UNWATCHED_TRACKED = env_int("CRG_MAX_UNWATCHED_TRACKED", 256)
 
 
 def _watch_child_dirs(
@@ -2222,6 +2271,17 @@ class _WatchSupervisor:
         self._repaired_roots: set[str] = set()
         self._degraded = False
         self._promotion_failed = False
+        # Directories the OS refused to watch (inotify ENOSPC, the watch
+        # budget in #811).  Losing coverage quietly is the worst thing a
+        # watcher can do, so this record feeds `degraded` and, when it swallows
+        # everything, ends the process.  A dict, not a set, because it is
+        # bounded by age as well as by existence: refusals are only ever
+        # dropped on a successful reschedule or an explicit release, and a
+        # directory that was refused and then deleted — a build tree recreated
+        # on every run — would otherwise be remembered, and published to the
+        # health file, for as long as the daemon lives.  Path -> wall-clock
+        # time of the most recent refusal, newest last.
+        self._unwatched: dict[str, float] = {}
         self._promotion_retry_at: dict[str, float] = {}
         self._last_health_write = 0.0
         self._last_health_state: tuple[bool, bool, tuple[str, ...]] | None = None
@@ -2236,8 +2296,13 @@ class _WatchSupervisor:
 
     @property
     def degraded(self) -> bool:
-        """True for coarser coverage or a failed promotion in the current sync."""
-        return self._degraded or self._promotion_failed
+        """True for coarser coverage, a failed promotion, or a refused watch."""
+        return self._degraded or self._promotion_failed or bool(self._unwatched)
+
+    @property
+    def unwatched_paths(self) -> list[str]:
+        """Directories the OS refused to watch, so they are not covered."""
+        return sorted(self._unwatched)
 
     def attach(self, observer: Any) -> None:
         """Bind the observer, once the initial build has earned one."""
@@ -2266,13 +2331,51 @@ class _WatchSupervisor:
         try:
             handle = self._observer.schedule(self._handler, key, recursive=recursive)
         except OSError as exc:
-            logger.warning("Could not watch %s: %s", key, exc)
+            # Recording the loss is the whole point.  Swallowing the OSError
+            # here (inotify's ENOSPC when the OS watch budget is exhausted)
+            # left the supervisor watching nothing while `report_health`
+            # published observer_alive=true, degraded=false and `crg-daemon
+            # status` printed "ok" — blind, and claiming otherwise.
+            # `_promote_to_recursive` already marked itself degraded on the
+            # same failure; this path did not.
+            self._note_unwatched(key)
+            logger.warning(
+                "Could not watch %s: %s — coverage of that directory is lost", key, exc
+            )
             return
+        self._unwatched.pop(key, None)
         self._watches[key] = _WatchEntry(handle, _watch_identity(key))
         if recursive:
             self._shallow.discard(key)
         else:
             self._shallow.add(key)
+
+    def rewatch_all(self) -> bool:
+        """Re-attempt the whole watch plan after a total loss of coverage.
+
+        An exhausted OS watch budget is often transient — the build tool that
+        consumed it finishes, or the user raises the limit — so a watcher that
+        ended up watching nothing tries once more before giving up.  Returns
+        True when at least one watch is live afterwards.
+        """
+        if self._handler is None:  # pragma: no cover - never scheduled
+            return False
+        self._promotion_retry_at.clear()
+        plan = _plan_watch_paths(
+            self._repo_root,
+            self._ignore_patterns,
+            max_schedules=self._max_schedules,
+        )
+        for path, recursive in plan:
+            self._schedule(path, recursive=recursive)
+        self._prune_unwatched()
+        if self._watches:
+            logger.warning(
+                "Re-established %d watch(es) on %s after a total loss of coverage",
+                len(self._watches),
+                self._repo_root,
+            )
+        return bool(self._watches)
 
     def sync_watches(
         self, *, ignore_patterns: list[str] | None = None,
@@ -2330,7 +2433,27 @@ class _WatchSupervisor:
                 )
                 if self._adopt_directory(candidate, required=newly_included):
                     adopted.append(candidate)
+        self._prune_unwatched()
         return adopted, vanished
+
+    def _note_unwatched(self, key: str) -> None:
+        """Record a directory the OS refused, newest last, and bound the record."""
+        self._unwatched.pop(key, None)
+        self._unwatched[key] = time.time()
+        while len(self._unwatched) > _MAX_UNWATCHED_TRACKED:
+            self._unwatched.pop(next(iter(self._unwatched)))
+
+    def _prune_unwatched(self) -> None:
+        """Forget refusals for directories that are no longer there.
+
+        A refused directory never enters ``_watches``, so neither a successful
+        reschedule nor ``_release_directory`` ever reaches it once it is
+        deleted.  Without this the record only grows: ``degraded`` stays true
+        for the daemon's whole lifetime over directories that do not exist,
+        and ``crg-daemon status`` keeps reporting a gap nobody can close.
+        """
+        for path in [p for p in self._unwatched if not os.path.isdir(p)]:
+            self._unwatched.pop(path, None)
 
     def _children_of(self, parent: str) -> list[str]:
         """Watched paths directly underneath *parent*."""
@@ -2433,6 +2556,8 @@ class _WatchSupervisor:
         entry = self._watches.pop(path, None)
         self._shallow.discard(path)
         self._repaired_roots.discard(path)
+        # A directory we deliberately let go is not a coverage gap.
+        self._unwatched.pop(path, None)
         if entry is None:
             return
         # unschedule() joins the emitter thread with no timeout, and a wedged
@@ -2976,6 +3101,32 @@ def watch(
                 _time.sleep(_WATCH_TICK_SECONDS)
             handler.raise_if_failed()
             _sync_watch_tree(supervisor, handler)
+            if not supervisor.watched_paths:
+                # Nothing is being watched at all: every schedule was refused,
+                # or every watched directory went away. Either way the process
+                # would otherwise sit here forever reporting perfect health
+                # while the graph silently froze. Try to recover once, then
+                # exit loudly so the daemon restarts it.
+                if not supervisor.rewatch_all():
+                    supervisor.report_health(
+                        observer_alive=False,
+                        last_event_at=handler.last_event_at,
+                        events_seen=handler.events_seen,
+                        dead_threads=("no filesystem watches",),
+                        force=True,
+                    )
+                    logger.error(
+                        "No filesystem watches could be established on %s (the OS "
+                        "watch limit is the usual cause); this watcher is exiting "
+                        "rather than reporting health while watching nothing. "
+                        "Raise the limit (Linux: fs.inotify.max_user_watches) or "
+                        "CRG_MAX_WATCH_SCHEDULES, then restart it.",
+                        repo_root,
+                    )
+                    raise RuntimeError(
+                        f"watch observer has no watches on {repo_root}: the OS "
+                        "refused every watch (watch limit exhausted)"
+                    )
             dead, repaired = supervisor.check_liveness()
             for path in repaired:
                 # A rescheduled watch missed whatever happened while it was

@@ -43,13 +43,14 @@ import fnmatch
 import json
 import logging
 import os
+import sqlite3
 from functools import partial
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Iterable, TypedDict
 
-from .errors import CodeReviewGraphError
+from .errors import CodeReviewGraphError, is_lock_error
 from .neighbourhood import DEFAULT_DEPTH as NB_DEFAULT_DEPTH
 from .neighbourhood import DEFAULT_MAX_NODES as NB_DEFAULT_MAX_NODES
 
@@ -695,8 +696,51 @@ def _warn_failed_files(result: dict) -> None:
     )
 
 
-# Subparsers that _run() needs after parsing, to print a subcommand's help or
-# raise a subcommand-scoped usage error. Populated by build_parser().
+def main() -> None:
+    """Main CLI entry point.
+
+    Two families of failure are reported here rather than raised, because
+    both of them are things the tool understands about itself.
+
+    Everything the tool can explain is raised as a
+    :class:`~code_review_graph.errors.CodeReviewGraphError` (a corrupt or
+    foreign graph, a data directory it may not write to, a VCS it could not
+    run) and printed in the house style the rest of the CLI already uses:
+    one ``Error: ...`` line on stderr, exit 1, no traceback to decode.
+
+    A contended graph is separate, and stays separate: it is reported, not
+    raised, and never described as damage. The choice is deliberate:
+    ``build`` and ``update`` are run from pre-commit hooks and editor hooks
+    where blocking indefinitely would look like a hang, and retrying past
+    SQLite's five-second wait would only lengthen a hang whose real cause is
+    another process that has not finished. Failing immediately is also the
+    recoverable outcome — the VCS anchor is written only by a build that ran
+    to completion, so nothing marks the half-written graph as current and the
+    next run rebuilds it.
+
+    Anything else really is a bug and keeps its traceback.
+    """
+    try:
+        _dispatch()
+    except CodeReviewGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except sqlite3.OperationalError as exc:
+        if not is_lock_error(exc):
+            raise
+        print(
+            f"Error: another process is updating this graph ({exc}).\n"
+            "Nothing was written, and no freshness anchor was recorded, so the "
+            "graph is unchanged.\n"
+            "Wait for the other process (a watcher, a daemon, or another "
+            "code-review-graph run) to finish and try again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+
+
+# Subparsers that _dispatch() needs after parsing, to print a subcommand's help
+# or raise a subcommand-scoped usage error. Populated by build_parser().
 _SUBCOMMANDS: dict[str, argparse.ArgumentParser] = {}
 
 
@@ -802,7 +846,7 @@ def _describe_visualization(
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser.
 
-    Split out of :func:`main` so tests can assert on the flag surface
+    Split out of :func:`_dispatch` so tests can assert on the flag surface
     without executing a command.
     """
     ap = argparse.ArgumentParser(
@@ -1573,24 +1617,8 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main() -> None:
-    """Main CLI entry point.
-
-    Everything the tool can explain about its own failure is raised as a
-    :class:`~code_review_graph.errors.CodeReviewGraphError` and reported here
-    in the house style the rest of the CLI already uses: one ``Error: ...``
-    line on stderr, exit 1, no traceback for the user to decode. Anything
-    else really is a bug and keeps its traceback.
-    """
-    try:
-        _run()
-    except CodeReviewGraphError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
-
-
-def _run() -> None:
-    """Parse the command line and dispatch one subcommand."""
+def _dispatch() -> None:
+    """Parse arguments and run the requested subcommand."""
     _configure_utf8_stdio()
     ap = build_parser()
     args = ap.parse_args()
@@ -1883,6 +1911,16 @@ def _run() -> None:
             if result.get("fts_indexed"):
                 parts.append(f"{result['fts_indexed']} FTS entries")
             print(f"Post-processing: {', '.join(parts) or 'done'}")
+            if result.get("build_incomplete"):
+                # Post-processing rebuilt derived data for the nodes that are
+                # stored, which is not the same as a repaired graph: the build
+                # that stored them never finished, so files are still missing.
+                print(
+                    "Build state: INCOMPLETE - the last build stopped before "
+                    "every file was stored, so files are still missing from "
+                    "the graph. Post-processing cannot add them. Run "
+                    "'code-review-graph build' to rebuild."
+                )
         finally:
             store.close()
         return
@@ -2152,7 +2190,12 @@ def _run() -> None:
                         print(panel)
 
         elif args.command == "status":
+            from .build_state import BUILD_IN_PROGRESS, read_build_state
+            from .tools.build import build_was_interrupted
+
             stats = store.get_stats()
+            interrupted = build_was_interrupted(store)
+            files_missing = read_build_state(store) == BUILD_IN_PROGRESS
             stored_branch = store.get_metadata("git_branch")
             stored_sha = store.get_metadata("git_head_sha")
             from .incremental import _git_branch_info, detect_vcs
@@ -2179,6 +2222,7 @@ def _run() -> None:
                     "current_sha": current_sha,
                     "svn_branch": stored_svn_branch,
                     "svn_revision": stored_rev,
+                    "build_incomplete": interrupted,
                 }))
             elif not args.quiet:
                 print(f"Nodes: {stats.total_nodes}")
@@ -2186,6 +2230,23 @@ def _run() -> None:
                 print(f"Files: {stats.files_count}")
                 print(f"Languages: {', '.join(stats.languages)}")
                 print(f"Last updated: {stats.last_updated or 'never'}")
+                if interrupted and files_missing:
+                    # Nothing derived can put back a file that was never
+                    # parsed, so this one names the repair that works.
+                    print(
+                        "Build state: INCOMPLETE - the last build stopped "
+                        "before every file was stored, so files are missing "
+                        "from the graph. Run 'code-review-graph build' to "
+                        "rebuild it."
+                    )
+                elif interrupted:
+                    # The nodes can all be present and the graph still be a
+                    # half-built one: search and flows are derived afterwards.
+                    print(
+                        "Build state: INCOMPLETE - the last build stopped before "
+                        "post-processing finished, so search and flows may be "
+                        "missing. Run 'code-review-graph update' to repair it."
+                    )
                 if stored_branch:
                     print(f"Built on branch: {stored_branch}")
                 if stored_sha:

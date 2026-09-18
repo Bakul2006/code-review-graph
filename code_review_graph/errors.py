@@ -11,6 +11,8 @@ specific enough to act on: what is wrong, where, and what to do about it.
 
 from __future__ import annotations
 
+import sqlite3
+
 
 class CodeReviewGraphError(Exception):
     """Base class for every self-explaining failure in this package."""
@@ -46,9 +48,33 @@ class ChangeDiscoveryError(CodeReviewGraphError, RuntimeError):
     """
 
 
+# SQLite's answer to a writer that waited out ``busy_timeout`` is
+# ``OperationalError: database is locked``. Nothing between there and the
+# process boundary used to catch it, so a user whose watcher happened to be
+# mid-update saw twenty lines of internal traceback.
+#
+# Contention is emphatically not one of the failures above. A graph another
+# process is writing is healthy; it needs a second try, not the rebuild a
+# :class:`GraphStoreError` prescribes. The two are told apart here, once, so
+# that no caller can quietly relabel one as the other.
+_LOCK_ERRORS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+)
+
+
+def is_lock_error(exc: BaseException) -> bool:
+    """True when SQLite refused because another process holds the write lock."""
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        needle in str(exc).lower() for needle in _LOCK_ERRORS
+    )
+
+
 __all__ = [
     "ChangeDiscoveryError",
     "CodeReviewGraphError",
     "GraphRootMismatchError",
     "GraphStoreError",
+    "is_lock_error",
 ]
