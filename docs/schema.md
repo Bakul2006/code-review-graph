@@ -145,6 +145,8 @@ CREATE TABLE nodes (
     file_hash TEXT,
     extra TEXT DEFAULT '{}',
     symbol TEXT,                 -- v10
+    docstring TEXT,              -- v13
+    name_tokens TEXT,            -- v13
     updated_at REAL NOT NULL,
     signature TEXT,              -- v2
     community_id INTEGER         -- v4
@@ -207,9 +209,10 @@ CREATE TABLE communities (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- v5 (rebuilt by search.rebuild_fts_index with the same definition)
+-- v5, widened by v13 (rebuilt by search.rebuild_fts_index from the same
+-- migrations.NODES_FTS_DDL, so the two cannot drift)
 CREATE VIRTUAL TABLE nodes_fts USING fts5(
-    name, qualified_name, file_path, signature,
+    name, qualified_name, file_path, signature, docstring, name_tokens,
     content='nodes', content_rowid='rowid',
     tokenize='porter unicode61'
 );
@@ -248,13 +251,15 @@ CREATE TABLE risk_index (
     FOREIGN KEY (node_id) REFERENCES nodes(id)
 );
 
--- v11
+-- v12, widened by v13 to mirror every nodes_fts column
 CREATE TABLE nodes_fts_state (
     node_id INTEGER PRIMARY KEY,
     name TEXT,
     qualified_name TEXT,
     file_path TEXT,
-    signature TEXT
+    signature TEXT,
+    docstring TEXT,      -- v13
+    name_tokens TEXT     -- v13
 );
 CREATE INDEX idx_nodes_fts_state_file ON nodes_fts_state(file_path);
 ```
@@ -264,7 +269,10 @@ values from `nodes`. Removing one of its entries therefore needs the values that
 indexed, and those are gone once the node row is deleted. `nodes_fts_state` mirrors what
 the index currently holds so `search.update_fts_index` can rewrite just the rows an
 update touched instead of dropping and repopulating the whole index. It starts empty
-after the migration; the first index sync fills it with one full rebuild.
+after the migration; the first index sync fills it with one full rebuild. Its columns
+have to be exactly `migrations.NODES_FTS_COLUMNS`, because an external-content delete
+replays every indexed value; the `fts_state_synced` metadata key records the mirror
+shape, and a mirror written under an older value forces one rebuild.
 
 ### Embeddings
 
@@ -285,7 +293,8 @@ CREATE TABLE embeddings (
 
 | Key | Set by |
 |---|---|
-| `schema_version` | `migrations.py`; `11` on a current database |
+| `schema_version` | `migrations.py`; `13` on a current database |
+| `fts_state_synced` | `search.rebuild_fts_index`; mirror-shape version |
 | `last_updated` | Full and incremental builds |
 | `last_build_type` | Full and incremental builds |
 | `git_head_sha`, `git_branch` | Builds in a git checkout |
@@ -333,3 +342,4 @@ Each migration runs in its own transaction and updates `schema_version` on succe
 | 10 | `nodes.symbol`, back-filled from `qualified_name`, and `idx_nodes_symbol` |
 | 11 | `edges.target_resolution`, back-filled for `CALLS`/`REFERENCES`, and `idx_edges_kind_target_resolution` |
 | 12 | `nodes_fts_state`, the mirror of the FTS index, and `idx_nodes_fts_state_file` |
+| 13 | `nodes.docstring`, `nodes.name_tokens`, both back-filled; `nodes_fts` and `nodes_fts_state` widened to carry them |

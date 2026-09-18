@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -79,6 +80,98 @@ def _symbol_of(qualified_name: str) -> str:
     return symbol if sep else qualified_name
 
 
+# Longest docstring summary mirrored into the searchable ``nodes.docstring``
+# column. The parser already caps what it stores in ``extra``; this bound is
+# re-applied because existing databases may hold anything.
+MAX_INDEXED_DOCSTRING_CHARS = 400
+# Bound on the derived ``nodes.name_tokens`` column so a pathological
+# identifier cannot grow the FTS index without limit.
+MAX_INDEXED_TOKEN_CHARS = 200
+
+_ALNUM_RUN_RE = re.compile(r"[0-9A-Za-z]+")
+# Split at lower/digit -> upper ("hashPassword") and at the boundary before
+# the final capitalised word of an acronym run ("HTTPServer" -> HTTP Server).
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _index_tokens(*values: str | None) -> str:
+    """Return the camelCase/PascalCase word splits of *values*, space joined.
+
+    Only sub-words that the FTS5 ``unicode61`` tokenizer cannot produce on
+    its own are emitted. unicode61 already breaks on every non-alphanumeric
+    character, so ``get_users`` and ``graph/impact.py`` contribute nothing,
+    while ``hashPassword`` contributes ``hash Password``, the tokens that
+    make ``password`` match it. Keeping the column minimal matters: repeating
+    tokens that are already indexed would inflate their term frequency and
+    skew BM25 ranking.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        for run in _ALNUM_RUN_RE.findall(value):
+            parts = _CAMEL_BOUNDARY_RE.split(run)
+            if len(parts) < 2:
+                continue
+            for part in parts:
+                lowered = part.lower()
+                if lowered and lowered not in seen:
+                    seen.add(lowered)
+                    out.append(part)
+    return " ".join(out)[:MAX_INDEXED_TOKEN_CHARS]
+
+
+def identifier_words(text: str) -> set[str]:
+    """Return the lowercase words *text* is built from.
+
+    Both the whole alphanumeric run and its camelCase parts are returned, so
+    ``GraphStore`` yields ``{graphstore, graph, store}``. Callers compare
+    these sets to decide whether a symbol is *named after* a query, which is
+    the signal BM25 cannot express once long file paths dominate a row's
+    token count.
+    """
+    words: set[str] = set()
+    for run in _ALNUM_RUN_RE.findall(text or ""):
+        words.add(run.lower())
+        for part in _CAMEL_BOUNDARY_RE.split(run):
+            if part:
+                words.add(part.lower())
+    return words
+
+
+def node_index_tokens(
+    kind: str,
+    name: str,
+    parent_name: str | None,
+    file_path: str | None,
+) -> str:
+    """Return the value for a node's ``name_tokens`` column.
+
+    A File node's ``name`` *is* its path, so splitting it would fold every
+    directory segment of the checkout into the index (an absolute path under
+    ``.../CloudDocs/`` would add "Cloud Docs" to every file in the graph).
+    File nodes contribute their stem only.
+    """
+    stem = PurePosixPath(file_path or "").stem
+    return _index_tokens("" if kind == "File" else name, parent_name, stem)
+
+
+def _indexed_docstring(extra: dict[str, Any] | None) -> str | None:
+    """Return the whitespace-normalized docstring summary held in *extra*.
+
+    Existing databases may carry any JSON value under ``docstring``, so
+    non-strings are ignored rather than coerced.
+    """
+    if not extra:
+        return None
+    raw = extra.get("docstring")
+    if not isinstance(raw, str):
+        return None
+    summary = " ".join(raw.split())[:MAX_INDEXED_DOCSTRING_CHARS]
+    return summary or None
+
+
 def _bridge_qualified_name(qualified_name: str) -> str:
     """Return *qualified_name* with its file-path component POSIX-normalized.
 
@@ -120,6 +213,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     -- before run_migrations, so indexing a column this CREATE TABLE cannot add
     -- to an existing table would break every pre-existing database on open.
     symbol TEXT,
+    -- Documentation summary lifted out of extra['docstring'] so the FTS5
+    -- external-content index can reach it (FTS columns must be real columns
+    -- of the content table). See migration v11.
+    docstring TEXT,
+    -- camelCase/PascalCase word splits for name, parent_name and the file
+    -- stem. unicode61 splits on punctuation but keeps hashPassword as one
+    -- token, so "password" could never match it. Added by migration v11.
+    name_tokens TEXT,
     updated_at REAL NOT NULL
 );
 
@@ -439,8 +540,8 @@ class GraphStore:
             """INSERT INTO nodes
                (kind, name, qualified_name, file_path, line_start, line_end,
                 language, parent_name, params, return_type, modifiers, is_test,
-                file_hash, extra, symbol, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_hash, extra, symbol, docstring, name_tokens, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(qualified_name) DO UPDATE SET
                  kind=excluded.kind, name=excluded.name,
                  file_path=excluded.file_path, line_start=excluded.line_start,
@@ -449,6 +550,7 @@ class GraphStore:
                  return_type=excluded.return_type, modifiers=excluded.modifiers,
                  is_test=excluded.is_test, file_hash=excluded.file_hash,
                  extra=excluded.extra, symbol=excluded.symbol,
+                 docstring=excluded.docstring, name_tokens=excluded.name_tokens,
                  updated_at=excluded.updated_at
             """,
             (
@@ -456,7 +558,10 @@ class GraphStore:
                 node.line_start, node.line_end, node.language,
                 node.parent_name, node.params, node.return_type,
                 node.modifiers, int(node.is_test), file_hash,
-                extra, _symbol_of(qualified), now,
+                extra, _symbol_of(qualified), _indexed_docstring(node.extra),
+                node_index_tokens(node.kind, node.name, node.parent_name,
+                                  node.file_path),
+                now,
             ),
         )
         row = self._conn.execute(
@@ -627,14 +732,17 @@ class GraphStore:
                     node.line_start, node.line_end, node.language,
                     node.parent_name, node.params, node.return_type,
                     node.modifiers, int(node.is_test), fhash,
-                    extra, _symbol_of(qualified), now,
+                    extra, _symbol_of(qualified), _indexed_docstring(node.extra),
+                    node_index_tokens(node.kind, node.name, node.parent_name,
+                                      normalized),
+                    now,
                 ))
             self._conn.executemany(
                 """INSERT INTO nodes
                    (kind, name, qualified_name, file_path, line_start, line_end,
                     language, parent_name, params, return_type, modifiers, is_test,
-                    file_hash, extra, symbol, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    file_hash, extra, symbol, docstring, name_tokens, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(qualified_name) DO UPDATE SET
                      kind=excluded.kind, name=excluded.name,
                      file_path=excluded.file_path, line_start=excluded.line_start,
@@ -643,6 +751,7 @@ class GraphStore:
                      return_type=excluded.return_type, modifiers=excluded.modifiers,
                      is_test=excluded.is_test, file_hash=excluded.file_hash,
                      extra=excluded.extra, symbol=excluded.symbol,
+                     docstring=excluded.docstring, name_tokens=excluded.name_tokens,
                      updated_at=excluded.updated_at
                 """,
                 node_rows,

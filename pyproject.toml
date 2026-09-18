@@ -157,6 +157,7 @@ norecursedirs = ["tests/fixtures"]
 markers = [
     "e2e: end-to-end tests that drive the real pipeline, MCP server or CLI as a subprocess",
     "browser: drives the generated visualization page in a real headless browser",
+    "action_e2e: drives the composite GitHub Action's own steps against scratch repositories",
     "platform_lifecycle: drives install/reinstall/uninstall for every supported platform",
     "packaging: builds the distribution artefacts and smoke-tests them from a clean install",
     "determinism: rebuilds one corpus many ways and compares every table (minutes)",
