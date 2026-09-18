@@ -76,42 +76,56 @@ also allowed on `staging`.
 **Promotion PRs** move everything on `staging` to `testing`, and later everything on
 `testing` to `main`. They are always merged with a **merge commit**, never squashed, so
 every contributor stays the author of their commits; the `testing` and `main` rulesets
-allow no other merge method. A promotion PR opened by a workflow shows an "Approve
-workflows to run" banner; the required checks are already satisfied by the CI run on the
-source branch's tip, so the banner can be approved or ignored.
+allow no other merge method. Opening a promotion PR re-queues every required check on a
+commit that already had them green from the push run, so the PR sits blocked for a
+quarter of an hour or so before it can be merged. That is normal.
 
 `staging` → `testing` happens by itself. `testing` → `main` never does.
 
 ### Automatic promotion to `testing`
 
 `.github/workflows/auto-promote.yml` runs once a day. If `staging` has commits `testing`
-does not, and every required status check is green on the `staging` tip, it opens the
-promotion PR and merges it with a merge commit. It writes a summary on every run,
-including the runs that decide to do nothing, so "nothing to promote" is never
-indistinguishable from "did not run".
+does not, every required status check is green on the `staging` tip, and the promotion
+gate has not failed on the current `testing` tip, it opens the promotion PR and merges it
+with a merge commit. It writes a summary on every run, including the runs that decide to
+do nothing, so "nothing to promote" is never indistinguishable from "did not run".
+
+**One repository setting is required.** Settings → Actions → General → Workflow
+permissions → tick **Allow GitHub Actions to create and approve pull requests** → Save.
+Without it `gh pr create` is refused and no promotion PR can be opened — by this workflow
+or by the manual `Promote` one. Leave *Workflow permissions* itself on **Read repository
+contents and packages permissions**: both workflows ask for the writes they need in their
+own `permissions:` block. If the tick is missing, the run goes red and the job summary
+gives that click path.
+
+It merges only a PR it opened itself: same repository, `staging` → `testing`, carrying the
+`auto-promotion` label, and at the commit whose checks were read. `gh pr list --head
+staging` matches a branch of that name in any of this repository's forks, and a PR's base
+branch can be changed by its author at any time without re-running a single check, so all
+of that is verified again immediately before the merge, and the merge itself is pinned
+with `--match-head-commit`. **A promotion PR you opened by hand is never touched** — it
+has no `auto-promotion` label, so the daily run refuses it by number and says so.
 
 It stops, without failing, when there is nothing to promote, when CI is still running,
-when a required check failed or was skipped, or when an open promotion PR conflicts or is
-held by a rule. Those states are already reported elsewhere and tomorrow's run looks
-again. Two things turn the run red, because nothing else reports them:
+when a required check failed or was skipped, when the promotion gate is still running on
+`testing`, when the gate failed there, or when `staging` moved mid-run. Those states are
+reported elsewhere already and tomorrow's run looks again. Three things turn the run red,
+because nothing else reports them:
 
 - **GitHub refused the merge.** The PR is left open and the refusal is quoted in the job
-  summary; merge it by hand with a merge commit. The likeliest cause is the `testing`
-  ruleset's "require extra approval for unattributed changes", which asks for one
-  approving review when a promoted commit's author does not map to a GitHub account — and
-  `GITHUB_TOKEN` is not allowed to approve.
-- **The follow-up checks could not be started.** A push made with `GITHUB_TOKEN` starts no
-  `push` workflow run, so this merge does not run `ci.yml` or the promotion gate on
-  `testing` the way a hand merge does. The last step starts both through
-  `workflow_dispatch`, which is the exception to that rule. If that fails, the `testing`
-  tip carries no required contexts: the next `testing` → `main` PR would be unmergeable
-  and the gate would not have run. Start them from the Actions tab.
+  summary, with the causes listed in the order they actually occur; merge it by hand with
+  a merge commit.
+- **The workflow is stuck on its own PR** — it conflicts, it is a draft, or GitHub holds
+  it for a rule with every required check green. A stalled promotion that reported itself
+  as a green warning every morning would stay stalled for ever.
+- **A PR it was about to merge is not the one it decided on**, or the release gate could
+  not be started after the merge.
 
 Every rule lives in `scripts/auto_promote.py` and is covered by
 `tests/test_auto_promote.py`; the workflow fetches facts and obeys. The required contexts
 are read from the `testing` ruleset at run time, so a renamed CI job cannot silently drop
 out of the gate. The workflow has no input, variable or code path that can target `main`,
-and the tests assert it.
+the PR it merges is re-checked at the door, and the tests assert both.
 
 To see what it would decide without it doing anything, run the `Auto promote` workflow
 from the Actions tab: a hand-started run defaults to a dry run.

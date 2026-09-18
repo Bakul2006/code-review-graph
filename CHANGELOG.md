@@ -19,13 +19,20 @@
 - `CRG_HOOK_WORKTREES=1` keeps the generated pre-commit hook active inside
   a linked Git worktree (#953).
 - `staging` is promoted to `testing` automatically, once a day, when it has
-  commits `testing` lacks and every required status check is green on its
-  tip. `.github/workflows/auto-promote.yml` opens the promotion pull request
-  and merges it with a merge commit, so contributor authorship survives; the
+  commits `testing` lacks, every required status check is green on its tip,
+  and the promotion gate has not failed on the `testing` tip.
+  `.github/workflows/auto-promote.yml` opens the promotion pull request and
+  merges it with a merge commit, so contributor authorship survives; the
   decision lives in `scripts/auto_promote.py` and reads the required
-  contexts from the `testing` ruleset at run time. A hand-started run
-  defaults to a dry run. Promotion to `main` is never automatic and the
-  workflow cannot target it.
+  contexts from the `testing` ruleset at run time. It merges only a pull
+  request it opened itself — same repository, `staging` → `testing`,
+  labelled `auto-promotion`, and pinned with `--match-head-commit` to the
+  commit whose checks were read — all re-verified immediately before the
+  merge, so a fork branch named `staging`, a base branch changed after the
+  fact, or a promotion pull request opened by hand cannot be merged by it. A
+  hand-started run defaults to a dry run. Requires *Allow GitHub Actions to
+  create and approve pull requests* under Settings → Actions → General.
+  Promotion to `main` is never automatic and the workflow cannot target it.
 
 ### Changed
 
