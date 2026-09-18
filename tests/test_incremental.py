@@ -1429,8 +1429,12 @@ class TestWatchReconciliation:
             with (
                 patch("watchdog.observers.Observer") as observer,
                 patch("time.sleep", side_effect=KeyboardInterrupt),
+                # Patch the entry point post-processing calls, not the
+                # rebuild underneath it: whether a sync rebuilds or applies
+                # a delta depends on how much of the graph moved, and this
+                # test is about the warning, not about which path ran.
                 patch(
-                    "code_review_graph.search.rebuild_fts_index",
+                    "code_review_graph.search.update_fts_index",
                     side_effect=sqlite3.OperationalError("forced FTS failure"),
                 ),
                 pytest.raises(

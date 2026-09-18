@@ -1193,10 +1193,14 @@ def test_hostile_symbol_is_neutralised(hostile_comment: str):
     # No markdown link survives either: the brackets are backslashed, so the
     # payload renders as inert text with the URL still legible. Asserting the
     # whole escaped span pins both halves of that at once, the escaping and
-    # the surviving text. A bare URL substring check would be weaker: it also
-    # passes when the renderer stops escaping brackets, and reads to CodeQL
-    # as URL sanitization (py/incomplete-url-substring-sanitization).
-    assert "\\[click\\](https://attacker.invalid)" in hostile_comment
+    # the surviving text, and the unescaped span is asserted absent so the
+    # pair cannot both pass on a renderer that emits the link twice. Neither
+    # literal is a bare URL on its own, which is CodeQL's
+    # py/incomplete-url-substring-sanitization shape;
+    # tests/test_codeql_url_substring.py keeps that shape out of this
+    # repository.
+    assert "[click](https://attacker.invalid)" not in hostile_comment
+    assert "\\[click\\](https://attacker.invalid)" in hostile_comment, "kept, inert"
     links = re.findall(r"(?<!\\)\[[^\]\\]+\]\(([^)]+)\)", hostile_comment)
     assert links == ["https://github.com/tirth8205/code-review-graph"], links
     # Backticks are escaped, so the injected command never becomes code.
