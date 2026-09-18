@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
@@ -508,6 +509,9 @@ class GraphStore:
             raise
         self._nxg_cache: nx.DiGraph | None = None
         self._cache_lock = threading.Lock()
+        # Identifies the read transaction currently open on this connection,
+        # so a reader cannot roll back a transaction a writer took from it.
+        self._active_read_txn: object | None = None
 
     def __enter__(self) -> "GraphStore":
         return self
@@ -661,12 +665,64 @@ class GraphStore:
         self._invalidate_cache()
         return changed
 
+    @contextmanager
+    def _read_transaction(self) -> Iterator[None]:
+        """Hold one snapshot for the duration of a multi-statement read.
+
+        The connection runs with ``isolation_level=None``, so without this
+        every statement gets its own snapshot and a writer committing between
+        two of them yields numbers that contradict each other — ``get_stats``
+        could report a ``total_nodes`` taken before a watcher's commit and a
+        per-kind breakdown taken after it.
+
+        ``BEGIN DEFERRED`` takes no lock and, under WAL, never blocks the
+        writer: it only pins the snapshot this connection reads from. Nested
+        use is a no-op so an enclosing write transaction keeps its own scope,
+        and a failure to begin degrades to today's per-statement reads rather
+        than failing the query.
+        """
+        if self._conn.in_transaction:
+            yield
+            return
+        try:
+            self._conn.execute("BEGIN DEFERRED")
+        except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+            logger.debug("Could not open a read transaction: %s", exc)
+            yield
+            return
+        token = object()
+        self._active_read_txn = token
+        try:
+            yield
+        finally:
+            # A writer thread sharing this store (the MCP server's auto-watch
+            # does) calls _begin_immediate, which rolls back whatever is open
+            # and starts its own transaction. Rolling back here would then
+            # discard that writer's rows. The token says whether the
+            # transaction being closed is still ours.
+            if self._active_read_txn is token:
+                self._active_read_txn = None
+                try:
+                    # Read-only: rollback and commit are equivalent, and
+                    # rollback cannot fail on a transaction that wrote nothing.
+                    self._conn.rollback()
+                except sqlite3.Error as exc:  # pragma: no cover - defensive
+                    logger.debug("Could not close the read transaction: %s", exc)
+
     def _begin_immediate(self) -> None:
         """Start an IMMEDIATE transaction, rolling back any prior uncommitted
         transaction first (regression guard for #135 / #489).
         """
         if self._conn.in_transaction:
-            logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
+            if self._active_read_txn is None:
+                logger.warning(
+                    "Rolling back uncommitted transaction before BEGIN IMMEDIATE"
+                )
+            else:
+                # A concurrent multi-statement read on this connection; taking
+                # it over costs that reader its snapshot, nothing more.
+                logger.debug("Taking over an open read transaction for a write")
+            self._active_read_txn = None
             self._conn.rollback()
         self._conn.execute("BEGIN IMMEDIATE")
 
@@ -2471,7 +2527,16 @@ class GraphStore:
         return {"nodes": nodes, "edges": edges}
 
     def get_stats(self) -> GraphStats:
-        """Return aggregate statistics about the graph."""
+        """Return aggregate statistics about the graph.
+
+        Every statement below reads from one snapshot, so the per-kind
+        breakdowns still sum to the totals when a watcher commits partway
+        through (issue: `status` printing numbers that do not add up).
+        """
+        with self._read_transaction():
+            return self._get_stats_locked()
+
+    def _get_stats_locked(self) -> GraphStats:
         total_nodes = self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
         total_edges = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
 
