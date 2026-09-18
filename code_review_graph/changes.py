@@ -14,7 +14,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
+from .constants import env_float, env_int
+from .errors import ChangeDiscoveryError
 from .flows import get_affected_flows
 from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
 from .parser import is_test_file, normalize_file_path
@@ -32,8 +35,6 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "__construct", "__init__", "__destruct",
 })
 
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
-
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
 
@@ -43,15 +44,40 @@ _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORE
 # ---------------------------------------------------------------------------
 
 
+def _vcs_unavailable(tool: str, exc: BaseException) -> ChangeDiscoveryError:
+    """Describe a VCS command that could not be run at all.
+
+    Mirrors :func:`code_review_graph.incremental._vcs_unavailable`; a missing
+    binary and a timeout say nothing about the working tree, so no caller may
+    read them as "no lines changed".
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return ChangeDiscoveryError(
+            f"could not determine the changed lines: {tool} timed out after "
+            f"{_GIT_TIMEOUT}s. Raise CRG_GIT_TIMEOUT, or re-run when the "
+            "repository is not busy."
+        )
+    return ChangeDiscoveryError(
+        f"could not determine the changed lines: {tool} could not be run "
+        f"({exc}). Install {tool} and make sure it is on PATH."
+    )
+
+
 def parse_git_diff_ranges(
     repo_root: str,
     base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Run ``git diff --unified=0`` and extract changed line ranges per file.
 
     Args:
         repo_root: Absolute path to the repository root.
         base: Git ref to diff against (default: ``HEAD~1``).
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when git
+            cannot be run at all, instead of returning an empty mapping that
+            a caller would read as "no lines changed".
 
     Returns:
         Mapping of file paths to lists of ``(start_line, end_line)`` tuples.
@@ -76,6 +102,8 @@ def parse_git_diff_ranges(
             return {}
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("git diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("git", exc) from exc
         return {}
 
     return _parse_unified_diff(result.stdout)
@@ -84,6 +112,8 @@ def parse_git_diff_ranges(
 def parse_svn_diff_ranges(
     repo_root: str,
     rev_range: str | None = None,
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Run ``svn diff`` and extract changed line ranges per file.
 
@@ -118,6 +148,8 @@ def parse_svn_diff_ranges(
             return {}
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("svn diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("svn", exc) from exc
         return {}
 
     return _parse_unified_diff(result.stdout)
@@ -126,6 +158,8 @@ def parse_svn_diff_ranges(
 def parse_diff_ranges(
     repo_root: str,
     base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Auto-detect VCS and return changed line ranges per file.
 
@@ -138,12 +172,90 @@ def parse_diff_ranges(
               For SVN: an optional revision range (e.g. ``"r100:HEAD"``);
               when *base* is not a valid SVN revision, working-copy changes
               (``svn diff``) are used instead.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            VCS binary is missing or times out, instead of returning ``{}``.
     """
     root_path = Path(repo_root)
     if (root_path / ".svn").exists():
         rev_range = base if _SAFE_SVN_REV.match(base) else None
-        return parse_svn_diff_ranges(repo_root, rev_range)
-    return parse_git_diff_ranges(repo_root, base)
+        return parse_svn_diff_ranges(repo_root, rev_range, require_vcs=require_vcs)
+    return parse_git_diff_ranges(repo_root, base, require_vcs=require_vcs)
+
+
+_C_QUOTE_ESCAPES = {
+    "a": "\a", "b": "\b", "f": "\f", "n": "\n",
+    "r": "\r", "t": "\t", "v": "\v", "\\": "\\", '"': '"',
+}
+
+
+def _unquote_c_path(quoted: str) -> str:
+    """Decode git's C-style quoted path back to text.
+
+    With ``core.quotePath`` (the default) git writes a path containing a
+    non-ASCII or control byte as ``"src/caf\\303\\251.py"``: double-quoted,
+    with backslash escapes and three-digit octal escapes for raw bytes. The
+    octal escapes are UTF-8 bytes, so they are reassembled before decoding.
+    """
+    raw = bytearray()
+    index, end = 1, len(quoted) - 1
+    while index < end:
+        char = quoted[index]
+        if char != "\\":
+            raw.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        nxt = quoted[index + 1] if index + 1 < end else ""
+        if nxt in _C_QUOTE_ESCAPES:
+            raw.extend(_C_QUOTE_ESCAPES[nxt].encode("utf-8"))
+            index += 2
+            continue
+        octal = ""
+        while len(octal) < 3 and index + 1 + len(octal) < end:
+            digit = quoted[index + 1 + len(octal)]
+            if digit not in "01234567":
+                break
+            octal += digit
+        if octal:
+            raw.append(int(octal, 8) & 0xFF)
+            index += 1 + len(octal)
+            continue
+        raw.extend(b"\\")
+        index += 1
+    return raw.decode("utf-8", "replace")
+
+
+def _diff_header_path(rest: str) -> str | None:
+    """Extract the post-image path from the text after ``+++ ``.
+
+    Git writes the path three ways, and only the plainest one is a bare
+    ``b/path``: it appends a TAB when the path contains a space, and
+    C-quotes the whole ``"b/path"`` when it contains a non-ASCII or control
+    byte. Returns None for ``/dev/null``, the post-image of a deleted file.
+    """
+    rest = rest.rstrip("\r")
+    if rest.startswith('"'):
+        closing = rest.rfind('"')
+        path = _unquote_c_path(rest[: closing + 1])
+    else:
+        # The trailing TAB is a separator, never part of the path: git emits
+        # one only when the path itself contains a space.
+        path = rest.split("\t", 1)[0]
+    if path.startswith("b/"):
+        path = path[2:]
+        return path or None
+    return None
+
+
+# The post-image header, in every spelling git writes it: a bare ``b/path``,
+# the same with the TAB git appends when the path contains a space, the
+# C-quoted ``"b/path"`` it uses when the path contains a non-ASCII or
+# control byte, and ``/dev/null`` for a deleted file. Anchored on those
+# three shapes so an added line that merely starts with "+++ " is not read
+# as a header.
+_POST_IMAGE_HEADER = re.compile(
+    r'^\+\+\+ (/dev/null|"b/(?:[^"\\]|\\.)*"|b/.*)$'
+)
 
 
 def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
@@ -154,15 +266,13 @@ def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     ranges: dict[str, list[tuple[int, int]]] = {}
     current_file: str | None = None
 
-    # Match "+++ b/path/to/file"
-    file_pattern = re.compile(r"^\+\+\+ b/(.+)$")
     # Match "@@ ... +start,count @@" or "@@ ... +start @@"
     hunk_pattern = re.compile(r"^@@ .+? \+(\d+)(?:,(\d+))? @@")
 
     for line in diff_text.splitlines():
-        file_match = file_pattern.match(line)
+        file_match = _POST_IMAGE_HEADER.match(line)
         if file_match:
-            current_file = file_match.group(1)
+            current_file = _diff_header_path(file_match.group(1))
             continue
 
         hunk_match = hunk_pattern.match(line)
@@ -192,8 +302,11 @@ _NUMSTAT_COUNT = re.compile(r"^(?:\d+|-)$")
 # 30-second diff timeout: the history walk is capped at a commit count, and a
 # slow repository degrades to the pre-churn behaviour (an empty mapping, and
 # therefore a zero change-frequency term) instead of hanging the call.
-_CHURN_TIMEOUT = float(os.environ.get("CRG_CHURN_TIMEOUT", "5"))
-_CHURN_MAX_COMMITS = int(os.environ.get("CRG_CHURN_MAX_COMMITS", "2000"))
+# Read through the shared helpers (#912): a typo in either variable falls
+# back to the documented default and warns by name, rather than aborting the
+# import of every command with a bare ValueError.
+_CHURN_TIMEOUT = env_float("CRG_CHURN_TIMEOUT", 5.0)
+_CHURN_MAX_COMMITS = env_int("CRG_CHURN_MAX_COMMITS", 2000)
 
 # Churn counts commits, so the answer only changes when HEAD does: successful
 # results are keyed by (repo, commit, window).
@@ -530,6 +643,7 @@ def analyze_changes(
     repo_root: str | None = None,
     base: str = "HEAD~1",
     include_churn: bool = False,
+    require_vcs: bool = False,
 ) -> dict[str, Any]:
     """Analyze changes and produce risk-scored review guidance.
 
@@ -544,6 +658,10 @@ def analyze_changes(
         include_churn: Add an opt-in change-frequency term to each node's
             risk score. The trailing window defaults to 90 days and can be
             configured with ``CRG_CHURN_WINDOW_DAYS``.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            diff cannot be read at all, rather than silently degrading to a
+            file-level analysis. Review gates pass this.
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
@@ -553,6 +671,7 @@ def analyze_changes(
         change-frequency term, or ``"off"`` when it was not requested).
     """
     # Compute changed ranges if not provided.
+    ranges_unavailable = ""
     if changed_ranges is None and repo_root is not None:
         # Diff keys are forward-slash paths relative to the repo root, but
         # the graph stores absolute native paths. Remap so lookups work on
@@ -562,9 +681,23 @@ def analyze_changes(
         # explicit changed_ranges path (MCP) is untouched — tools/review.py
         # remaps before calling, and remapping twice would corrupt keys.
         root_path = Path(repo_root)
+        try:
+            raw_ranges = parse_diff_ranges(repo_root, base, require_vcs=require_vcs)
+        except ChangeDiscoveryError as exc:
+            if not changed_files:
+                # Nothing else to go on: an empty answer here would be an
+                # all-clear the tool has not earned.
+                raise
+            # The changed files are already known, so an unreadable
+            # line-level diff costs precision, not honesty. Degrade to
+            # whole-file scoring and say so in the summary rather than
+            # presenting a file-level answer as a line-level one.
+            logger.warning("%s; scoring whole files instead", exc)
+            ranges_unavailable = str(exc)
+            raw_ranges = {}
         changed_ranges = {
             normalize_file_path(root_path / key): ranges
-            for key, ranges in parse_diff_ranges(repo_root, base).items()
+            for key, ranges in raw_ranges.items()
         }
 
     # The affected-flows lookup and the no-ranges fallback match
@@ -598,7 +731,7 @@ def analyze_changes(
     ]
 
     # Cap to prevent O(N*M) query explosion on large PRs.
-    _max_funcs = int(os.environ.get("CRG_MAX_CHANGED_FUNCS", "500"))
+    _max_funcs = env_int("CRG_MAX_CHANGED_FUNCS", 500)
     funcs_truncated = len(changed_funcs) > _max_funcs
     if funcs_truncated:
         changed_funcs = changed_funcs[:_max_funcs]
@@ -697,6 +830,11 @@ def analyze_changes(
             f"  - Warning: analysis capped at {_max_funcs} functions "
             f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
         )
+    if ranges_unavailable:
+        summary_parts.append(
+            "  - Warning: line-level diff unavailable, whole files scored "
+            f"({ranges_unavailable})"
+        )
     if churn_status == CHURN_UNAVAILABLE:
         # Say it in the summary, not only in a log line nobody reads: the
         # scores below are missing a term worth up to 0.15, and a reviewer
@@ -716,5 +854,6 @@ def analyze_changes(
         "test_gaps": test_gaps,
         "review_priorities": review_priorities,
         "functions_truncated": funcs_truncated,
+        "diff_ranges_unavailable": ranges_unavailable,
         "churn_status": churn_status,
     }

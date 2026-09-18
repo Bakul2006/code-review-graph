@@ -18,6 +18,26 @@
   (#952).
 - `CRG_HOOK_WORKTREES=1` keeps the generated pre-commit hook active inside
   a linked Git worktree (#953).
+- `CRG_DISCOVERY_TIMEOUT` bounds each Git command that discovers what
+  changed when a review tool or command was not handed an explicit file
+  list. It defaults to 5 seconds, never exceeds `CRG_GIT_TIMEOUT`, and is
+  read on every call rather than frozen at import. `CRG_GIT_TIMEOUT` keeps
+  its 30-second default and still governs build, update and watch (#262).
+- `staging` is promoted to `testing` automatically, once a day, when it has
+  commits `testing` lacks, every required status check is green on its tip,
+  and the promotion gate has not failed on the `testing` tip.
+  `.github/workflows/auto-promote.yml` opens the promotion pull request and
+  merges it with a merge commit, so contributor authorship survives; the
+  decision lives in `scripts/auto_promote.py` and reads the required
+  contexts from the `testing` ruleset at run time. It merges only a pull
+  request it opened itself — same repository, `staging` → `testing`,
+  labelled `auto-promotion`, and pinned with `--match-head-commit` to the
+  commit whose checks were read — all re-verified immediately before the
+  merge, so a fork branch named `staging`, a base branch changed after the
+  fact, or a promotion pull request opened by hand cannot be merged by it. A
+  hand-started run defaults to a dry run. Requires *Allow GitHub Actions to
+  create and approve pull requests* under Settings → Actions → General.
+  Promotion to `main` is never automatic and the workflow cannot target it.
 
 ### Changed
 
@@ -40,9 +60,104 @@
   another branch. Detection uses the git directory's `commondir` file and
   needs only `git rev-parse --absolute-git-dir` (Git 2.13). Reinstall
   upgrades the exact hook block written by earlier releases (#953).
+- Every MCP tool that can reach Git discovery, a graph traversal, FTS, an
+  embedding provider or the filesystem now runs its work on a worker thread
+  through one shared helper. A tool that exceeds `CRG_TOOL_TIMEOUT` answers
+  with `status: error` naming itself and the budget, instead of leaving the
+  client to time the request out itself as MCP error -32001. Only
+  `get_docs_section_tool` and `list_repos_tool` still run inline; they read
+  one small file each (#262, #46, #136).
+
+  `CRG_TOOL_TIMEOUT` keeps its meaning: it bounds read-only tools, and it
+  does **not** bound `build_or_update_graph_tool`, `run_postprocess_tool`,
+  `embed_graph_tool`, `generate_wiki_tool` or `apply_refactor_tool`. Those
+  write — to `graph.db`, to the wiki tree, to your source files — and a
+  timeout cancels the wait, not the worker, so bounding them would report
+  failure to the client while the write went on regardless.
+- Change discovery is bounded honestly. Each Git command in the chain that
+  works out what changed gets `CRG_DISCOVERY_TIMEOUT` (5 seconds) rather
+  than the 30-second `CRG_GIT_TIMEOUT`, and runs with `require_vcs`, so
+  exhausting that budget raises a `ChangeDiscoveryError` and the tool
+  answers `status: error`. Shortening a budget that failed *silently* would
+  only have made #913's false all-clear easier to hit, and would have
+  extended it to the base resolution, where a timed-out merge base
+  degrades a three-dot diff into a two-dot one. Raising `CRG_GIT_TIMEOUT`
+  still raises discovery with it, so the documented remedy for slow Git
+  keeps working (#262).
+- `get_minimal_context_tool` runs its change discovery on that same budget.
+  It previously spent up to ~130 seconds on five Git subprocesses of its
+  own — the tool agents are told to call first, and the one most likely to
+  hit a client's request ceiling (#262).
 
 ### Fixed
 
+- Go and Ruby imports resolve into the repository instead of staying bare
+  strings. Go reads the module path from the nearest `go.mod` (nested
+  modules win over their ancestors, and local `replace` targets are
+  honoured) and maps an in-repo import to the package DIRECTORY it names;
+  the standard library, undownloaded dependencies and anything the ignore
+  patterns exclude stay unresolved. Ruby resolves `require_relative`
+  against the requiring file and `require`, `load`, `autoload` and
+  `require_all` against the repository's load roots (gemspec
+  `require_paths`, `lib`, `test`, `spec`, the Rails `app` roots, and
+  `$LOAD_PATH.unshift` in a root script); gems stay unresolved.
+  `importers_of` for cli/cli's `pkg/iostreams/color.go` goes from 0 to 424,
+  and for jekyll's `test/helper.rb` from 0 to 51.
+- A Go import names a package and a Ruby `require_all` names a directory
+  tree, so both emit ONE edge naming that directory, tagged
+  `extra.import_scope`, and the read path expands a directory to its member
+  files. `importers_of` matches edges targeting a file's own package,
+  `imports_of` reports `import_target_kind`, and the impact traversal
+  follows a package target at every hop without spending one. Emitting an
+  edge per member file instead would make the edge count grow with imports
+  times package size. On kubernetes/kubernetes that was 588,972 edges against
+  the 93,650 recorded now, one per import statement (73,507 of the 588,972
+  came from a single imported package), and 524.6s of build time against
+  about 146s. It also made an incremental update disagree with a rebuild,
+  because an edge's targets then depend on which files were in the package
+  when the importing file happened to be parsed.
+- Resolving imports that previously resolved to nothing costs build time and
+  disk, on every repository measured, and never saves either. Measured
+  against the graph built before this change: a kubernetes/kubernetes build
+  goes from 115.1s and 122.8s to 148.7s and 146.5s (about 24% slower) and its
+  database from 4.41 GB to 5.36 GB (21.5% larger), run isolated and
+  alternating on one idle machine; cli/cli goes from a 7.6s build and a
+  281.1 MB database to 9.3s and 325.9 MB. What that buys is that a bound
+  import also lets the call resolver attribute cross-file calls: on cli/cli
+  the CALLS edges bound to an indexed node go from 5503 to 22564 of 67503,
+  with the edge count unchanged.
+- The impact traversal's directory branch is pinned to an index seek on
+  `(target_qualified, kind)`. Left to itself SQLite drove it from the
+  covering index on `kind` alone and rescanned every `IMPORTS_FROM` row once
+  per frontier directory, which was 18 seconds of a 19-second kubernetes
+  traversal; pinned it is 1.8s, against 6.5s for the same answer under the
+  per-file fan-out. `tests/test_import_scope.py` asserts the plan.
+- No import edge names a path the build does not index. 73,512 kubernetes
+  import edges named a path the build never indexed, 73,507 of them files
+  under `vendor/`, which `**/vendor/**` excludes, so every one of them was a
+  confident-looking path that matched no node. Five remain. Such an import
+  keeps its bare module string, which is visibly external.
+- `get_impact_radius` bounds every list in its response by a fixed ceiling
+  -- the same 100 nodes, 150 edges and 200 files `get_review_context`
+  applies to the same radius -- and reports `edges_omitted`,
+  `changed_nodes_omitted` and `impacted_files_omitted` alongside the
+  existing `nodes_omitted` and `total_impacted`. `edges` and `changed_nodes`
+  had no ceiling at all and `max_results` was not exposed on the MCP tool,
+  so the response grew with the repository: 138k tokens on one changed file
+  of cli/cli and 189,163 on one of kubernetes, against a documented 12k
+  budget. That kubernetes response is now 23,669 tokens. Edges that touch the
+  changed code are kept first, and `max_results` is now an argument of
+  `get_impact_radius_tool`.
+- Every specifier in a Go `import ( ... )` block carries its own line.
+  8636 of cli/cli's 8687 import edges (99.4%) were stamped with the line of
+  the `import (` token.
+- Ruby import extraction dispatches on the call's method name instead of
+  testing whether the node text contains "require". 31 of jekyll's 227
+  import edges (14%) were not on a require line at all, with targets such
+  as `Missing --ssl_cert or --ssl_key. Both are required.`; those call
+  subtrees were also being dropped whole, so their calls are now
+  extracted. `autoload`, which is how jekyll declares its entire internal
+  module graph, produced no edge at all.
 - Freshness metadata follows what was stored. A no-op `update` that
   confirms `HEAD` advances the Git anchor, so queries after a commit no
   longer carry a stale-graph caveat, and a file that fails to parse no
