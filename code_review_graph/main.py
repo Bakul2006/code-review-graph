@@ -226,11 +226,17 @@ def get_impact_radius_tool(
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
     detail_level: str = "standard",
+    resolution: str = "all",
 ) -> dict:
     """Analyze the blast radius of changed files in the codebase.
 
     Shows which functions, classes, and files are impacted by changes.
     Auto-detects changed files from git if not specified.
+
+    An impacted node that calls or references the changed code directly also
+    carries the ``call_site`` (file and line) it does so at, and
+    ``unresolved_call_sites`` counts call sites that name a changed symbol but
+    were never bound to it, so an empty radius is not mistaken for proof.
 
     Args:
         changed_files: List of changed file paths (relative to repo root). Auto-detected if omitted.
@@ -238,11 +244,13 @@ def get_impact_radius_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
+        resolution: "all" (default) or "direct" to traverse only calls bound to an indexed node.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_impact_radius(
         changed_files=changed_files, max_depth=max_depth,
         repo_root=root, base=base, detail_level=detail_level,
+        resolution=resolution,
     ), root)
 
 
@@ -253,6 +261,7 @@ def query_graph_tool(
     repo_root: Optional[str] = None,
     detail_level: str = "standard",
     max_results: int = 100,
+    resolution: str = "all",
 ) -> dict:
     """Run a predefined graph query to explore code relationships.
 
@@ -274,17 +283,25 @@ def query_graph_tool(
     - consumers_of: Find classes that consume a Spring configuration property
     - file_summary: Get all nodes in a file
 
+    callers_of, callees_of and references_to return one row per call site, each
+    carrying the ``call_site`` (file and line) the call is written at, plus a
+    ``resolution_split`` saying how many of those call sites are bound to an
+    indexed node and how many are bare-name matches.
+
     Args:
         pattern: Query pattern name (see above).
         target: Node name, qualified name, or file path to query.
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
         max_results: Maximum results to return. Default: 100.
+        resolution: "all" (default), "direct" for only calls bound to an indexed
+            node, or "unresolved" for only the bare-name matches.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(query_graph(
         pattern=pattern, target=target, repo_root=root,
         detail_level=detail_level, max_results=max_results,
+        resolution=resolution,
     ), root)
 
 

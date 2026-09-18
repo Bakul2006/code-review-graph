@@ -45,6 +45,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -254,6 +255,27 @@ BUDGETS: dict[str, dict[str, Any]] = {
         "default_max": 4_000,
         # query.py caps this one via max_results; the ceiling is the caller's
         # own value, so a whole-file summary is the realistic worst case.
+        "worst_max": 40_000,
+    },
+    # The bare target above resolves ambiguously, so it never reaches the
+    # callers_of body. This case does, against the fixture's most-called
+    # helper: every function in the neighbouring package calls it, so it is
+    # the widest call-site list the fixture can produce. It is what pins the
+    # cost of returning one row per call site rather than one per caller.
+    "query_graph_tool:callers_of": {
+        "tool": "query_graph_tool",
+        "default": {"pattern": "callers_of", "target": "CALLEE_QN"},
+        "worst": {
+            "pattern": "callers_of", "target": "CALLEE_QN",
+            "max_results": HUGE,
+        },
+        # Measured 23,599 at the 100-result default and 34,426 for the whole
+        # answer. One row per call site costs ~2.7% over one row per caller
+        # here: the extra key is a line plus, only where the call is written
+        # outside the caller's own file, a path.
+        "default_max": 25_000,
+        # Bounded only by max_results, like every other query.py pattern, so
+        # the caller's own value is the ceiling.
         "worst_max": 40_000,
     },
     "get_review_context_tool": {
@@ -505,6 +527,14 @@ def _register_fixture(repo: dict[str, Any]) -> None:
 
 _FLOW_SQL = "SELECT id FROM flows ORDER BY node_count DESC LIMIT 1"
 _COMMUNITY_SQL = "SELECT id, name FROM communities ORDER BY size DESC LIMIT 1"
+# The most-called function in the fixture, by incoming CALLS edges. Read from
+# the graph rather than hard-coded so it follows the fixture if it changes.
+_CALLEE_SQL = (
+    "SELECT n.qualified_name FROM nodes n "
+    "JOIN edges e ON e.target_qualified = n.qualified_name AND e.kind = 'CALLS' "
+    "WHERE n.kind = 'Function' "
+    "GROUP BY n.qualified_name ORDER BY COUNT(*) DESC, n.qualified_name LIMIT 1"
+)
 
 
 def _resolve_kwargs(kwargs: dict[str, Any], repo: dict[str, Any]) -> dict[str, Any]:
@@ -523,6 +553,8 @@ def _resolve_kwargs(kwargs: dict[str, Any], repo: dict[str, Any]) -> dict[str, A
             resolved[key] = _pick_row(repo, _COMMUNITY_SQL, 0)
         elif value == "COMMUNITY_NAME":
             resolved[key] = _pick_row(repo, _COMMUNITY_SQL, 1)
+        elif value == "CALLEE_QN":
+            resolved[key] = _pick_row(repo, _CALLEE_SQL, 0)
         elif value == "REFACTOR_ID":
             resolved[key] = repo["refactor_id"]
         elif value == "FLOOD_NAMES":
@@ -759,6 +791,25 @@ def test_hard_ceilings_bind(repo):
     # Each snippet can overshoot by the "..." separators it inserts, so allow
     # a small margin over the raw line budget.
     assert emitted_lines <= review._MAX_REVIEW_SOURCE_LINES * 1.5
+    # The source lines themselves are accounted for exactly: the budget is
+    # allocated once over the risk-ranked file list, and what a file does not
+    # use is handed to the next file rather than spent twice.
+    source_lines = sum(
+        1
+        for snippet in context["source_snippets"].values()
+        for line in snippet.splitlines()
+        if re.match(r"^\d+: ", line)
+    )
+    assert source_lines <= review._MAX_REVIEW_SOURCE_LINES
+    # And no single file may hold more than its capped share of that budget.
+    share_cap = review._source_share_cap(
+        review._MAX_REVIEW_SOURCE_LINES, review._MAX_LINES_PER_FILE,
+    )
+    for name, snippet in context["source_snippets"].items():
+        held = sum(
+            1 for line in snippet.splitlines() if re.match(r"^\d+: ", line)
+        )
+        assert held <= share_cap, f"{name} starved the rest of the ranking"
 
     dead = crg_main.refactor_tool(
         repo_root=root, mode="dead_code", max_results=HUGE,

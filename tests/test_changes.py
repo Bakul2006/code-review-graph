@@ -914,15 +914,17 @@ class TestRiskScoreChurn:
 
         baseline = analyze_changes(self.store, **kwargs)
         with patch(
-            "code_review_graph.changes.compute_file_churn",
-            return_value={"app.py": 10},
+            "code_review_graph.changes.compute_file_churn_with_status",
+            return_value=({"app.py": 10}, "ok"),
         ):
             churned = analyze_changes(self.store, include_churn=True, **kwargs)
 
         assert churned["risk_score"] - baseline["risk_score"] == pytest.approx(0.15)
 
     def test_analyze_changes_does_not_compute_churn_by_default(self, tmp_path):
-        with patch("code_review_graph.changes.compute_file_churn") as churn:
+        with patch(
+            "code_review_graph.changes.compute_file_churn_with_status",
+        ) as churn:
             analyze_changes(
                 self.store,
                 changed_files=["app.py"],

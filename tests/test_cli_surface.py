@@ -1167,6 +1167,8 @@ NUMERIC_ENV_VARS: tuple[NumericVar, ...] = (
     NumericVar("CRG_MAX_CHANGED_FUNCS", ("detect-changes", "--brief"), "100"),
     NumericVar("CRG_MAX_TRANSITIVE_FRONTIER", ("detect-changes", "--brief"), "20"),
     NumericVar("CRG_CHURN_WINDOW_DAYS", ("detect-changes", "--brief", "--churn"), "30"),
+    NumericVar("CRG_CHURN_TIMEOUT", ("detect-changes", "--brief", "--churn"), "10"),
+    NumericVar("CRG_CHURN_MAX_COMMITS", ("detect-changes", "--brief", "--churn"), "500"),
     NumericVar("CRG_RESTART_BACKOFF", ("daemon", "status"), "15"),
     NumericVar("CRG_RESTART_BACKOFF_MAX", ("daemon", "status"), "600"),
     NumericVar("CRG_RESTART_HEALTHY_AFTER", ("daemon", "status"), "300"),

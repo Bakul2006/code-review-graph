@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -37,8 +38,11 @@ from .constants import (
 from .errors import GraphStoreError
 from .migrations import (
     LATEST_VERSION,
+    TARGET_RESOLUTION_EXPR,
+    TARGET_RESOLUTION_KINDS,
     get_schema_version,
     run_migrations,
+    target_resolution_expr,
 )
 from .parser import EdgeInfo, NodeInfo, normalize_file_path
 
@@ -73,6 +77,98 @@ def _symbol_of(qualified_name: str) -> str:
     """
     _, sep, symbol = qualified_name.partition("::")
     return symbol if sep else qualified_name
+
+
+# Longest docstring summary mirrored into the searchable ``nodes.docstring``
+# column. The parser already caps what it stores in ``extra``; this bound is
+# re-applied because existing databases may hold anything.
+MAX_INDEXED_DOCSTRING_CHARS = 400
+# Bound on the derived ``nodes.name_tokens`` column so a pathological
+# identifier cannot grow the FTS index without limit.
+MAX_INDEXED_TOKEN_CHARS = 200
+
+_ALNUM_RUN_RE = re.compile(r"[0-9A-Za-z]+")
+# Split at lower/digit -> upper ("hashPassword") and at the boundary before
+# the final capitalised word of an acronym run ("HTTPServer" -> HTTP Server).
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _index_tokens(*values: str | None) -> str:
+    """Return the camelCase/PascalCase word splits of *values*, space joined.
+
+    Only sub-words that the FTS5 ``unicode61`` tokenizer cannot produce on
+    its own are emitted. unicode61 already breaks on every non-alphanumeric
+    character, so ``get_users`` and ``graph/impact.py`` contribute nothing,
+    while ``hashPassword`` contributes ``hash Password``, the tokens that
+    make ``password`` match it. Keeping the column minimal matters: repeating
+    tokens that are already indexed would inflate their term frequency and
+    skew BM25 ranking.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        for run in _ALNUM_RUN_RE.findall(value):
+            parts = _CAMEL_BOUNDARY_RE.split(run)
+            if len(parts) < 2:
+                continue
+            for part in parts:
+                lowered = part.lower()
+                if lowered and lowered not in seen:
+                    seen.add(lowered)
+                    out.append(part)
+    return " ".join(out)[:MAX_INDEXED_TOKEN_CHARS]
+
+
+def identifier_words(text: str) -> set[str]:
+    """Return the lowercase words *text* is built from.
+
+    Both the whole alphanumeric run and its camelCase parts are returned, so
+    ``GraphStore`` yields ``{graphstore, graph, store}``. Callers compare
+    these sets to decide whether a symbol is *named after* a query, which is
+    the signal BM25 cannot express once long file paths dominate a row's
+    token count.
+    """
+    words: set[str] = set()
+    for run in _ALNUM_RUN_RE.findall(text or ""):
+        words.add(run.lower())
+        for part in _CAMEL_BOUNDARY_RE.split(run):
+            if part:
+                words.add(part.lower())
+    return words
+
+
+def node_index_tokens(
+    kind: str,
+    name: str,
+    parent_name: str | None,
+    file_path: str | None,
+) -> str:
+    """Return the value for a node's ``name_tokens`` column.
+
+    A File node's ``name`` *is* its path, so splitting it would fold every
+    directory segment of the checkout into the index (an absolute path under
+    ``.../CloudDocs/`` would add "Cloud Docs" to every file in the graph).
+    File nodes contribute their stem only.
+    """
+    stem = PurePosixPath(file_path or "").stem
+    return _index_tokens("" if kind == "File" else name, parent_name, stem)
+
+
+def _indexed_docstring(extra: dict[str, Any] | None) -> str | None:
+    """Return the whitespace-normalized docstring summary held in *extra*.
+
+    Existing databases may carry any JSON value under ``docstring``, so
+    non-strings are ignored rather than coerced.
+    """
+    if not extra:
+        return None
+    raw = extra.get("docstring")
+    if not isinstance(raw, str):
+        return None
+    summary = " ".join(raw.split())[:MAX_INDEXED_DOCSTRING_CHARS]
+    return summary or None
 
 
 def _bridge_qualified_name(qualified_name: str) -> str:
@@ -116,6 +212,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     -- before run_migrations, so indexing a column this CREATE TABLE cannot add
     -- to an existing table would break every pre-existing database on open.
     symbol TEXT,
+    -- Documentation summary lifted out of extra['docstring'] so the FTS5
+    -- external-content index can reach it (FTS columns must be real columns
+    -- of the content table). See migration v11.
+    docstring TEXT,
+    -- camelCase/PascalCase word splits for name, parent_name and the file
+    -- stem. unicode61 splits on punctuation but keeps hashPassword as one
+    -- token, so "password" could never match it. Added by migration v11.
+    name_tokens TEXT,
     updated_at REAL NOT NULL
 );
 
@@ -129,6 +233,13 @@ CREATE TABLE IF NOT EXISTS edges (
     extra TEXT DEFAULT '{}',
     confidence REAL DEFAULT 1.0,
     confidence_tier TEXT DEFAULT 'EXTRACTED',
+    -- 'direct' when target_qualified names an indexed node, 'unresolved' when
+    -- it is a bare name the read path can only match by name. NULL for edge
+    -- kinds where the distinction is meaningless (an IMPORTS_FROM target is a
+    -- file path, not a call target) and for rows written since the last
+    -- refresh_target_resolution() pass. Same rule as nodes.symbol above:
+    -- idx_edges_kind_target_resolution is created by migration v11, not here.
+    target_resolution TEXT,
     updated_at REAL NOT NULL
 );
 
@@ -147,6 +258,33 @@ CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_qualified, kind
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_qualified, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_file ON edges(file_path);
 """
+
+
+#: Accepted values for the ``resolution`` filter shared by the query tools
+#: and the impact traversal. "all" keeps today's behaviour; "direct" keeps
+#: only attributions the graph bound to an indexed node; "unresolved" keeps
+#: only the bare-name guesses (query patterns only).
+RESOLUTION_ALL = "all"
+RESOLUTION_DIRECT = "direct"
+RESOLUTION_UNRESOLVED = "unresolved"
+QUERY_RESOLUTIONS = (RESOLUTION_ALL, RESOLUTION_DIRECT, RESOLUTION_UNRESOLVED)
+IMPACT_RESOLUTIONS = (RESOLUTION_ALL, RESOLUTION_DIRECT)
+
+
+def _impact_resolution_guard(resolution: str) -> str:
+    """Return the SQL predicate for one validated impact resolution mode."""
+    if resolution == RESOLUTION_ALL:
+        return ""
+    if resolution != RESOLUTION_DIRECT:
+        raise ValueError(
+            f"resolution must be one of {list(IMPACT_RESOLUTIONS)}, "
+            f"got {resolution!r}"
+        )
+    return (
+        " AND (e.kind NOT IN ('CALLS', 'REFERENCES') "
+        f"OR COALESCE(e.target_resolution, {target_resolution_expr('e')})"
+        " = 'direct')"
+    )
 
 
 @dataclass
@@ -178,6 +316,9 @@ class GraphEdge:
     extra: dict
     confidence: float = 1.0
     confidence_tier: str = "EXTRACTED"
+    #: 'direct', 'unresolved', or None where the distinction does not apply
+    #: (a non-call edge) or has not been computed yet. See migration v11.
+    target_resolution: Optional[str] = None
 
 
 @dataclass
@@ -346,8 +487,8 @@ class GraphStore:
             """INSERT INTO nodes
                (kind, name, qualified_name, file_path, line_start, line_end,
                 language, parent_name, params, return_type, modifiers, is_test,
-                file_hash, extra, symbol, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_hash, extra, symbol, docstring, name_tokens, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(qualified_name) DO UPDATE SET
                  kind=excluded.kind, name=excluded.name,
                  file_path=excluded.file_path, line_start=excluded.line_start,
@@ -356,6 +497,7 @@ class GraphStore:
                  return_type=excluded.return_type, modifiers=excluded.modifiers,
                  is_test=excluded.is_test, file_hash=excluded.file_hash,
                  extra=excluded.extra, symbol=excluded.symbol,
+                 docstring=excluded.docstring, name_tokens=excluded.name_tokens,
                  updated_at=excluded.updated_at
             """,
             (
@@ -363,7 +505,10 @@ class GraphStore:
                 node.line_start, node.line_end, node.language,
                 node.parent_name, node.params, node.return_type,
                 node.modifiers, int(node.is_test), file_hash,
-                extra, _symbol_of(qualified), now,
+                extra, _symbol_of(qualified), _indexed_docstring(node.extra),
+                node_index_tokens(node.kind, node.name, node.parent_name,
+                                  node.file_path),
+                now,
             ),
         )
         row = self._conn.execute(
@@ -534,14 +679,17 @@ class GraphStore:
                     node.line_start, node.line_end, node.language,
                     node.parent_name, node.params, node.return_type,
                     node.modifiers, int(node.is_test), fhash,
-                    extra, _symbol_of(qualified), now,
+                    extra, _symbol_of(qualified), _indexed_docstring(node.extra),
+                    node_index_tokens(node.kind, node.name, node.parent_name,
+                                      normalized),
+                    now,
                 ))
             self._conn.executemany(
                 """INSERT INTO nodes
                    (kind, name, qualified_name, file_path, line_start, line_end,
                     language, parent_name, params, return_type, modifiers, is_test,
-                    file_hash, extra, symbol, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    file_hash, extra, symbol, docstring, name_tokens, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(qualified_name) DO UPDATE SET
                      kind=excluded.kind, name=excluded.name,
                      file_path=excluded.file_path, line_start=excluded.line_start,
@@ -550,6 +698,7 @@ class GraphStore:
                      return_type=excluded.return_type, modifiers=excluded.modifiers,
                      is_test=excluded.is_test, file_hash=excluded.file_hash,
                      extra=excluded.extra, symbol=excluded.symbol,
+                     docstring=excluded.docstring, name_tokens=excluded.name_tokens,
                      updated_at=excluded.updated_at
                 """,
                 node_rows,
@@ -590,6 +739,26 @@ class GraphStore:
     def get_metadata(self, key: str) -> Optional[str]:
         row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+    def get_repo_root(self) -> Optional[str]:
+        """Absolute root of the repository this graph describes, if known.
+
+        ``file_path`` values are absolute, so any consumer that reads a path
+        convention out of them (``tests/``, ``src/test/``) has to know where
+        the repository starts, or it reads the directories above the checkout
+        instead. Builds record the root; for a graph built before they did,
+        the default database location ``<root>/.code-review-graph/graph.db``
+        gives the same answer. ``None`` means neither applies, and callers
+        must degrade explicitly rather than assume the whole path is inside
+        the repository.
+        """
+        recorded = self.get_metadata("repo_root")
+        if recorded:
+            return recorded
+        parent = self.db_path.parent
+        if parent.name == ".code-review-graph":
+            return str(parent.parent)
+        return None
 
     def has_nodes(self) -> bool:
         row = self._conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchone()
@@ -1082,6 +1251,64 @@ class GraphStore:
         Returns the number of resolved edges.
         """
         return self._resolve_bare_endpoints("CALLS", "target_qualified")
+
+    # -- Target-resolution certainty --------------------------------------
+
+    def refresh_target_resolution(self) -> int:
+        """Recompute ``edges.target_resolution`` for CALLS/REFERENCES edges.
+
+        Run after every resolver pass: those passes rewrite bare targets into
+        qualified ones, so a classification taken at insert time would be
+        stale for exactly the edges the distinction is about. One set-based
+        UPDATE over the edge table, not a per-row query.
+
+        Returns the number of rows classified.
+        """
+        placeholders = ", ".join("?" for _ in TARGET_RESOLUTION_KINDS)
+        self._begin_immediate()
+        try:
+            cursor = self._conn.execute(
+                "UPDATE edges SET target_resolution = "  # noqa: S608
+                f"{TARGET_RESOLUTION_EXPR} WHERE kind IN ({placeholders})",
+                TARGET_RESOLUTION_KINDS,
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    def count_edges_by_resolution(self, kind: str = "CALLS") -> dict[str, int]:
+        """Split one edge kind into certain and guessed target attributions.
+
+        The first query is an index-only group-by over
+        ``idx_edges_kind_target_resolution``; that is what the stored column
+        is for. Only rows the column has not classified yet -- a store written
+        directly by a test, or a build that skipped post-processing -- pay for
+        re-deriving the answer, so the count is never silently short and a
+        refreshed graph never pays for a scan.
+        """
+        split = {"direct": 0, "unresolved": 0}
+        unclassified = 0
+        for resolution, count in self._conn.execute(
+            "SELECT target_resolution, COUNT(*) FROM edges "
+            "WHERE kind = ? GROUP BY target_resolution",
+            (kind,),
+        ):
+            if resolution in split:
+                split[resolution] = count
+            elif resolution is None:
+                unclassified = count
+        if unclassified:
+            for resolution, count in self._conn.execute(
+                f"SELECT {TARGET_RESOLUTION_EXPR} AS resolution, "  # noqa: S608
+                "COUNT(*) FROM edges WHERE kind = ? "
+                "AND target_resolution IS NULL GROUP BY resolution",
+                (kind,),
+            ):
+                if resolution in split:
+                    split[resolution] += count
+        return split
 
     def resolve_cpp_scoped_call_targets(self) -> int:
         """Resolve cross-file C++ ``Scope::call`` targets by stable scope identity.
@@ -1775,11 +2002,44 @@ class GraphStore:
                             seeds.add(ns)
         return seeds
 
+    def count_unresolved_call_sites(self, names: set[str]) -> int:
+        """Count call sites that name *names* but were never bound to a node.
+
+        These are the blast radius's blind spot: a CALLS/REFERENCES edge whose
+        target is a bare name cannot join a qualified seed, so the traversal
+        never follows it. The count is deliberately not receiver-filtered --
+        that check needs a specific candidate node -- so it is an upper bound
+        on missed impact, not a claim that every one of these is a real call.
+        """
+        if not names:
+            return 0
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_seed_names (name TEXT PRIMARY KEY)"
+        )
+        self._conn.execute("DELETE FROM _impact_seed_names")
+        name_list = list(names)
+        for start in range(0, len(name_list), 450):
+            batch = name_list[start:start + 450]
+            placeholders = ",".join("(?)" for _ in batch)
+            self._conn.execute(  # nosec B608
+                f"INSERT OR IGNORE INTO _impact_seed_names (name) VALUES {placeholders}",
+                batch,
+            )
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM edges "  # noqa: S608
+            "JOIN _impact_seed_names s ON s.name = edges.target_qualified "
+            "WHERE edges.kind IN ('CALLS', 'REFERENCES') "
+            f"AND COALESCE(edges.target_resolution, {TARGET_RESOLUTION_EXPR}) "
+            "= 'unresolved'",
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def get_impact_radius(
         self,
         changed_files: list[str],
         max_depth: int = MAX_IMPACT_DEPTH,
         max_nodes: int = MAX_IMPACT_NODES,
+        resolution: str = "all",
     ) -> dict[str, Any]:
         """Find dependents and tests impacted by changed files within depth N.
 
@@ -1798,13 +2058,25 @@ class GraphStore:
           - impacted_files: unique set of affected files
           - edges: connecting edges
           - impact_scores: qualified name to best-path score
+
+        ``resolution="direct"`` refuses to traverse a CALLS/REFERENCES edge
+        whose target was never bound to an indexed node, so the answer rests
+        only on attributions the graph can prove. It is a guard, not a
+        reachability change: a bare target cannot equal a qualified seed, so
+        an unresolved hop is already unreachable under both engines. The
+        guard keeps that true if a future resolver leaves a dangling
+        qualified target behind. ``IMPORTS_FROM`` is never filtered -- its
+        targets are file paths and C# namespace bridges, for which
+        "unresolved" would be a false claim.
         """
         if BFS_ENGINE == "networkx":
             return self._get_impact_radius_networkx(
                 changed_files, max_depth=max_depth, max_nodes=max_nodes,
+                resolution=resolution,
             )
         return self.get_impact_radius_sql(
             changed_files, max_depth=max_depth, max_nodes=max_nodes,
+            resolution=resolution,
         )
 
     # -- Bounded SQLite relaxation version (default) ----------------------
@@ -1814,12 +2086,16 @@ class GraphStore:
         changed_files: list[str],
         max_depth: int = MAX_IMPACT_DEPTH,
         max_nodes: int = MAX_IMPACT_NODES,
+        resolution: str = "all",
     ) -> dict[str, Any]:
         """Impact radius via bounded best-score relaxation in SQLite.
 
         Faster than NetworkX for large graphs because it avoids
         materialising the full graph in Python.
         """
+        # Validate before the empty-input short circuits so a bad mode is an
+        # error rather than a silently accepted no-op.
+        resolution_guard = _impact_resolution_guard(resolution)
         max_depth = max(0, int(max_depth))
         max_nodes = max(0, int(max_nodes))
         if not changed_files:
@@ -1904,7 +2180,9 @@ class GraphStore:
             "SELECT qn, 1.0 FROM _impact_seeds"
         )
 
-        candidate_sql = """
+        # ``resolution_guard`` is either the empty string or a fixed predicate
+        # chosen by a validated enum; no caller value reaches the SQL text.
+        candidate_sql = f"""
         INSERT INTO _impact_next (node_qn, score)
         SELECT node_qn, MAX(score)
         FROM (
@@ -1913,18 +2191,18 @@ class GraphStore:
             FROM _impact_frontier f
             JOIN edges e ON e.source_qualified = f.node_qn
             LEFT JOIN _impact_policies p ON p.kind = e.kind
-            WHERE COALESCE(p.direction, ?) = ?
+            WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
             UNION ALL
             SELECT e.source_qualified AS node_qn,
                    f.score * COALESCE(p.weight, ?) * ? AS score
             FROM _impact_frontier f
             JOIN edges e ON e.target_qualified = f.node_qn
             LEFT JOIN _impact_policies p ON p.kind = e.kind
-            WHERE COALESCE(p.direction, ?) = ?
+            WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
         ) candidates
         WHERE score > ?
         GROUP BY node_qn
-        """
+        """  # noqa: S608
         candidate_params = (
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
@@ -2004,6 +2282,11 @@ class GraphStore:
         all_qns = seeds | {n.qualified_name for n in impacted_nodes}
         if all_qns:
             relevant_edges = self.get_edges_among(all_qns)
+            if resolution == RESOLUTION_DIRECT:
+                relevant_edges = [
+                    edge for edge in relevant_edges
+                    if edge.target_resolution != RESOLUTION_UNRESOLVED
+                ]
 
         return {
             "changed_nodes": changed_nodes,
@@ -2027,8 +2310,15 @@ class GraphStore:
         changed_files: list[str],
         max_depth: int = MAX_IMPACT_DEPTH,
         max_nodes: int = MAX_IMPACT_NODES,
+        resolution: str = "all",
     ) -> dict[str, Any]:
         """BFS via NetworkX (legacy). Used when CRG_BFS_ENGINE=networkx."""
+        if resolution not in IMPACT_RESOLUTIONS:
+            raise ValueError(
+                f"resolution must be one of {list(IMPACT_RESOLUTIONS)}, "
+                f"got {resolution!r}"
+            )
+        direct_only = resolution == RESOLUTION_DIRECT
         max_depth = max(0, int(max_depth))
         max_nodes = max(0, int(max_nodes))
         nxg = self._build_networkx_graph()
@@ -2049,10 +2339,12 @@ class GraphStore:
                     (target, data["impact_outgoing_weight"])
                     for _, target, data in nxg.out_edges(qn, data=True)
                     if "impact_outgoing_weight" in data
+                    and not (direct_only and data.get("unresolved_target"))
                 ] + [
                     (source, data["impact_incoming_weight"])
                     for source, _, data in nxg.in_edges(qn, data=True)
                     if "impact_incoming_weight" in data
+                    and not (direct_only and data.get("unresolved_target"))
                 ]
                 for other_qn, weight in neighbors:
                     new_score = score * weight * IMPACT_DEPTH_DECAY
@@ -2088,6 +2380,11 @@ class GraphStore:
         all_qns = seeds | {n.qualified_name for n in impacted_nodes}
         if all_qns:
             relevant_edges = self.get_edges_among(all_qns)
+            if resolution == RESOLUTION_DIRECT:
+                relevant_edges = [
+                    edge for edge in relevant_edges
+                    if edge.target_resolution != RESOLUTION_UNRESOLVED
+                ]
 
         return {
             "changed_nodes": changed_nodes,
@@ -2616,6 +2913,11 @@ class GraphStore:
                 return self._nxg_cache
             g: nx.DiGraph = nx.DiGraph()
             rows = self._conn.execute("SELECT * FROM edges").fetchall()
+            known_qns = {
+                row[0] for row in self._conn.execute(
+                    "SELECT qualified_name FROM nodes"
+                )
+            }
             for r in rows:
                 source = r["source_qualified"]
                 target = r["target_qualified"]
@@ -2626,6 +2928,28 @@ class GraphStore:
                 if not g.has_edge(source, target):
                     g.add_edge(source, target, kind=kind)
                 data = g[source][target]
+                # Mirror the stored column, falling back to the same
+                # node-existence test for a graph built before migration v11.
+                # Parallel edges collapse into one networkx edge, so the flag
+                # means "every edge here is an unresolved call": one proven
+                # relationship of any kind clears it, and a direct-only
+                # traversal never drops a hop it could prove.
+                unresolved = False
+                if kind in TARGET_RESOLUTION_KINDS:
+                    stored = (
+                        r["target_resolution"]
+                        if "target_resolution" in r.keys()
+                        else None
+                    )
+                    unresolved = (
+                        stored == "unresolved"
+                        if stored is not None
+                        else target not in known_qns
+                    )
+                if unresolved:
+                    data.setdefault("unresolved_target", True)
+                else:
+                    data["unresolved_target"] = False
                 existing_weight = IMPACT_EDGE_WEIGHTS.get(
                     data.get("kind", ""), IMPACT_DEFAULT_EDGE_WEIGHT,
                 )
@@ -2673,6 +2997,10 @@ class GraphStore:
         extra = json.loads(row["extra"]) if row["extra"] else {}
         confidence = row["confidence"] if "confidence" in row.keys() else 1.0
         confidence_tier = row["confidence_tier"] if "confidence_tier" in row.keys() else "EXTRACTED"
+        keys = row.keys()
+        target_resolution = (
+            row["target_resolution"] if "target_resolution" in keys else None
+        )
         return GraphEdge(
             id=row["id"],
             kind=row["kind"],
@@ -2683,6 +3011,7 @@ class GraphStore:
             extra=extra,
             confidence=confidence,
             confidence_tier=confidence_tier,
+            target_resolution=target_resolution,
         )
 
 
@@ -2722,6 +3051,11 @@ def edge_to_dict(e: GraphEdge) -> dict:
         "file_path": e.file_path, "line": e.line,
         "confidence": e.confidence, "confidence_tier": e.confidence_tier,
     }
+    # Only the uncertain value is spelled out. Its absence is the certain
+    # case, which is the common one, so the response does not pay a key per
+    # edge to say "as expected".
+    if e.target_resolution == RESOLUTION_UNRESOLVED:
+        result["target_resolution"] = RESOLUTION_UNRESOLVED
     for key in ("ambiguous_targets", "unresolved_targets"):
         targets = e.extra.get(key)
         if isinstance(targets, list):
