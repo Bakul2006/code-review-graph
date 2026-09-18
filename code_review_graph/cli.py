@@ -695,6 +695,40 @@ def _warn_failed_files(result: dict) -> None:
     )
 
 
+def _open_graph_store(db_path: Path, command: str):
+    """Open the graph store, recovering from an unusable database file.
+
+    A restored CI cache can hold a truncated or half-written ``graph.db``,
+    and it can just as easily hold a valid SQLite file whose tables are the
+    wrong shape. SQLite refuses either one and the command dies with a
+    traceback, which is why ``action.yml``'s ``update || build`` fallback
+    could not recover: the full build failed for exactly the same reason.
+    ``build`` rewrites the graph from scratch, so there the bad file is
+    discarded and the build proceeds; every other command reports one
+    actionable line.
+    """
+    from .graph import CorruptGraphDatabaseError, GraphStore, discard_corrupt_database
+
+    try:
+        return GraphStore(db_path)
+    except CorruptGraphDatabaseError as exc:
+        if command != "build":
+            print(
+                f"The graph database at {db_path} is unusable "
+                f"({exc.reason}). Run `code-review-graph build` to rebuild "
+                "it from scratch.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+        logging.warning(
+            "Graph database at %s is unusable (%s); discarding it and "
+            "building from scratch.",
+            db_path, exc.reason,
+        )
+        discard_corrupt_database(db_path)
+        return GraphStore(db_path)
+
+
 # SQLite's answer to a writer that waited out ``busy_timeout`` is
 # ``OperationalError: database is locked``. Nothing between there and the
 # process boundary used to catch it, so a user whose watcher happened to be
@@ -1880,7 +1914,6 @@ def _dispatch() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    from .graph import GraphStore
     from .incremental import (
         find_project_root,
         find_repo_root,
@@ -1892,7 +1925,7 @@ def _dispatch() -> None:
         repo_root = Path(args.repo) if args.repo else find_project_root()
         _handle_data_dir_option(args, repo_root)
         db_path = get_db_path(repo_root)
-        store = GraphStore(db_path)
+        store = _open_graph_store(db_path, args.command)
         try:
             from .tools.build import run_postprocess
 
@@ -2012,7 +2045,7 @@ def _dispatch() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
-    store = GraphStore(db_path)
+    store = _open_graph_store(db_path, args.command)
 
     try:
         if args.command == "dead-code":
