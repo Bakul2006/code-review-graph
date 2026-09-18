@@ -13,6 +13,14 @@ Exit codes:
     0  rendered successfully (gate passed or disabled)
     2  the input file could not be read
     3  risk gate breached (``--fail-on-risk high|critical``)
+    4  detect-changes did not produce an analysis at all
+
+Exit 4 exists because "no changes" and "could not determine the changes"
+must not render as the same comment. ``detect-changes`` prints exactly
+``No changes detected.`` for a genuinely clean tree and exits 0; anything
+else non-JSON on its stdout means the analysis never happened, and a review
+gate that rendered a reassuring comment for that would be waving through a
+pull request nobody looked at.
 """
 
 from __future__ import annotations
@@ -325,6 +333,32 @@ def render_no_changes() -> str:
     )
 
 
+def render_not_analyzed(detail: str) -> str:
+    """Comment for output that is neither an analysis nor a clean tree."""
+    return "\n".join(
+        [
+            MARKER,
+            "",
+            "## code-review-graph review",
+            "",
+            "**The change analysis did not run, so this pull request has not "
+            "been reviewed by code-review-graph.** This is not an all-clear.",
+            "",
+            "```",
+            md_escape(detail, limit=400) or "(no output)",
+            "```",
+            "",
+            "---",
+            "",
+            FOOTER,
+        ]
+    )
+
+
+#: The exact line ``detect-changes`` prints for a genuinely unchanged tree.
+NO_CHANGES_MARKER = "No changes detected."
+
+
 def load_report(text: str) -> dict[str, Any] | None:
     """Parse detect-changes output; None when it is not a JSON object.
 
@@ -338,6 +372,16 @@ def load_report(text: str) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     return data
+
+
+def is_clean_tree(text: str) -> bool:
+    """True only for detect-changes' own "nothing changed" line.
+
+    Anything else that failed to parse as JSON — an error message, a partial
+    write, an empty file because the command died — is the analysis not
+    having happened, which is a different thing entirely.
+    """
+    return text.strip() == NO_CHANGES_MARKER
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -393,7 +437,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     report = load_report(text)
-    if report is None:
+    not_analyzed = report is None and not is_clean_tree(text)
+    if not_analyzed:
+        logger.error(
+            "detect-changes produced no analysis; this is NOT an all-clear: %s",
+            text.strip()[:400] or "(no output)",
+        )
+        body = render_not_analyzed(text)
+    elif report is None:
         body = render_no_changes()
     else:
         body = render_markdown(
@@ -411,6 +462,10 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as exc:
                 logger.error("Cannot write output file %s: %s", args.output, exc)
                 return 2
+
+    if not_analyzed:
+        # Distinct from the risk gate: the risk is unknown, not low.
+        return 4
 
     if args.fail_on_risk != "none" and report is not None:
         score = float(report.get("risk_score") or 0.0)

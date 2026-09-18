@@ -940,9 +940,13 @@ def detect_changes_func(
         base = resolve_review_base(root, base)
         # Detect changed files if not provided.
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
+            # require_vcs: the "no changed files" answer below is an
+            # all-clear. A git that cannot be run must not produce it — the
+            # ChangeDiscoveryError becomes {"status": "error"} instead, so a
+            # client can tell "nothing to review" from "could not look".
+            changed_files = get_changed_files(root, base, require_vcs=True)
             if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+                changed_files = get_staged_and_unstaged(root, require_vcs=True)
 
         if not changed_files:
             return {
@@ -962,6 +966,9 @@ def detect_changes_func(
         abs_files = [normalize_file_path(root / f) for f in changed_files]
 
         # Parse diff ranges for line-level mapping.
+        # Lenient on purpose: the changed-file list above is already known
+        # to be non-empty, so an unreadable line-level diff costs precision,
+        # not honesty. analyze_changes records the degradation.
         diff_ranges = parse_diff_ranges(str(root), base)
         # Remap to absolute paths so they match graph file_paths.
         abs_ranges: dict[str, list[tuple[int, int]]] = {}

@@ -50,6 +50,7 @@ from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Iterable, TypedDict
 
+from .errors import CodeReviewGraphError, is_lock_error
 from .neighbourhood import DEFAULT_DEPTH as NB_DEFAULT_DEPTH
 from .neighbourhood import DEFAULT_MAX_NODES as NB_DEFAULT_MAX_NODES
 
@@ -700,12 +701,23 @@ def _open_graph_store(db_path: Path, command: str):
 
     A restored CI cache can hold a truncated or half-written ``graph.db``,
     and it can just as easily hold a valid SQLite file whose tables are the
-    wrong shape. SQLite refuses either one and the command dies with a
+    wrong shape. SQLite refuses either one and the command used to die with a
     traceback, which is why ``action.yml``'s ``update || build`` fallback
     could not recover: the full build failed for exactly the same reason.
     ``build`` rewrites the graph from scratch, so there the bad file is
-    discarded and the build proceeds; every other command reports one
-    actionable line.
+    discarded and the build proceeds.
+
+    Every other command re-raises, and ``main`` prints the one actionable
+    line the error already carries. That is the whole difference between the
+    two paths, and it is worth stating why the reporting is not duplicated
+    here: a second message would compete with the first, and one of them
+    would drift.
+
+    ``build`` discards only what ``CorruptGraphDatabaseError`` names, and
+    that class is deliberately narrow. A contended database, a read-only
+    checkout, a foreign SQLite file and a graph from a newer release all
+    reach ``main`` as themselves, because deleting any of those would destroy
+    a graph, or data, that is not broken.
     """
     from .graph import CorruptGraphDatabaseError, GraphStore, discard_corrupt_database
 
@@ -713,14 +725,8 @@ def _open_graph_store(db_path: Path, command: str):
         return GraphStore(db_path)
     except CorruptGraphDatabaseError as exc:
         if command != "build":
-            print(
-                f"The graph database at {db_path} is unusable "
-                f"({exc.reason}). Run `code-review-graph build` to rebuild "
-                "it from scratch.",
-                file=sys.stderr,
-            )
-            raise SystemExit(1) from None
-        logging.warning(
+            raise
+        logger.warning(
             "Graph database at %s is unusable (%s); discarding it and "
             "building from scratch.",
             db_path, exc.reason,
@@ -729,39 +735,41 @@ def _open_graph_store(db_path: Path, command: str):
         return GraphStore(db_path)
 
 
-# SQLite's answer to a writer that waited out ``busy_timeout`` is
-# ``OperationalError: database is locked``. Nothing between there and the
-# process boundary used to catch it, so a user whose watcher happened to be
-# mid-update saw twenty lines of internal traceback.
-_LOCK_ERRORS = (
-    "database is locked",
-    "database table is locked",
-    "database schema is locked",
-)
-
-
-def _is_lock_error(exc: BaseException) -> bool:
-    return isinstance(exc, sqlite3.OperationalError) and any(
-        needle in str(exc).lower() for needle in _LOCK_ERRORS
-    )
-
-
 def main() -> None:
     """Main CLI entry point.
 
-    A contended graph is reported, not raised.  The choice is deliberate:
+    Two families of failure are reported here rather than raised, because
+    both of them are things the tool understands about itself.
+
+    Everything the tool can explain is raised as a
+    :class:`~code_review_graph.errors.CodeReviewGraphError` (a corrupt or
+    foreign graph, a data directory it may not write to, a VCS it could not
+    run) and printed in the house style the rest of the CLI already uses:
+    one ``Error: ...`` line on stderr, exit 1, no traceback to decode.
+
+    One of those is reported here only because nothing could be done about
+    it earlier: an unreadable graph reaches ``build`` as a rebuild (see
+    ``_open_graph_store``) and only every other command as a line.
+
+    A contended graph is separate, and stays separate: it is reported, not
+    raised, and never described as damage. The choice is deliberate:
     ``build`` and ``update`` are run from pre-commit hooks and editor hooks
     where blocking indefinitely would look like a hang, and retrying past
     SQLite's five-second wait would only lengthen a hang whose real cause is
-    another process that has not finished.  Failing immediately is also the
+    another process that has not finished. Failing immediately is also the
     recoverable outcome — the VCS anchor is written only by a build that ran
     to completion, so nothing marks the half-written graph as current and the
     next run rebuilds it.
+
+    Anything else really is a bug and keeps its traceback.
     """
     try:
         _dispatch()
+    except CodeReviewGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     except sqlite3.OperationalError as exc:
-        if not _is_lock_error(exc):
+        if not is_lock_error(exc):
             raise
         print(
             f"Error: another process is updating this graph ({exc}).\n"
@@ -1915,6 +1923,7 @@ def _dispatch() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     from .incremental import (
+        assert_graph_serves_root,
         find_project_root,
         find_repo_root,
         get_db_path,
@@ -2046,6 +2055,16 @@ def _dispatch() -> None:
         )
         raise SystemExit(1)
     store = _open_graph_store(db_path, args.command)
+
+    try:
+        # A graph.db copied or cached from another checkout answers every
+        # question with that repository's symbols and absolute paths. The
+        # write side has refused that since #909; the read side used to
+        # accept it in silence.
+        assert_graph_serves_root(repo_root, store)
+    except BaseException:
+        store.close()
+        raise
 
     try:
         if args.command == "dead-code":
@@ -2488,9 +2507,14 @@ def _dispatch() -> None:
             from .incremental import get_changed_files, get_staged_and_unstaged, resolve_review_base
 
             base = resolve_review_base(repo_root, args.base)
-            changed = get_changed_files(repo_root, base)
+            # require_vcs: this command's exit code is a review gate. "I
+            # could not look" must never render as "there is nothing to
+            # review" — a CI job keyed on exit 0 would wave through a pull
+            # request nobody read. ChangeDiscoveryError reaches main() and
+            # becomes one `Error: ...` line and exit 1.
+            changed = get_changed_files(repo_root, base, require_vcs=True)
             if not changed:
-                changed = get_staged_and_unstaged(repo_root)
+                changed = get_staged_and_unstaged(repo_root, require_vcs=True)
 
             if not changed:
                 print("No changes detected.")
@@ -2501,6 +2525,7 @@ def _dispatch() -> None:
                     repo_root=str(repo_root),
                     base=base,
                     include_churn=getattr(args, "churn", False),
+                    require_vcs=True,
                 )
                 original_tokens = estimate_file_tokens(repo_root, changed)
                 attach_context_savings(

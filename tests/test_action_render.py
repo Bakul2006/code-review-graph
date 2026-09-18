@@ -477,6 +477,47 @@ def test_main_no_changes_input(tmp_path):
     assert "No analyzable code changes" in out.read_text(encoding="utf-8")
 
 
+def test_is_clean_tree_only_matches_detect_changes_own_line():
+    """Anything else non-JSON is the analysis not having happened."""
+    assert render.is_clean_tree("No changes detected.\n")
+    assert not render.is_clean_tree("")
+    assert not render.is_clean_tree("Error: could not determine the changes: ...")
+    assert not render.is_clean_tree("No changes detected. Also: git exploded.")
+
+
+def test_main_not_analyzed_returns_4_and_says_so(tmp_path):
+    """A detect-changes failure must not render as an all-clear."""
+    src = tmp_path / "report.json"
+    src.write_text(
+        "Error: could not determine the changes: git could not be run.\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "comment.md"
+    code = render.main(["--input", str(src), "--output", str(out)])
+    assert code == 4
+    body = out.read_text(encoding="utf-8")
+    assert body.startswith(render.MARKER)
+    assert "has not been reviewed" in body
+    assert "not an all-clear" in body
+    assert "No analyzable code changes" not in body
+
+
+def test_empty_detect_changes_output_is_not_an_all_clear(tmp_path):
+    """A command that died before printing anything is not a clean tree."""
+    src = tmp_path / "report.json"
+    src.write_text("", encoding="utf-8")
+    code = render.main(["--input", str(src), "--quiet"])
+    assert code == 4
+
+
+def test_not_analyzed_beats_fail_on_risk_none(tmp_path):
+    """An unknown risk is not a low one, so `none` cannot switch it off."""
+    src = tmp_path / "report.json"
+    src.write_text("Error: boom\n", encoding="utf-8")
+    code = render.main(["--input", str(src), "--quiet", "--fail-on-risk", "none"])
+    assert code == 4
+
+
 def test_main_missing_input_returns_2(tmp_path):
     code = render.main(["--input", str(tmp_path / "nope.json"), "--quiet"])
     assert code == 2

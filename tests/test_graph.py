@@ -10,6 +10,7 @@ from pathlib import Path, PureWindowsPath
 import pytest
 
 import code_review_graph.constants as constants_module
+from code_review_graph.errors import GraphStoreError
 from code_review_graph.graph import (
     CorruptGraphDatabaseError,
     GraphStore,
@@ -1512,6 +1513,12 @@ class TestUnusableDatabaseRecovery:
         same ``__init__`` block as a mis-shaped schema. Classifying it as
         unusable would send ``build`` to ``discard_corrupt_database`` and
         destroy a graph that was never broken.
+
+        It is still reported rather than raised raw: the permission failure
+        is one the tool understands about itself, so it arrives as a
+        ``GraphStoreError`` naming the directory to fix. What must never
+        happen is the *corrupt* classification, which is what the assertion
+        below pins.
         """
         db = tmp_path / "graph.db"
         GraphStore(db).close()
@@ -1519,9 +1526,10 @@ class TestUnusableDatabaseRecovery:
         db.chmod(0o444)
         tmp_path.chmod(0o555)
         try:
-            with pytest.raises(sqlite3.DatabaseError) as caught:
+            with pytest.raises(GraphStoreError) as caught:
                 GraphStore(db)
             assert not isinstance(caught.value, CorruptGraphDatabaseError), caught.value
+            assert str(tmp_path) in str(caught.value)
         finally:
             tmp_path.chmod(0o755)
             db.chmod(0o644)
