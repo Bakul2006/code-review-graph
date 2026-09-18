@@ -40,8 +40,22 @@ RISK_THRESHOLDS: dict[str, float] = {"critical": 0.85, "high": 0.7, "medium": 0.
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MAX_CELL = 120
-# GitHub rejects comment bodies over 65,536 characters; leave headroom.
+# GitHub rejects comment bodies over 65,536 characters, and the trusted
+# workflow that publishes this report (.github/workflows/pr-review-comment.yml)
+# rejects an artifact larger than MAX_REPORT_BYTES. This is that same budget,
+# and it is a budget for the *finished* body: the truncation notice and the
+# footer have to fit inside it, or every truncated report is rejected by the
+# consumer and the largest pull requests get no comment at all. Measured in
+# UTF-8 bytes, because that is what the consumer measures.
 _MAX_BODY = 60_000
+# main() writes the body followed by a newline, and the consumer measures the
+# file on disk, not the string this module returns. That newline is therefore
+# part of what is measured and one byte of the budget belongs to it: without
+# this reservation a report sized at exactly _MAX_BODY becomes a 60,001-byte
+# artifact and is rejected by the very check the budget exists to satisfy.
+_ARTIFACT_NEWLINE_BYTES = len(b"\n")
+#: What the body itself may occupy, once the artifact's newline is reserved.
+_MAX_BODY_TEXT = _MAX_BODY - _ARTIFACT_NEWLINE_BYTES
 
 
 def risk_level(score: float) -> str:
@@ -260,10 +274,38 @@ def render_markdown(
         )
 
     lines.extend(["", "---", "", FOOTER])
-    body = "\n".join(lines)
-    if len(body) > _MAX_BODY:
-        body = body[:_MAX_BODY] + "\n\n*Report truncated.*\n\n" + FOOTER
-    return body
+    return _fit_to_budget("\n".join(lines))
+
+
+def _fit_to_budget(body: str) -> str:
+    """Return *body* trimmed so the written artifact fits ``_MAX_BODY``.
+
+    Everything the consumer measures is inside the budget: the truncation
+    notice, the footer, and the newline ``main`` writes after the body. The
+    notice and footer are subtracted before the report is cut, and the cut
+    lands on a line boundary so the last row of a markdown table is never
+    left half-written.
+    """
+    encoded = body.encode("utf-8")
+    if len(encoded) <= _MAX_BODY_TEXT:
+        return body
+    suffix = "\n\n*Report truncated.*\n\n" + FOOTER
+    budget = _MAX_BODY_TEXT - len(suffix.encode("utf-8"))
+    head = encoded[:budget].decode("utf-8", "ignore")
+    newline = head.rfind("\n")
+    if newline > 0:
+        head = head[:newline]
+    return head + suffix
+
+
+def _artifact_text(body: str) -> str:
+    """The exact bytes written out for *body*.
+
+    The trailing newline is what a text file ends with, and it is also the
+    byte ``_MAX_BODY_TEXT`` reserves. Both callers below go through here so
+    the reservation and the write cannot drift apart.
+    """
+    return body + "\n"
 
 
 def render_no_changes() -> str:
@@ -362,10 +404,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.quiet:
         if args.output == "-":
-            sys.stdout.write(body + "\n")
+            sys.stdout.write(_artifact_text(body))
         else:
             try:
-                Path(args.output).write_text(body + "\n", encoding="utf-8")
+                Path(args.output).write_text(_artifact_text(body), encoding="utf-8")
             except OSError as exc:
                 logger.error("Cannot write output file %s: %s", args.output, exc)
                 return 2

@@ -1162,7 +1162,14 @@ def get_all_tracked_files(
     if recurse_submodules is None:
         recurse_submodules = _RECURSE_SUBMODULES
 
-    cmd = ["git", "ls-files"]
+    # -z is required, not a nicety: without it core.quotePath (on by
+    # default) makes git C-quote any path holding a non-ASCII or control
+    # byte, so `git ls-files` answers `"src/caf\303\251.py"` — quotes,
+    # backslashes and all — and every such file is silently dropped from the
+    # inventory because that spelling does not exist on disk. With -z the
+    # paths arrive raw and NUL-separated, and a newline in a path is no
+    # longer a record separator either.
+    cmd = ["git", "ls-files", "-z"]
     if recurse_submodules:
         cmd.append("--recurse-submodules")
 
@@ -1175,7 +1182,7 @@ def get_all_tracked_files(
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
-        return [f.strip() for f in result.stdout.splitlines() if f.strip()]
+        return [f for f in result.stdout.split("\0") if f]
     except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return []
 

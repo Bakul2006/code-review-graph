@@ -110,10 +110,34 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
         marker='<!-- code-review-graph-report -->'
+        # Only ever edit a comment this Action itself posted. The marker is
+        # published in docs/GITHUB_ACTION.md, so any pull request
+        # participant can post a comment carrying it; without an author
+        # filter the Action would adopt that comment and every later run
+        # would rewrite it (or stall on it) instead of keeping its own
+        # report.
+        #
+        # A personal access token answers `gh api user` with its own login,
+        # so that identity is exact. An installation token (the default
+        # GITHUB_TOKEN, or a GitHub App's) cannot call that endpoint at all,
+        # and its comments are authored by a bot account whose login this
+        # step has no way to learn: github-actions[bot] for the default
+        # token, <app-slug>[bot] for an App. Assuming github-actions[bot]
+        # there loses an App's own sticky comment and posts a duplicate on
+        # every run, so the fallback matches on what is actually knowable --
+        # a marker comment written by a bot. Pull request participants are
+        # Users, never Bots, so the marker is still not enough on its own.
+        author=$(gh api user --jq '.login' 2>/dev/null || true)
+        if [ -n "${author}" ]; then
+          author_filter=".user.login == \"${author}\""
+        else
+          author_filter='.user.type == "Bot"'
+        fi
         comment_id=$(gh api \
           "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
           --paginate \
-          --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n 1)
+          --jq ".[] | select(${author_filter} and
+                 (.body | startswith(\"${marker}\"))) | .id" | head -n 1)
         if [ -n "${comment_id}" ]; then
           gh api --method PATCH --silent \
             "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" \
