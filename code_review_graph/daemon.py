@@ -1673,19 +1673,44 @@ class WatchDaemon:
             if self._windows_job is not None:
                 self._windows_job.assign(proc)
         except Exception:
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
                     try:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        logger.warning(
-                            "Watcher '%s' remained alive after SIGKILL", repo.alias
-                        )
-            log_fd.close()
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            logger.warning("Watcher '%s' remained alive after SIGKILL", repo.alias)
+            except OSError:
+                try:
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except (subprocess.TimeoutExpired, OSError):
+                            logger.warning(
+                                "Watcher '%s' did not stop after forced cleanup",
+                                repo.alias,
+                                exc_info=True,
+                            )
+                except OSError:
+                    logger.warning(
+                        "Failed to kill watcher '%s' during startup cleanup",
+                        repo.alias,
+                        exc_info=True,
+                    )
+            finally:
+                try:
+                    log_fd.close()
+                except OSError:
+                    logger.warning(
+                        "Failed to close log file for watcher '%s'",
+                        repo.alias,
+                        exc_info=True,
+                    )
             logger.exception("Failed to start watcher for '%s'", repo.alias)
             return
 

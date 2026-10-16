@@ -611,7 +611,9 @@ class TestWatchDaemon:
             daemon.stop()
 
     @patch("code_review_graph.daemon.subprocess.Popen")
-    def test_start_watcher_assignment_failure_terminates_alive_process(self, mock_popen, daemon_env):
+    def test_start_watcher_assignment_failure_terminates_alive_process(
+        self, mock_popen, daemon_env
+    ):
         """A live watcher is terminated when Windows Job assignment fails."""
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -626,6 +628,38 @@ class TestWatchDaemon:
 
         mock_proc.terminate.assert_called_once_with()
         mock_proc.wait.assert_called_once_with(timeout=5)
+        assert "alpha" not in daemon._children
+
+    @patch("code_review_graph.daemon.subprocess.Popen")
+    def test_health_loop_continues_after_assignment_cleanup_os_errors(self, mock_popen, daemon_env):
+        """Cleanup errors do not stop later health checks or leak the log handle."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = None
+        mock_proc.terminate.side_effect = PermissionError("access denied")
+        mock_proc.kill.side_effect = OSError("kill failed")
+        mock_popen.return_value = mock_proc
+
+        daemon = daemon_env["daemon"]
+        repo = daemon_env["config"].repos[0]
+        daemon._current_repos = {repo.alias: repo}
+        daemon._windows_job = MagicMock()
+        daemon._windows_job.assign.side_effect = OSError("job assignment failed")
+        daemon._health_stop = MagicMock()
+        daemon._health_stop.is_set.side_effect = [False, False, False, False, False, True]
+        log_fd = MagicMock()
+
+        with (
+            patch("builtins.open", return_value=log_fd),
+            patch.object(daemon, "_save_state"),
+            patch.object(daemon, "_check_health", wraps=daemon._check_health) as check_health,
+        ):
+            daemon._health_loop()
+
+        mock_proc.terminate.assert_called_once_with()
+        mock_proc.kill.assert_called_once_with()
+        log_fd.close.assert_called_once_with()
+        assert check_health.call_count == 2
         assert "alpha" not in daemon._children
 
     @patch("code_review_graph.daemon.subprocess.Popen")
