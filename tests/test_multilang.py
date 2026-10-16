@@ -2755,6 +2755,29 @@ class TestElixirParsing:
             for edge in edges
         )
 
+    def test_guarded_short_form_function_calls_are_extracted(self, tmp_path):
+        path = tmp_path / "guarded_short_form.ex"
+        source = (
+            b"defmodule Example do\n"
+            b"  def guarded(x) when is_binary(x), do: helper(x)\n"
+            b"  def helper(x), do: x\n"
+            b"end\n"
+        )
+
+        nodes, edges = self.parser.parse_bytes(path, source)
+
+        guarded = [
+            node for node in nodes
+            if node.kind == "Function" and node.name == "guarded"
+        ]
+        assert len(guarded) == 1
+        guarded_calls = [
+            edge for edge in edges
+            if edge.kind == "CALLS" and edge.source.endswith("::Example.guarded")
+        ]
+        assert any(node.kind == "Function" and node.name == "helper" for node in nodes)
+        assert [edge.target.rsplit("::", 1)[-1] for edge in guarded_calls] == ["Example.helper"]
+
     @pytest.mark.parametrize(
         "name, declaration",
         [
@@ -2774,7 +2797,7 @@ class TestElixirParsing:
         functions = [node for node in nodes if node.kind == "Function"]
         assert [node.name for node in functions] == [name]
 
-    def test_multi_clause_functions_keep_the_full_graph_range(self, tmp_path):
+    def test_multi_clause_functions_keep_distinct_parser_ranges(self, tmp_path):
         path = tmp_path / "clauses.ex"
         source = (
             b"defmodule T do\n"
@@ -2801,7 +2824,7 @@ class TestElixirParsing:
                 multi = store.get_node(f"{path.as_posix()}::T.multi")
 
             assert multi is not None
-            assert (multi.line_start, multi.line_end) == (4, 5)
+            assert (multi.line_start, multi.line_end) == (5, 5)
 
 
 class TestGDScriptParsing:
