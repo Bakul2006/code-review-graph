@@ -53,7 +53,6 @@ _EXACT_SYMBOL_BOOST = 3.0
 # multiply a hit by how much of the query its own symbol name accounts for.
 _NAME_COVERAGE_BOOST = 1.0
 _NAME_EXACT_COVERAGE_BOOST = 2.0
-_CLASS_MEMBER_EXACT_BOOST = 1.25
 
 
 # ---------------------------------------------------------------------------
@@ -995,15 +994,11 @@ def hybrid_search(
             if any(ident in qn_lo for ident in idents):
                 boost *= 2.0
         if query_words:
-            symbol_words = identifier_words(row["name"])
+            symbol = row["symbol"] if "symbol" in row.keys() else None
+            symbol_words = identifier_words(symbol or row["name"])
             covered = _covered_word_count(query_words, symbol_words)
             if covered:
                 boost *= 1.0 + _NAME_COVERAGE_BOOST * covered / len(query_words)
-                qualified_tail = qualified_name.rsplit("::", 1)[-1]
-                if covered == len(query_words) and qualified_tail.endswith(
-                    "." + row["name"]
-                ):
-                    boost *= _CLASS_MEMBER_EXACT_BOOST
                 if symbol_words == query_words:
                     boost *= _NAME_EXACT_COVERAGE_BOOST
 
